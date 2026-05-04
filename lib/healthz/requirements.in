@@ -1,0 +1,4 @@
+# Direct local dependencies
+-r ../boilerplate/requirements.in
+
+# Direct 3rd-party dependencies

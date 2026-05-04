@@ -1,0 +1,60 @@
+# Automatic static analysis every Git commit
+
+# If the pre-commit hook fails, check if the Git workspace is not dirty
+# (Ruff's automatic formatter may have applied some changes -- stage them and retry)
+
+# The tools can be also run manually:
+# basedpyright
+# ruff check
+# ruff format
+# bin/check_imports.py
+
+# Upgrades of the pinned versions are handled by bin/upgrade_packages.py
+
+# Emergency only: Override the checks using `git commit -m "..." --no-verify`
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    - id: check-yaml
+
+    - id: end-of-file-fixer
+
+    - id: trailing-whitespace
+
+    # Forbids a push directly to main (use a feature branch and create a PR instead)
+    - id: no-commit-to-branch
+
+  # Static code analysis and reformatting, replacement for Black and Flake8
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.11
+    hooks:
+    - id: ruff
+      types_or: [python, jupyter]
+      args: [--fix]
+
+    - id: ruff-format
+      types_or: [python, jupyter]
+
+  # Static type checker, replacement for Mypy and Pylance
+  - repo: https://github.com/detachhead/basedpyright-pre-commit-mirror
+    rev: 1.39.2
+    hooks:
+    - id: basedpyright
+
+  # Services cannot import from another services (use a `shared` folder instead)
+  # Libraries cannot import from services
+  - repo: local
+    hooks:
+    - id: check-imports
+      name: import directions
+      entry: bin/check_imports.py
+      language: system
+      types: [file, python]
+
+    - id: report-licenses
+      name: licenses safe to use
+      entry: bin/report_licenses.py --check-only
+      language: system
+      verbose: true

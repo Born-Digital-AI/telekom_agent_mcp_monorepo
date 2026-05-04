@@ -1,0 +1,18 @@
+# 3rd-party dependencies used only for development of libraries/services in the monorepo
+# (not included in Docker containers used in the production)
+
+# Have to be installed manually using `uv pip install -r requirements-dev.in -c requirements/constraints.txt`
+
+basedpyright
+ipython
+jupysql
+pdbpp
+pip-audit
+pre-commit
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+pytest-sourceorder
+ruff
+python-json-logger

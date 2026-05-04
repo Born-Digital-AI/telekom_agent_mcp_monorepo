@@ -1,0 +1,84 @@
+name: Build and push all services
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: Docker tag (e.g. v0.1.0 or latest)
+        required: true
+        default: latest
+  release:
+    types: [published]
+
+jobs:
+  list-services:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          services=$(ls -1 svc | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "services=${services}" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: list-services
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.list-services.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image name
+        id: image
+        run: |
+          image_name=$(echo "${{ matrix.service }}" | tr '_' '-')
+          echo "name=${image_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Compile pinned requirements for the service
+        run: |
+          mkdir -p requirements
+          uv pip compile \
+            --generate-hashes \
+            --output-file "requirements/${{ matrix.service }}.txt" \
+            "svc/${{ matrix.service }}/requirements.in"
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.docker_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/service.Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            service_name=${{ matrix.service }}
+            git_commit=${{ github.sha }}
+          tags: |
+            borndigitalaibot/${{ steps.image.outputs.name }}:${{ steps.tag.outputs.value }}
+            borndigitalaibot/${{ steps.image.outputs.name }}:${{ github.sha }}

@@ -1,0 +1,1 @@
+# Do not add any 1st/3rd-party dependencies, use only the standard library to avoid slowing down the GitHub Actions CI!

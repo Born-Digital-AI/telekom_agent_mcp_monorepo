@@ -1,0 +1,34 @@
+# Compiled Python bytecode
+__pycache__/
+
+# Test discovery cache
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+
+# Python virtual envirnment
+.venv
+
+# Mypy AST parsing cache
+.mypy_cache/
+
+# VS Code extension settings for Database connections
+.vscode/
+
+# Coverage.py database
+.coverage*
+htmlcov
+
+# Basedpyright's baseline
+.basedpyright
+
+# Claude AI settings
+.claude/
+
+.DS_Store
+
+prague-airport.*

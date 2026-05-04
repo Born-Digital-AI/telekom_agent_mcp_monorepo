@@ -1,0 +1,7 @@
+# Direct local dependencies
+-r ../boilerplate/requirements.in
+-r ../healthz/requirements.in
+
+# Direct 3rd-party dependencies
+mcp
+uvicorn

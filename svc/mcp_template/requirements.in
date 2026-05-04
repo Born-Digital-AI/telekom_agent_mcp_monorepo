@@ -1,0 +1,4 @@
+# Direct local dependencies
+-r ../../lib/mcp_service/requirements.in
+
+# Direct 3rd-party dependencies

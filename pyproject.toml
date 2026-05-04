@@ -1,0 +1,143 @@
+# Configuration of 3rd-party tools used in the monorepo
+
+# --- pip-audit ---
+
+[tool.pip-audit]
+ignore-vuln = [
+    "GHSA-4xh5-x5gv-qwph",  # pip 25.2 vulnerability - pip itself, not affecting runtime dependencies
+    "CVE-2026-3219",  # pip 26.0.1 vulnerability - pip itself, not affecting runtime dependencies
+    "CVE-2026-24486",  # python-multipart 0.0.21 - upgrade blocked by fastapi compatibility
+    "CVE-2026-4539",  # pygments 2.19.1 - transitive dev dependency (pytest, ipython), not used in production
+    "CVE-2026-0994",  # pymilvus 2.3.7 vulnerability - vulnerable JSON-to-protobuf parsing path is not used (gRPC only)
+]
+
+# --- Pytest ---
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+# Add "--cov=lib --cov=svc --cov=tests --cov-report=term" to measure the test coverage (will slow the tests down)
+addopts = "--showlocals -rxs -v --strict-markers --maxfail=1"
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests (fast, no infrastructure)",
+    "component: Component tests (interaction with infrastructure running via Docker Compose)",
+    "slow: Slow tests (not included by default)",
+    "paid: Tests accessing paid remote APIs (not included by default)",
+    "sourceorder: Tests which depend on running in fixed order (provided by pytest-sourceorder, used by component tests)",
+    "asyncio: Tests which use await for calling the system under test (provided by pytest-asyncio)"
+]
+norecursedirs = ".git __pycache__ .pyc"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "class"
+filterwarnings = [
+    # Remove after upgrading to 1.0, see https://github.com/vacanza/python-holidays/discussions/1800
+    "ignore::DeprecationWarning:holidays",
+]
+
+# --- Ruff ---
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+
+ignore = [
+    # Harmful or useless rules
+    "D105", # Docstring in magic methods (no added value)
+    "D107", # Docstring in constructors (no added value)
+    "D203", # Blank line before class Docstring (conflicts with D211, wastes space)
+    "D213", # Multiline docstring summary on 2nd line (conflicts with D212, wastes space)
+    "E501", # Lone too long (don't break long string literals)
+    "S607", # Absolute path to executable in subprocess.run (no control over location of binaries)
+    "ANN002", # Type annotations for *args (no added value)
+    "ANN003", # Type annotations for **kwargs (no added value)
+    "ANN204", # Type annotations for special methods (no added value)
+    "G004", # Logging using f-strings
+    "UP017", # Use datetime.UTC alias (conflicts with basedpyright which doesn't recognize datetime.UTC)
+
+    # Rules incompatible with the formatter, see https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+    "W191",
+    "E111",
+    "E114",
+    "E117",
+    "D206",
+    "D300",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "COM812",
+    "COM819",
+    "ISC001",
+    "ISC002",
+    # Flaky rules - for future reconsideration
+    "S603", # Untrusted input in subprocess.run (false positives)
+    "TRY400", # logger.exception instead of logger.error in exception handler (false positives)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"bin/**" = ["T201", "INP001", "EXE002"]  # Print statements, namespace packages, exec bit (utility scripts)
+"scripts/**" = ["T201", "D", "ANN", "S101", "S105", "INP001", "BLE001", "TRY300", "PLC0415", "PERF", "I001", "F401"]  # One-time validation scripts - relaxed rules
+".github/scripts/**" = ["T201", "D", "ANN", "PLR0913", "PLR0912", "PLR0915", "C901", "S701", "INP001"]  # Print, docstrings, annotations, complexity rules, jinja2 autoescape, namespace packages (CI scripts)
+"__init__.py" = ["D104"]  # Docstrings in packages
+"tests/**" = ["D", "ANN", "S101", "INP001", "PLR2004", "SLF001", "FBT", "PTH", "BLE001", "PLC0415", "C901", "PERF", "PLR0911", "PLR0912", "PLR0915", "S110", "PT011", "DTZ005", "RUF001"]  # Relaxed rules for tests
+"svc/**/tests/**" = ["D", "ANN", "S101", "INP001", "PLR2004", "SLF001", "FBT", "PTH", "BLE001", "PLC0415", "C901", "PERF", "PLR0911", "PLR0912", "PLR0915", "S110", "PT011", "DTZ005", "RUF001"]  # Same ignores for tests inside service directories
+"svc/**/tools.py" = ["D102", "D103", "D205", "D400", "D415", "D417", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", "ARG001", "ANN401", "C901", "S310", "BLE001", "N806", "TRY300", "RUF001"]  # MCP tool wrappers — legacy domain logic, relaxed rules
+"svc/**/customer_db.py" = ["D100", "D103", "D205", "ERA001", "FBT001", "FBT002", "PLR2004"]  # Mock data fixture modules — relaxed rules
+"svc/**/troubleshooting_data.py" = ["D100", "D103", "D205", "D400", "D415", "ERA001", "RUF001"]  # Static data with multi-line module docstring
+"svc/**/intent_catalog.py" = ["RUF001", "ERA001"]  # Slovak unicode literals
+"svc/**/clarification_scripts.py" = ["RUF001"]  # Slovak unicode literals
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+known-first-party = ["lib", "svc"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.flake8-import-conventions.extend-aliases]
+"datetime" = "dt"
+"sqlalchemy" = "sa"
+"sqlalchemy.ext.asyncio" = "sa_async"
+"sqlalchemy.dialects.postgresql" = "sa_pg"
+"sqlalchemy.exceptions" = "sa_exc"
+"pgvector.sqlalchemy" = "pgv"
+"cognitiveservices.speech.audio" = "speechsdk"
+"google.genai" = "genai"
+"presidio_analyzer.nlp_engine" = "presidio_nlp"
+"presidio_analyzer.predefined_recognizers" = "presidio_recognizers"
+
+# --- Based Pyright ---
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+pythonPlatform = "Linux"
+include = ["bin", "lib", "svc"]
+exclude = ["**/__pycache__", "**/tests/**"]
+ignore = ["**/*.pyi"]
+typeCheckingMode = "standard"
+enableTypeIgnoreComments = true
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportImplicitStringConcatenation = false
+reportImplicitOverride = false
+reportUninitializedInstanceVariable = false
+reportUnusedCallResult = false
+reportAny = false
+venvPath = "."
+venv = ".venv"
+
+# --- Coverage.py ---
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if __name__ == .__main__.:", "@(abc\\.)?abstractmethod"]
+ignore_errors = true
+skip_covered = true
+skip_empty = true
+sort = "-cover"

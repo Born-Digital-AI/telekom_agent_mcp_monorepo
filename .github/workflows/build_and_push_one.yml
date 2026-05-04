@@ -1,0 +1,68 @@
+name: Build and push one service
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: Service to build (folder name in svc/, e.g. mcp_telekom_cc_selfcare)
+        type: choice
+        required: true
+        options:
+          - mcp_template
+          - mcp_telekom
+          - mcp_telekom_cc_selfcare
+          - mcp_telekom_main_triage
+          - mcp_telekom_thd_selfcare
+      docker_tag:
+        description: Docker tag (e.g. v0.1.0 or latest)
+        required: true
+        default: latest
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image name
+        id: image
+        run: |
+          # Convert underscores to dashes for the image name (Docker convention)
+          image_name=$(echo "${{ github.event.inputs.service_name }}" | tr '_' '-')
+          echo "name=${image_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv (for requirements compilation if needed)
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Compile pinned requirements for the service
+        run: |
+          mkdir -p requirements
+          uv pip compile \
+            --generate-hashes \
+            --output-file "requirements/${{ github.event.inputs.service_name }}.txt" \
+            "svc/${{ github.event.inputs.service_name }}/requirements.in"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/service.Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            service_name=${{ github.event.inputs.service_name }}
+            git_commit=${{ github.sha }}
+          tags: |
+            borndigitalaibot/${{ steps.image.outputs.name }}:${{ github.event.inputs.docker_tag }}
+            borndigitalaibot/${{ steps.image.outputs.name }}:${{ github.sha }}

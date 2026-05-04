@@ -1,2 +1,3 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# For displaying the history of changes of particular function/method using
+# git log -L :<function or method>:<path to .py file>
+*.py diff=python

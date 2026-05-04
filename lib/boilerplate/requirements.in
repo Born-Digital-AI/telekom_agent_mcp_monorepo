@@ -1,0 +1,14 @@
+# Direct local dependencies
+
+# Direct 3rd-party dependencies
+fastapi
+prometheus-client
+pydantic
+pydantic-settings
+pyyaml
+python-logstash-async
+python-json-logger
+
+# No need to install the extras for sentry-sdk, they just state the minimal supported versions
+sentry-sdk
+setproctitle
