@@ -12,8 +12,60 @@ This module provides drop-in replacements for ``ToolRegistry`` and ``mcp_tool``
 that route registrations to a FastMCP instance and inject ``_meta`` from the
 ContextVars populated by :class:`lib.mcp_service.middleware.TracingMiddleware`.
 
-The wrapper hides the ``_meta`` parameter from the MCP schema (so the LLM
-doesn't see it) while still passing it to the underlying function.
+The wrapper:
+
+- Hides the ``_meta`` parameter from the MCP schema (so the LLM doesn't see it)
+  while still passing it to the underlying function.
+- Preserves async-ness — ``async def`` tools produce an awaitable wrapper, sync
+  tools stay sync.
+- Ignores ``input_schema=`` (FastMCP derives the schema from the function
+  signature; the old manual override is no-op).
+
+Migration workflow (legacy ``my-mcp-server/projects/<name>/``)
+--------------------------------------------------------------
+
+1. Copy the project's ``.py`` files into ``svc/mcp_<name>/``.
+2. In ``tools.py`` swap two imports — ``mcp_server`` → this module, and any
+   sibling imports to relative form::
+
+        # before:
+        # from mcp_server import ToolRegistry, mcp_tool
+        # from customer_db import find_by_phone
+
+        # after:
+        from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
+        from .customer_db import find_by_phone
+
+3. Drop the legacy sys-path bootstrap (no longer needed under per-service layout)::
+
+        # remove:
+        # _project_dir = Path(__file__).parent
+        # if str(_project_dir) not in sys.path:
+        #     sys.path.insert(0, str(_project_dir))
+
+4. Add ``svc/mcp_<name>/__init__.py`` that plugs ``register(registry)`` into
+   FastMCP::
+
+        from lib.mcp_service import MCPService, MCPServiceConfig
+        from lib.mcp_service.legacy_compat import ToolRegistry
+        from .tools import register
+
+        class MCPMyService(MCPService[MCPServiceConfig]):
+            NAME = "mcp-my-service"
+            TEAM = "your-team"
+
+            def setup_tools(self, mcp):
+                registry = ToolRegistry(mcp)
+                register(registry)
+
+        SERVICE_CLASS = MCPMyService
+
+5. Drop legacy artefacts that don't apply: ``project.json`` (replaced by config
+   class), ``startup.py`` (move logic into ``__init__``), ``web.py`` (custom
+   HTTP routes — re-implement via ``MCPService.register_http_endpoints`` if
+   actually needed).
+
+Worked example: :mod:`svc.mcp_telekom_cc_selfcare`.
 """
 
 from __future__ import annotations

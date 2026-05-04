@@ -118,4 +118,8 @@ Kubernetes deployment is handled by separate repos (`non-prod-kubernetes`, `aks-
 
 ## Adding a new MCP server
 
-See [NEW_MCP_GUIDE.md](NEW_MCP_GUIDE.md).
+See [AGENTS.md](AGENTS.md) — the conventions and step-by-step skeleton are
+maintained there for both human contributors and AI coding agents. For
+porting tools from the legacy `my-mcp-server` repo, the migration recipe lives
+in the [`lib/mcp_service/legacy_compat.py`](lib/mcp_service/legacy_compat.py)
+module docstring.
