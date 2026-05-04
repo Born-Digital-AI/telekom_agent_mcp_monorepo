@@ -12,7 +12,7 @@ from lib.mcp_service.legacy_compat import _wrap_for_fastmcp, mcp_tool
 
 @pytest.mark.unit
 def test_wrap_strips_meta_from_signature() -> None:
-    def legacy_tool(arg: str, _meta: dict | None = None) -> str:  # noqa: ARG001
+    def legacy_tool(arg: str, _meta: dict | None = None) -> str:
         return arg
 
     wrapped = _wrap_for_fastmcp(legacy_tool)

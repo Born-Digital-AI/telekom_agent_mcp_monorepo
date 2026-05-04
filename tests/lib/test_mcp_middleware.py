@@ -20,7 +20,7 @@ def _scope(headers: list[tuple[bytes, bytes]]) -> dict:
 async def test_middleware_binds_conversation_and_interaction_ids() -> None:
     captured: dict[str, str] = {}
 
-    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001, ANN001
+    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001
         captured["conversation_id"] = current_conversation_id.get("")
         captured["interaction_id"] = current_interaction_id.get("")
         captured["trace_id"] = current_trace_id.get("")
@@ -56,7 +56,7 @@ async def test_middleware_binds_conversation_and_interaction_ids() -> None:
 async def test_middleware_generates_trace_id_when_absent() -> None:
     seen_trace: dict[str, str] = {}
 
-    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001, ANN001
+    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001
         seen_trace["value"] = current_trace_id.get("")
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
@@ -77,7 +77,7 @@ async def test_middleware_generates_trace_id_when_absent() -> None:
 async def test_middleware_truncates_oversized_trace_id() -> None:
     seen_trace: dict[str, str] = {}
 
-    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001, ANN001
+    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001
         seen_trace["value"] = current_trace_id.get("")
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
@@ -100,7 +100,7 @@ async def test_middleware_skips_non_http_scopes() -> None:
     """Lifespan/websocket scopes must pass through untouched."""
     inner_called = False
 
-    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001, ANN001
+    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001
         nonlocal inner_called
         inner_called = True
 
