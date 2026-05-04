@@ -9,9 +9,7 @@ on:
         required: true
         options:
           - mcp_template
-          - mcp_telekom
           - mcp_telekom_cc_selfcare
-          - mcp_telekom_main_triage
           - mcp_telekom_thd_selfcare
       docker_tag:
         description: Docker tag (e.g. v0.1.0 or latest)

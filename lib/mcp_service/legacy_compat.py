@@ -66,16 +66,33 @@ def _wrap_for_fastmcp(func: Callable[..., Any]) -> Callable[..., Any]:
 
     - Removes ``_meta`` from the visible signature.
     - Injects a fresh ``_meta`` dict on every call from the active ContextVars.
+    - Preserves async-ness: an ``async def`` ``func`` produces an ``async`` wrapper
+      so FastMCP awaits the coroutine. A sync ``func`` produces a sync wrapper.
     """
     accepts_meta = "_meta" in inspect.signature(func).parameters
 
-    @functools.wraps(func)
-    def wrapped(**kwargs: Any) -> Any:  # noqa: ANN401
-        # Never trust an explicit `_meta` from the caller — always overwrite.
+    def _inject_meta(kwargs: dict[str, Any]) -> None:
         kwargs.pop("_meta", None)
         if accepts_meta:
             kwargs["_meta"] = _build_meta()
-        return func(**kwargs)
+
+    wrapped: Callable[..., Any]
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def async_wrapped(**kwargs: Any) -> Any:  # noqa: ANN401
+            _inject_meta(kwargs)
+            return await func(**kwargs)
+
+        wrapped = async_wrapped
+    else:
+
+        @functools.wraps(func)
+        def sync_wrapped(**kwargs: Any) -> Any:  # noqa: ANN401
+            _inject_meta(kwargs)
+            return func(**kwargs)
+
+        wrapped = sync_wrapped
 
     wrapped.__signature__ = _strip_meta_signature(func)  # type: ignore[attr-defined]
     if hasattr(wrapped, "__annotations__"):

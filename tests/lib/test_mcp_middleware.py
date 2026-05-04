@@ -46,10 +46,10 @@ async def test_middleware_binds_conversation_and_interaction_ids() -> None:
     assert captured["conversation_id"] == "conv-42"
     assert captured["interaction_id"] == "int-7"
     assert captured["trace_id"] == "DEADBEEF"
-    # Response start frame must echo X-Trace-Id back
+    # Response start frame must echo X-Trace-Id back (lowercase per ASGI spec)
     start_frame = next(m for m in sent if m["type"] == "http.response.start")
     response_headers = dict(start_frame["headers"])
-    assert response_headers[b"X-Trace-Id"] == b"DEADBEEF"
+    assert response_headers[b"x-trace-id"] == b"DEADBEEF"
 
 
 @pytest.mark.unit

@@ -33,12 +33,28 @@ WAKEUP_FREQUENCY = 10  # How many times per second to check for graceful shutdow
 
 
 def get_service_and_config(service_name: str) -> tuple[type[Service], type[ServiceConfig]]:
-    """Get a concrete configuration class for a service with given name."""
+    """Get a concrete configuration class for a service with given name.
+
+    Resolves the config class by walking ``__orig_bases__`` for the parameterised
+    generic ``Service[ConcreteConfig]`` (or ``MCPService[ConcreteConfig]``).
+    This avoids forcing each concrete service to redeclare ``__init__`` — without
+    a redeclaration, ``typing.get_type_hints(cls.__init__)`` would fail to resolve
+    the unbound TypeVar ``ConcreteConfig``.
+    """
     service_module = importlib.import_module(f"svc.{service_name}")
     service_class = service_module.SERVICE_CLASS
-    config_class: type[ServiceConfig] = typing.get_type_hints(service_class.__init__)["config"]
 
-    return service_class, config_class
+    for base in getattr(service_class, "__orig_bases__", ()):
+        for arg in typing.get_args(base):
+            if isinstance(arg, type) and issubclass(arg, ServiceConfig):
+                return service_class, arg
+
+    msg = (
+        f"Cannot resolve config class for {service_class!r}. "
+        f"The service must inherit from a parameterised base, "
+        f"e.g. `class MyService(MCPService[MyConfig])`."
+    )
+    raise TypeError(msg)
 
 
 def create_service(name: str, **config_overrides: Any) -> Service:  # noqa: ANN401

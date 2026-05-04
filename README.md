@@ -22,9 +22,7 @@ The repo follows the conventions of the production `python-monorepo`:
 │   └── monorepo/        Filesystem helpers used by bin/ scripts and CI
 ├── svc/
 │   ├── mcp_template/                  Reference example
-│   ├── mcp_telekom/                   Top-level intent classifier
 │   ├── mcp_telekom_cc_selfcare/       Authentication + invoice resend
-│   ├── mcp_telekom_main_triage/       Selfcare routing + handover
 │   └── mcp_telekom_thd_selfcare/      Fixed internet troubleshooting
 ├── tests/
 ├── requirements/        Generated pinned requirements (committed)

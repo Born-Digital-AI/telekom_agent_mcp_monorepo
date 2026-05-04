@@ -72,3 +72,37 @@ def test_mcp_tool_decorator_returns_function_unchanged() -> None:
         return "ok"
 
     assert tool() == "ok"
+
+
+@pytest.mark.unit
+async def test_wrap_preserves_async_for_coroutine_functions() -> None:
+    """Async tools must produce an awaitable wrapper, not a sync wrapper that returns a coroutine."""
+    captured: dict = {}
+
+    async def legacy_async_tool(arg: str, _meta: dict | None = None) -> str:
+        captured["arg"] = arg
+        captured["meta"] = _meta
+        return arg.upper()
+
+    wrapped = _wrap_for_fastmcp(legacy_async_tool)
+    assert inspect.iscoroutinefunction(wrapped)
+
+    current_conversation_id.set("conv-async")
+    try:
+        result = await wrapped(arg="hi")
+    finally:
+        current_conversation_id.set("")
+
+    assert result == "HI"
+    assert captured["arg"] == "hi"
+    assert captured["meta"]["conversation_id"] == "conv-async"
+
+
+@pytest.mark.unit
+def test_wrap_keeps_sync_for_plain_functions() -> None:
+    def legacy_sync_tool(arg: str) -> str:
+        return arg.upper()
+
+    wrapped = _wrap_for_fastmcp(legacy_sync_tool)
+    assert not inspect.iscoroutinefunction(wrapped)
+    assert wrapped(arg="x") == "X"

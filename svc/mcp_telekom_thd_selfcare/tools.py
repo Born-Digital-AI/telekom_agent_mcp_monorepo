@@ -15,11 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import urllib.error
 import urllib.request
 from typing import Any
 
 from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
+from lib.mcp_service.state import TTLStore
 
 from .customer_db import (
     find_by_kod_adresata,
@@ -36,6 +38,7 @@ from .troubleshooting_data import (
 )
 
 _NLP_BASE_URL = os.environ.get("GOODBOT_URL", "http://goodbot.internal-test.svc.cluster.local:8121")
+_SESSION_TTL_SECONDS = 30 * 60  # Drop session state 30 minutes after last write.
 _log = logging.getLogger(__name__)
 
 
@@ -43,32 +46,48 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
+_NLP_TIMEOUT_SECONDS = 1.0  # Hard cap so a slow NLP doesn't extend the tool's latency budget.
+
+
 def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
+    """Fire-and-forget PUT to the NLP engine state endpoint.
+
+    Spawned in a daemon thread so the calling tool returns immediately. Errors
+    are logged at WARNING level. The HTTP timeout is intentionally aggressive
+    (``_NLP_TIMEOUT_SECONDS``) so a stalled NLP can't accumulate threads.
+    """
     url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
     payload = {"named_entities": named_entities}
     body = json.dumps(payload, ensure_ascii=False).encode()
-    req = urllib.request.Request(
-        url, data=body, method="PUT", headers={"Content-Type": "application/json"}
-    )
-    _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
-    try:
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            resp_body = resp.read().decode("utf-8", errors="replace")
-            _log.info("NLP state PUT %s -> HTTP %s body=%s", url, resp.status, resp_body)
-    except urllib.error.HTTPError as exc:
-        resp_body = exc.read().decode("utf-8", errors="replace")
-        _log.warning("NLP state PUT %s -> HTTP %s body=%s", url, exc.code, resp_body)
-    except Exception as exc:
-        _log.warning("NLP state PUT %s -> error: %s", url, exc)
+
+    def _do() -> None:
+        req = urllib.request.Request(
+            url, data=body, method="PUT", headers={"Content-Type": "application/json"}
+        )
+        _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
+        try:
+            with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
+                resp_body = resp.read().decode("utf-8", errors="replace")
+                _log.info("NLP state PUT %s -> HTTP %s body=%s", url, resp.status, resp_body)
+        except urllib.error.HTTPError as exc:
+            resp_body = exc.read().decode("utf-8", errors="replace")
+            _log.warning("NLP state PUT %s -> HTTP %s body=%s", url, exc.code, resp_body)
+        except Exception as exc:
+            _log.warning("NLP state PUT %s -> error: %s", url, exc)
+
+    threading.Thread(target=_do, daemon=True, name="nlp-state-put").start()
 
 
-# Per-conversation session state (in-memory)
-_SESSION_STATE: dict[str, dict[str, Any]] = {}
+# Per-conversation session state. Process-local — NOT shared across replicas.
+# Run this service with replicas=1, or replace with Redis when scaling out.
+# See AGENTS.md > "State management".
+_SESSION_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_SESSION_TTL_SECONDS)
 
 
 def _get_state(conversation_id: str) -> dict[str, Any]:
-    if conversation_id not in _SESSION_STATE:
-        _SESSION_STATE[conversation_id] = {
+    state = _SESSION_STATE.get(conversation_id)
+    if state is None:
+        state = {
             "customer_id": None,
             "service_point": None,
             "router_model": None,
@@ -78,7 +97,8 @@ def _get_state(conversation_id: str) -> dict[str, Any]:
             "current_step_index": 0,
             "completed_steps": [],
         }
-    return _SESSION_STATE[conversation_id]
+        _SESSION_STATE.set(conversation_id, state)
+    return state
 
 
 def register(registry: ToolRegistry) -> None:

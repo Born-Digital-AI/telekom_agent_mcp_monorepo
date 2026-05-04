@@ -102,11 +102,6 @@ class MCPMyService(MCPService[MCPMyServiceConfig]):
     CPU_LIMIT = "1000m"
     MEMORY_LIMIT = "512Mi"
 
-    def __init__(self, config: MCPMyServiceConfig) -> None:
-        # REQUIRED. Without this concrete __init__, typing.get_type_hints
-        # cannot resolve the generic ConcreteConfig and bin/run_service.py fails.
-        super().__init__(config)
-
     def setup_tools(self, mcp: FastMCP) -> None:
         @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
         async def my_tool(
@@ -223,6 +218,25 @@ async def my_tool(arg: str) -> str:
 ```
 
 Both will be empty strings if the caller didn't send the headers — branch defensively.
+
+## State management
+
+Services that need transient per-conversation state (auth progress, multi-step
+flows) should use `lib.mcp_service.state.TTLStore` rather than a plain `dict`:
+
+```python
+from lib.mcp_service.state import TTLStore
+
+_AUTH_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=30 * 60)
+```
+
+`TTLStore` evicts entries that haven't been written for `ttl_seconds`. This
+prevents the unbounded-memory growth a plain `dict` keyed on conversation_id
+suffers in production.
+
+**Single-replica only.** `TTLStore` is process-local. If a service uses it,
+the K8s deployment must run `replicas=1`. For multi-replica scale-out,
+replace it with a Redis (or similar) shared store.
 
 ## Configuration rules
 

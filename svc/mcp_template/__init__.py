@@ -30,9 +30,6 @@ class MCPTemplate(MCPService[MCPTemplateConfig]):
     CPU_LIMIT = "500m"
     MEMORY_LIMIT = "256Mi"
 
-    def __init__(self, config: MCPTemplateConfig) -> None:
-        super().__init__(config)
-
     def setup_tools(self, mcp: FastMCP) -> None:
         """Register the demo tools on the FastMCP instance."""
         read_only = ToolAnnotations(readOnlyHint=True, idempotentHint=True)

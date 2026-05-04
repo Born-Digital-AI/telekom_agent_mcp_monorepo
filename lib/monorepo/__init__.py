@@ -9,7 +9,7 @@ import pathlib
 import re
 
 DEFAULT_BASE_IMAGE = "base-debian"
-REQUIREMENTS_REGEX = re.compile("^ *-r .*shared/([a-zA-Z_1-9]+)/")
+REQUIREMENTS_REGEX = re.compile(r"^ *-r .*shared/([a-zA-Z_0-9]+)/")
 
 
 def get_service_names() -> set[str]:

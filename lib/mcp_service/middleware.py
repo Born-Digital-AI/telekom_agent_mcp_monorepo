@@ -77,12 +77,16 @@ class TracingMiddleware:
         set_conversation_id(_header(headers, CONVERSATION_ID_HEADER))
         set_interaction_id(_header(headers, INTERACTION_ID_HEADER))
 
+        # ASGI spec recommends lowercased response header names. uvicorn lowercases
+        # them on the wire anyway, but downstream HTTP clients vary in case-sensitivity
+        # so we emit the canonical form directly.
+        trace_header_name = TRACE_HEADER.lower().encode("latin-1")
+        trace_id_bytes = trace_id.encode("latin-1")
+
         async def send_with_trace(message: Message) -> None:
             if message["type"] == "http.response.start":
                 response_headers = list(message.get("headers", []))
-                response_headers.append(
-                    (TRACE_HEADER.encode("latin-1"), trace_id.encode("latin-1")),
-                )
+                response_headers.append((trace_header_name, trace_id_bytes))
                 message["headers"] = response_headers
             await send(message)
 

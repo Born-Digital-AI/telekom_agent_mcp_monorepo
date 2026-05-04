@@ -1,7 +1,6 @@
 # Direct local dependencies
 
 # Direct 3rd-party dependencies
-fastapi
 prometheus-client
 pydantic
 pydantic-settings

@@ -30,9 +30,6 @@ class MCPTelekomThdSelfcare(MCPService[MCPTelekomThdSelfcareConfig]):
     CPU_LIMIT = "1000m"
     MEMORY_LIMIT = "512Mi"
 
-    def __init__(self, config: MCPTelekomThdSelfcareConfig) -> None:
-        super().__init__(config)
-
     def setup_tools(self, mcp: FastMCP) -> None:
         """Register the THD Selfcare tools onto FastMCP via the legacy registry adapter."""
         registry = ToolRegistry(mcp)
