@@ -114,7 +114,7 @@ GitHub Actions provides:
 - [`.github/workflows/build_and_push_one.yml`](.github/workflows/build_and_push_one.yml) — manual per-service Docker build & push to Docker Hub.
 - [`.github/workflows/build_and_push_all.yml`](.github/workflows/build_and_push_all.yml) — manual or release-triggered build for every service.
 
-Kubernetes deployment is handled by separate repos (`non-prod-kubernetes`, `aks-prod-kubernetes`) — this repo only produces images.
+Kubernetes deployment is handled by separate repos (`non-prod-kubernetes`, `aks-prod-kubernetes`) — this repo only produces images. Reference manifests for each service live in [`k8s/`](k8s/) and can be copied into the environment-specific deployment repo.
 
 ## Adding a new MCP server
 

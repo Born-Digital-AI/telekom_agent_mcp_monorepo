@@ -12,10 +12,11 @@ import sys
 import typing
 from typing import TYPE_CHECKING
 
+import pydantic
 import setproctitle
 import yaml
 
-from lib.boilerplate.error_reporting import ErrorReportingConfig
+from lib.boilerplate.config import Config
 from lib.boilerplate.exceptions import ProcessingError
 from lib.boilerplate.logging import LogColor, random_trace_id, set_service_details, set_trace_id
 from lib.boilerplate.metrics import Metrics
@@ -104,11 +105,12 @@ class NoAliasDumper(yaml.SafeDumper):
         return True
 
 
-class ServiceConfig(ErrorReportingConfig):
+class ServiceConfig(Config):
     """Common configuration options shared by all services."""
 
     colorize_logs: bool = True
     collect_metrics: bool = True  # Disable when Prometheus is not scraping (to avoid OOM)
+    git_commit: str = pydantic.Field(default=os.getenv("GIT_COMMIT", "local"))
 
 
 class Service[ConcreteConfig: ServiceConfig]:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from lib.boilerplate.config import ENV_PREFIX, Config, env_variable_for_option, get_default_config
-from lib.boilerplate.error_reporting import configure_error_reporting
 from lib.boilerplate.exceptions import (
     ApplicationError,
     ConfigError,
@@ -59,7 +58,6 @@ __all__ = [
     "ResourceConfig",
     "Service",
     "ServiceConfig",
-    "configure_error_reporting",
     "configure_logger",
     "configure_logging",
     "create_service",

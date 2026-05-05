@@ -29,7 +29,6 @@ monorepo_root_path: pathlib.Path = pathlib.Path().cwd()
 sys.path.append(str(monorepo_root_path))
 
 from lib.boilerplate import (  # noqa: E402
-    configure_error_reporting,
     configure_logging,
     running_service,
 )
@@ -44,7 +43,6 @@ async def run_service(
 ) -> None:
     """Run a service with given name and configuration options."""
     configure_logging()
-    configure_error_reporting()
 
     async with running_service(
         service_name, ignore_defaults=ignore_defaults, **config_overrides

@@ -90,7 +90,6 @@ COMPATIBLE_PACKAGES = {
     "websockets",  # BSD-3-Clause license but metadata shows as N/A
     "azure-core",  # MIT license but metadata shows as N/A
     "python-json-logger",  # BSD-2-Clause license but metadata shows as N/A
-    "sentry-sdk",  # MIT license but metadata shows as N/A
     "jiter",  # MIT license but metadata shows as N/A
 }
 
