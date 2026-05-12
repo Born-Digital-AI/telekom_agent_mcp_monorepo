@@ -2,13 +2,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mcp-telekom-thd-selfcare
+  namespace: internal-test
   labels:
     app: mcp-telekom-thd-selfcare
-    team: telekom
-  namespace: development
 spec:
-  selector:
-    app: mcp-telekom-thd-selfcare
+  type: ClusterIP
   ports:
     - name: mcp
       protocol: TCP
@@ -18,4 +16,5 @@ spec:
       protocol: TCP
       port: 8080
       targetPort: 8080
-  type: ClusterIP
+  selector:
+    app: mcp-telekom-thd-selfcare
