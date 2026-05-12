@@ -22,7 +22,13 @@ class _FakeMCP:
     def __init__(self) -> None:
         self.registered: dict[str, Any] = {}
 
-    def tool(self, *, annotations: Any = None, name: str | None = None, description: str | None = None):  # noqa: ARG002
+    def tool(
+        self,
+        *,
+        annotations: Any = None,  # noqa: ARG002
+        name: str | None = None,
+        description: str | None = None,  # noqa: ARG002
+    ):
         def decorator(fn: Any) -> Any:
             self.registered[name or fn.__name__] = fn
             return fn
@@ -190,8 +196,16 @@ async def test_get_document_fetches_doc_and_chunks_in_parallel(fixture) -> None:
 async def test_get_document_without_chunks_skips_chunks_call(fixture) -> None:
     tools, client, _ = fixture
     client.get_document_responses.append(
-        {"id": 5, "name": "x", "annotation": None, "labels": [], "url": None,
-         "tokens_count": None, "created_at": "2026-01-01T00:00:00Z", "updated_at": None}
+        {
+            "id": 5,
+            "name": "x",
+            "annotation": None,
+            "labels": [],
+            "url": None,
+            "tokens_count": None,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": None,
+        }
     )
 
     result = json.loads(await tools["get_document"](document_id=5, include_chunks=False))

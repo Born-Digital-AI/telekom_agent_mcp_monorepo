@@ -80,7 +80,9 @@ def register(
         ] = None,
         labels: Annotated[
             list[str] | None,
-            pydantic.Field(description="Optional list of labels — documents must carry all of them"),
+            pydantic.Field(
+                description="Optional list of labels — documents must carry all of them"
+            ),
         ] = None,
         sort_column: Annotated[
             Literal["id", "name", "created_at", "updated_at", "tokens_count"],
@@ -272,9 +274,7 @@ def register(
             page = 1
             page_size = 100
             while True:
-                result = await client.list_documents(
-                    index_id=index_id, page=page, limit=page_size
-                )
+                result = await client.list_documents(index_id=index_id, page=page, limit=page_size)
                 docs = result.get("data", [])
                 document_count += len(docs)
                 for d in docs:
