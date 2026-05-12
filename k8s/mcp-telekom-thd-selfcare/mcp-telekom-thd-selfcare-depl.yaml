@@ -7,10 +7,11 @@ metadata:
     team: telekom
   namespace: development
 spec:
-  # Service uses lib.mcp_service.state.TTLStore for per-conversation
-  # troubleshooting session state. State is process-local — DO NOT scale
-  # beyond 1 replica without switching to a shared store. See
-  # AGENTS.md > "State management".
+  # Service caches the distinct-labels list in a process-local TTL store
+  # (svc/.../indexer_client.py: LabelsCache). Multiple replicas would each
+  # hold an independent cache — harmless for correctness, but defeats the
+  # cache hit on alternating replicas. Keep at 1 unless cache-hit rate is
+  # not a concern. See AGENTS.md > "State management".
   replicas: 1
   selector:
     matchLabels:
@@ -73,9 +74,22 @@ spec:
             #       name: mcp-server-secret
             #       key: mcp-auth-api-key
 
-            # Telekom-specific: NLP engine endpoint for state propagation
-            - name: GOODBOT_URL
-              value: 'http://goodbot.development.svc.cluster.local:8121'
+            # Indexer (RAG knowledge base). REQUIRED — service refuses to start
+            # without these. Replace placeholder IDs with the real index for the
+            # target environment.
+            - name: APP_INDEXER_URL
+              value: 'http://indexer.development.svc.cluster.local:8000'
+            - name: APP_INDEXER_INDEX_ID
+              value: '0'  # TODO: real index_id for this environment
+            - name: APP_INDEXER_ORGANIZATION_ID
+              value: ''  # TODO: real organization_id
+            - name: APP_INDEXER_PROJECT_ID
+              value: ''  # TODO: real project_id
+            # Optional tuning (defaults shown):
+            # - name: APP_INDEXER_TIMEOUT_SECONDS
+            #   value: '30.0'
+            # - name: APP_INDEXER_LABELS_CACHE_TTL_SECONDS
+            #   value: '300'
 
             # Logstash → Kibana
             - name: APP_LOGSTASH_ENABLED
