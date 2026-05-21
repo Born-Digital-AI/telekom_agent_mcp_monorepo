@@ -15,6 +15,14 @@ from typing import TYPE_CHECKING, Annotated, Any
 import pydantic
 
 from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
+from svc.mcp_telekom_identity.dps_get_client import (
+    DPSAuthError,
+    DPSError,
+    DPSInvalidResponseError,
+    DPSNetworkError,
+    DPSTimeoutError,
+    DPSUpstreamError,
+)
 
 if TYPE_CHECKING:
     from svc.mcp_telekom_identity.dps_get_client import DPSGetClient
@@ -114,6 +122,40 @@ def _candidate(
     }
 
 
+def _dps_error_payload(exc: DPSError) -> dict[str, Any]:
+    if isinstance(exc, DPSAuthError):
+        return {
+            "found": False,
+            "error": "auth_failed",
+            "message": (
+                "Autentifikácia voči systému DPS zlyhala. Skontrolujte konfiguráciu tokenu."
+            ),
+        }
+    if isinstance(exc, DPSTimeoutError):
+        return {
+            "found": False,
+            "error": "upstream_timeout",
+            "message": "Systém DPS nestihol odpovedať v limite. Skúste znova.",
+        }
+    if isinstance(exc, DPSNetworkError):
+        return {
+            "found": False,
+            "error": "upstream_unreachable",
+            "message": ("Nedá sa pripojiť k systému DPS. Skontrolujte sieťové pripojenie."),
+        }
+    if isinstance(exc, (DPSUpstreamError, DPSInvalidResponseError)):
+        return {
+            "found": False,
+            "error": "upstream_error",
+            "message": ("Systém DPS momentálne nie je dostupný. Skúste o chvíľu znova."),
+        }
+    return {
+        "found": False,
+        "error": "upstream_error",
+        "message": ("Systém DPS momentálne nie je dostupný. Skúste o chvíľu znova."),
+    }
+
+
 def register(
     registry: ToolRegistry,
     *,
@@ -150,7 +192,11 @@ def register(
             max_candidates,
         )
 
-        parties_raw = await client.get_parties_by_identification(rc, "socialSecurityNumber")
+        try:
+            parties_raw = await client.get_parties_by_identification(rc, "socialSecurityNumber")
+        except DPSError as exc:
+            _log.warning("identifikacia_rodne_cislo party lookup failed: %s", exc)
+            return _json(_dps_error_payload(exc))
 
         # Filter to Party records with status=initialized, dedup by id.
         seen: set[str] = set()
@@ -182,9 +228,13 @@ def register(
         truncated = total > max_candidates
 
         # Step B fanout, concurrently per Party.
-        customer_lists = await asyncio.gather(
-            *(client.get_customers_by_engaged_party(p["id"]) for p in capped)
-        )
+        try:
+            customer_lists = await asyncio.gather(
+                *(client.get_customers_by_engaged_party(p["id"]) for p in capped)
+            )
+        except DPSError as exc:
+            _log.warning("identifikacia_rodne_cislo customer fanout failed: %s", exc)
+            return _json(_dps_error_payload(exc))
 
         candidates: list[dict[str, Any]] = []
         for party, customers in zip(capped, customer_lists, strict=True):

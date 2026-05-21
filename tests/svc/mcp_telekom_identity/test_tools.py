@@ -10,6 +10,13 @@ import pytest
 from lib.boilerplate.logging import current_conversation_id, current_interaction_id
 from lib.mcp_service.legacy_compat import ToolRegistry
 from svc.mcp_telekom_identity import tools as identity_tools
+from svc.mcp_telekom_identity.dps_get_client import (
+    DPSAuthError,
+    DPSInvalidResponseError,
+    DPSNetworkError,
+    DPSTimeoutError,
+    DPSUpstreamError,
+)
 
 
 class _FakeMCP:
@@ -338,3 +345,57 @@ async def test_address_formatting_handles_missing_pieces(make_tool, conv) -> Non
     result = await _call(tool, rodne_cislo="8753189467")
     [c] = result["candidates"]
     assert {"type": "address", "value": "Mierová, 04001 Košice"} in c["contacts"]
+
+
+@pytest.mark.unit
+async def test_auth_error_maps_to_auth_failed_json(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(parties=DPSAuthError("bad token"))
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result == {
+        "found": False,
+        "error": "auth_failed",
+        "message": ("Autentifikácia voči systému DPS zlyhala. Skontrolujte konfiguráciu tokenu."),
+    }
+
+
+@pytest.mark.unit
+async def test_upstream_error_maps_to_upstream_error_json(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(parties=DPSUpstreamError(503))
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is False
+    assert result["error"] == "upstream_error"
+    assert "DPS" in result["message"]
+
+
+@pytest.mark.unit
+async def test_timeout_error_maps_to_upstream_timeout_json(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(parties=DPSTimeoutError("slow"))
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is False
+    assert result["error"] == "upstream_timeout"
+
+
+@pytest.mark.unit
+async def test_network_error_maps_to_upstream_unreachable_json(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(parties=DPSNetworkError("dns"))
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is False
+    assert result["error"] == "upstream_unreachable"
+
+
+@pytest.mark.unit
+async def test_invalid_response_maps_to_upstream_error_json(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(parties=DPSInvalidResponseError("bad json"))
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is False
+    assert result["error"] == "upstream_error"
+
+
+@pytest.mark.unit
+async def test_customer_call_auth_error_also_maps_cleanly(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(
+        parties=[_full_party()],
+        customers_by_party=DPSAuthError("nope"),
+    )
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["error"] == "auth_failed"
