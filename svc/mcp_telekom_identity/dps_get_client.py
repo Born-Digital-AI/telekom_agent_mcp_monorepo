@@ -5,11 +5,6 @@ GET-only. Mutating endpoints will live in a separate module when needed.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
-
 
 class DPSError(Exception):
     """Base class for all DPS client errors."""
@@ -47,6 +42,7 @@ class DPSGetClient:
         base_url: str,
         bearer_token: str,
         timeout_seconds: float,
+        *,
         verify_tls: bool,
     ) -> None:
         self._base_url = base_url.rstrip("/")
