@@ -11,6 +11,7 @@ on:
           - mcp_template
           - mcp_telekom_cc_selfcare
           - mcp_telekom_thd_selfcare
+          - mcp_telekom_identity
       docker_tag:
         description: Docker tag (e.g. v0.1.0 or latest)
         required: true
