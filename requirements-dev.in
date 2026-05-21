@@ -16,3 +16,4 @@ pytest-mock
 pytest-sourceorder
 ruff
 python-json-logger
+respx
