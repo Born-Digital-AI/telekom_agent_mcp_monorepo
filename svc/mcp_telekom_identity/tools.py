@@ -33,6 +33,28 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+def _candidate_from_party_only(party: dict[str, Any]) -> dict[str, Any]:
+    """Build a candidate record from a Party with no Customer enrichment yet."""
+    ind = party.get("individual") or {}
+    given = ind.get("givenName") or ""
+    family = ind.get("familyName") or ""
+    name = " ".join(part for part in (given, family) if part) or None
+    return {
+        "party_id": party.get("id"),
+        "customer_id": None,
+        "name": name,
+        "given_name": given or None,
+        "family_name": family or None,
+        "status": None,
+        "market_segment": None,
+        "customer_segment": None,
+        "treatment_package": None,
+        "valid_for": None,
+        "contacts": [],
+        "identifications": [],
+    }
+
+
 def register(
     registry: ToolRegistry,
     *,
@@ -68,6 +90,51 @@ def register(
             rc[-4:],
             max_candidates,
         )
-        # Step A/B implemented in later tasks.
-        await client.get_parties_by_identification(rc, "socialSecurityNumber")
-        return _json({"found": False, "error": "not_found", "message": "stub"})
+
+        parties_raw = await client.get_parties_by_identification(rc, "socialSecurityNumber")
+
+        # Filter to Party records with status=initialized, dedup by id.
+        seen: set[str] = set()
+        parties: list[dict[str, Any]] = []
+        for p in parties_raw:
+            if p.get("entityType") != "Party":
+                continue
+            if p.get("status") != "initialized":
+                continue
+            pid = p.get("id")
+            if not isinstance(pid, str) or pid in seen:
+                continue
+            seen.add(pid)
+            parties.append(p)
+
+        if not parties:
+            return _json(
+                {
+                    "found": False,
+                    "error": "not_found",
+                    "message": (
+                        "Pre zadané rodné číslo nebol nájdený žiadny zákazník v systéme DPS."
+                    ),
+                }
+            )
+
+        total = len(parties)
+        capped = parties[:max_candidates]
+        truncated = total > max_candidates
+
+        # Step B is added in Task 8; for now emit candidates with customer_id=None.
+        candidates = [_candidate_from_party_only(p) for p in capped]
+        # Each Party also triggers a customer-management lookup (kept as a no-op
+        # call here so the cap test can assert the call count).
+        for p in capped:
+            await client.get_customers_by_engaged_party(p["id"])
+
+        return _json(
+            {
+                "found": True,
+                "total_party_matches": total,
+                "returned_count": len(candidates),
+                "truncated": truncated,
+                "candidates": candidates,
+            }
+        )

@@ -115,3 +115,68 @@ async def test_valid_format_reaches_party_call(make_tool, conv, good) -> None:  
     tool, stub = make_tool(parties=[])
     await _call(tool, rodne_cislo=good)
     assert stub.party_calls == [(good, "socialSecurityNumber")]
+
+
+def _party(party_id: str, status: str = "initialized", entity_type: str = "Party") -> dict:
+    return {
+        "id": party_id,
+        "status": status,
+        "entityType": entity_type,
+        "type": "individual",
+        "individual": {
+            "givenName": "Tester",
+            "familyName": "AT NECHYTAT",
+            "individualIdentifications": [],
+        },
+        "contacts": [],
+    }
+
+
+@pytest.mark.unit
+async def test_not_found_when_no_party_matches(make_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tool(parties=[])
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result == {
+        "found": False,
+        "error": "not_found",
+        "message": "Pre zadané rodné číslo nebol nájdený žiadny zákazník v systéme DPS.",
+    }
+
+
+@pytest.mark.unit
+async def test_filters_contactparty_and_non_initialized(make_tool, conv) -> None:  # noqa: ARG001
+    parties = [
+        _party("PARTY_1"),
+        _party("PARTY_2", entity_type="ContactParty"),
+        _party("PARTY_3", status="terminated"),
+        _party("PARTY_4"),
+    ]
+    tool, _stub = make_tool(parties=parties)
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is True
+    assert {c["party_id"] for c in result["candidates"]} == {"PARTY_1", "PARTY_4"}
+    assert result["total_party_matches"] == 2
+    assert result["truncated"] is False
+    # No customer lookups stubbed → customer_id remains null
+    assert all(c["customer_id"] is None for c in result["candidates"])
+
+
+@pytest.mark.unit
+async def test_caps_candidates_at_max_and_marks_truncated(make_tool, conv) -> None:  # noqa: ARG001
+    parties = [_party(f"PARTY_{i}") for i in range(25)]
+    tool, stub = make_tool(parties=parties, max_candidates=10)
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is True
+    assert result["total_party_matches"] == 25
+    assert result["returned_count"] == 10
+    assert result["truncated"] is True
+    assert len(stub.customer_calls) == 10
+
+
+@pytest.mark.unit
+async def test_dedup_by_party_id(make_tool, conv) -> None:  # noqa: ARG001
+    parties = [_party("PARTY_1"), _party("PARTY_1"), _party("PARTY_2")]
+    tool, _ = make_tool(parties=parties)
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert {c["party_id"] for c in result["candidates"]} == {"PARTY_1", "PARTY_2"}
+    assert result["total_party_matches"] == 2
