@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
+import respx
 
+from lib.boilerplate.logging import current_conversation_id, current_interaction_id
 from svc.mcp_telekom_identity.dps_get_client import (
     DPSAuthError,
     DPSError,
+    DPSGetClient,
     DPSInvalidResponseError,
     DPSNetworkError,
     DPSTimeoutError,
@@ -31,3 +35,128 @@ def test_upstream_error_carries_status_code() -> None:
     err = DPSUpstreamError(503)
     assert err.status_code == 503
     assert "503" in str(err)
+
+
+def _make_client() -> DPSGetClient:
+    return DPSGetClient(
+        base_url="https://dps.test/omni/test1",
+        bearer_token="TOKEN",  # noqa: S106
+        timeout_seconds=2.0,
+        verify_tls=False,
+    )
+
+
+@pytest.mark.unit
+async def test_get_returns_parsed_json_on_200() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get("/omni/test1/foo").mock(
+                return_value=httpx.Response(200, json=[{"id": "PARTY_1"}]),
+            )
+            result = await client._get("/foo", {"a": "b"})
+    assert result == [{"id": "PARTY_1"}]
+    assert route.called
+
+
+@pytest.mark.unit
+async def test_get_injects_bearer_and_request_ids_from_contextvars() -> None:
+    client = _make_client()
+    token_conv = current_conversation_id.set("conv-7")
+    token_inter = current_interaction_id.set("inter-9")
+    try:
+        async with client:
+            with respx.mock(base_url="https://dps.test") as router:
+                route = router.get("/omni/test1/foo").mock(
+                    return_value=httpx.Response(200, json=[]),
+                )
+                await client._get("/foo", {})
+        request = route.calls.last.request
+    finally:
+        current_conversation_id.reset(token_conv)
+        current_interaction_id.reset(token_inter)
+
+    assert request.headers["authorization"] == "Bearer TOKEN"
+    assert request.headers["accept"] == "application/json"
+    assert request.headers["x-request-session-id"] == "conv-7"
+    assert request.headers["x-request-tracking-id"] == "inter-9"
+    assert len(request.headers["x-request-id"]) >= 32  # uuid4 hex
+
+
+@pytest.mark.unit
+async def test_get_falls_back_to_uuid_when_contextvars_empty() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get("/omni/test1/foo").mock(
+                return_value=httpx.Response(200, json=[]),
+            )
+            await client._get("/foo", {})
+    request = route.calls.last.request
+    assert len(request.headers["x-request-session-id"]) >= 32
+    assert len(request.headers["x-request-tracking-id"]) >= 32
+
+
+@pytest.mark.unit
+async def test_get_raises_dps_auth_error_on_401() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get("/omni/test1/foo").mock(
+                return_value=httpx.Response(401, json={"err": "no"}),
+            )
+            with pytest.raises(DPSAuthError):
+                await client._get("/foo", {})
+
+
+@pytest.mark.unit
+async def test_get_raises_dps_upstream_error_on_500() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get("/omni/test1/foo").mock(
+                return_value=httpx.Response(500, text="boom"),
+            )
+            with pytest.raises(DPSUpstreamError) as excinfo:
+                await client._get("/foo", {})
+    assert excinfo.value.status_code == 500
+
+
+@pytest.mark.unit
+async def test_get_raises_dps_timeout_error() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get("/omni/test1/foo").mock(
+                side_effect=httpx.TimeoutException("slow"),
+            )
+            with pytest.raises(DPSTimeoutError):
+                await client._get("/foo", {})
+
+
+@pytest.mark.unit
+async def test_get_raises_dps_network_error_on_connect_failure() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get("/omni/test1/foo").mock(
+                side_effect=httpx.ConnectError("nope"),
+            )
+            with pytest.raises(DPSNetworkError):
+                await client._get("/foo", {})
+
+
+@pytest.mark.unit
+async def test_get_raises_invalid_response_on_non_json_body() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get("/omni/test1/foo").mock(
+                return_value=httpx.Response(
+                    200,
+                    text="<html>not json</html>",
+                    headers={"content-type": "text/html"},
+                ),
+            )
+            with pytest.raises(DPSInvalidResponseError):
+                await client._get("/foo", {})

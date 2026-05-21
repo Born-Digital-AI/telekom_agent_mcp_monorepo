@@ -1,9 +1,32 @@
 """HTTP client for the Slovak Telekom DPS API (party-management + customer-management).
 
 GET-only. Mutating endpoints will live in a separate module when needed.
+
+The underlying ``httpx.AsyncClient`` is created lazily on first call. The class
+also supports ``async with`` for tests where eager open/close is convenient,
+but the service does not have to use the context manager — the same instance
+can be created in ``__init__`` and reused across all tool invocations.
 """
 
 from __future__ import annotations
+
+import json
+import logging
+import uuid
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from lib.boilerplate.logging import current_conversation_id, current_interaction_id
+
+if TYPE_CHECKING:
+    from types import TracebackType
+    from typing import Self
+
+
+_log = logging.getLogger(__name__)
+
+_HTTP_CLIENT_ERROR_THRESHOLD = 400
 
 
 class DPSError(Exception):
@@ -35,7 +58,7 @@ class DPSInvalidResponseError(DPSError):
 
 
 class DPSGetClient:
-    """Async GET-only HTTP client for DPS. To be fleshed out in the next tasks."""
+    """Async GET-only HTTP client for DPS."""
 
     def __init__(
         self,
@@ -49,3 +72,69 @@ class DPSGetClient:
         self._bearer_token = bearer_token
         self._timeout_seconds = timeout_seconds
         self._verify_tls = verify_tls
+        self._client: httpx.AsyncClient | None = None
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                verify=self._verify_tls,
+            )
+        return self._client
+
+    async def __aenter__(self) -> Self:
+        self._ensure_client()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client and release connections."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _headers(self) -> dict[str, str]:
+        conv = current_conversation_id.get("") or uuid.uuid4().hex
+        inter = current_interaction_id.get("") or uuid.uuid4().hex
+        return {
+            "authorization": f"Bearer {self._bearer_token}",
+            "accept": "application/json",
+            "x-request-id": uuid.uuid4().hex,
+            "x-request-session-id": conv,
+            "x-request-tracking-id": inter,
+        }
+
+    async def _get(self, path: str, params: dict[str, str]) -> Any:  # noqa: ANN401
+        client = self._ensure_client()
+        url = self._base_url + path
+        _log.info("DPS GET %s", path)
+        try:
+            response = await client.get(url, params=params, headers=self._headers())
+        except httpx.TimeoutException as exc:
+            _log.warning("DPS GET %s timed out", path)
+            raise DPSTimeoutError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            _log.warning("DPS GET %s network error: %s", path, exc)
+            raise DPSNetworkError(str(exc)) from exc
+
+        status = response.status_code
+        if status in (401, 403):
+            _log.warning("DPS GET %s -> HTTP %s (auth)", path, status)
+            msg = f"DPS rejected the bearer token (HTTP {status})"
+            raise DPSAuthError(msg)
+        if status >= _HTTP_CLIENT_ERROR_THRESHOLD:
+            _log.warning("DPS GET %s -> HTTP %s", path, status)
+            raise DPSUpstreamError(status)
+
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            _log.warning("DPS GET %s returned invalid JSON: %s", path, exc)
+            raise DPSInvalidResponseError(str(exc)) from exc
