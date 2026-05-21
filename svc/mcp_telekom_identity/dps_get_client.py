@@ -111,6 +111,22 @@ class DPSGetClient:
             "x-request-tracking-id": inter,
         }
 
+    async def get_parties_by_identification(
+        self, identification_id: str, identification_type: str,
+    ) -> list[dict[str, Any]]:
+        """GET /party-management/3.54.0/v2/parties — resolve identification → party records."""
+        result = await self._get(
+            "/party-management/3.54.0/v2/parties",
+            {
+                "identificationId": identification_id,
+                "identificationType": identification_type,
+                "fields": "*",
+            },
+        )
+        if not isinstance(result, list):
+            raise DPSInvalidResponseError("party-management expected JSON array")
+        return result
+
     async def _get(self, path: str, params: dict[str, str]) -> Any:  # noqa: ANN401
         client = self._ensure_client()
         url = self._base_url + path

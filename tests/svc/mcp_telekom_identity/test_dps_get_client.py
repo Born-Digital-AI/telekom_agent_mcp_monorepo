@@ -172,3 +172,33 @@ async def test_get_raises_invalid_response_on_non_json_body() -> None:
             )
             with pytest.raises(DPSInvalidResponseError):
                 await client._get("/foo", {})
+
+
+@pytest.mark.unit
+async def test_get_parties_by_identification_calls_correct_path_and_params() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get(
+                "/omni/test1/party-management/3.54.0/v2/parties",
+            ).mock(return_value=httpx.Response(200, json=[{"id": "PARTY_1"}]))
+            result = await client.get_parties_by_identification(
+                "8753189467", "socialSecurityNumber",
+            )
+    assert result == [{"id": "PARTY_1"}]
+    request = route.calls.last.request
+    assert request.url.params["identificationId"] == "8753189467"
+    assert request.url.params["identificationType"] == "socialSecurityNumber"
+    assert request.url.params["fields"] == "*"
+
+
+@pytest.mark.unit
+async def test_get_parties_by_identification_returns_empty_list_when_no_match() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/party-management/3.54.0/v2/parties",
+            ).mock(return_value=httpx.Response(200, json=[]))
+            result = await client.get_parties_by_identification("0000000000", "socialSecurityNumber")
+    assert result == []
