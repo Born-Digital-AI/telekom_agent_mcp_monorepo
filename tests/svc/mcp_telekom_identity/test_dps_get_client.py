@@ -80,7 +80,7 @@ async def test_get_injects_bearer_and_request_ids_from_contextvars() -> None:
     assert request.headers["accept"] == "application/json"
     assert request.headers["x-request-session-id"] == "conv-7"
     assert request.headers["x-request-tracking-id"] == "inter-9"
-    assert len(request.headers["x-request-id"]) >= 32  # uuid4 hex
+    assert len(request.headers["x-request-id"]) == 32  # uuid4 hex
 
 
 @pytest.mark.unit
@@ -93,8 +93,8 @@ async def test_get_falls_back_to_uuid_when_contextvars_empty() -> None:
             )
             await client._get("/foo", {})
     request = route.calls.last.request
-    assert len(request.headers["x-request-session-id"]) >= 32
-    assert len(request.headers["x-request-tracking-id"]) >= 32
+    assert len(request.headers["x-request-session-id"]) == 32
+    assert len(request.headers["x-request-tracking-id"]) == 32
 
 
 @pytest.mark.unit
@@ -104,6 +104,18 @@ async def test_get_raises_dps_auth_error_on_401() -> None:
         with respx.mock(base_url="https://dps.test") as router:
             router.get("/omni/test1/foo").mock(
                 return_value=httpx.Response(401, json={"err": "no"}),
+            )
+            with pytest.raises(DPSAuthError):
+                await client._get("/foo", {})
+
+
+@pytest.mark.unit
+async def test_get_raises_dps_auth_error_on_403() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get("/omni/test1/foo").mock(
+                return_value=httpx.Response(403, json={"err": "forbidden"}),
             )
             with pytest.raises(DPSAuthError):
                 await client._get("/foo", {})
