@@ -183,7 +183,8 @@ async def test_get_parties_by_identification_calls_correct_path_and_params() -> 
                 "/omni/test1/party-management/3.54.0/v2/parties",
             ).mock(return_value=httpx.Response(200, json=[{"id": "PARTY_1"}]))
             result = await client.get_parties_by_identification(
-                "8753189467", "socialSecurityNumber",
+                "8753189467",
+                "socialSecurityNumber",
             )
     assert result == [{"id": "PARTY_1"}]
     request = route.calls.last.request
@@ -200,5 +201,34 @@ async def test_get_parties_by_identification_returns_empty_list_when_no_match() 
             router.get(
                 "/omni/test1/party-management/3.54.0/v2/parties",
             ).mock(return_value=httpx.Response(200, json=[]))
-            result = await client.get_parties_by_identification("0000000000", "socialSecurityNumber")
+            result = await client.get_parties_by_identification(
+                "0000000000", "socialSecurityNumber"
+            )
+    assert result == []
+
+
+@pytest.mark.unit
+async def test_get_customers_by_engaged_party_calls_correct_path_and_params() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get(
+                "/omni/test1/customer-management/4.67.0/customers",
+            ).mock(return_value=httpx.Response(200, json=[{"id": "4482259100"}]))
+            result = await client.get_customers_by_engaged_party("PARTY_4482259100")
+    assert result == [{"id": "4482259100"}]
+    request = route.calls.last.request
+    assert request.url.params["engagedParty.id"] == "PARTY_4482259100"
+    assert request.url.params["fields"] == "*"
+
+
+@pytest.mark.unit
+async def test_get_customers_by_engaged_party_empty_returns_empty_list() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/customer-management/4.67.0/customers",
+            ).mock(return_value=httpx.Response(200, json=[]))
+            result = await client.get_customers_by_engaged_party("PARTY_UNKNOWN")
     assert result == []

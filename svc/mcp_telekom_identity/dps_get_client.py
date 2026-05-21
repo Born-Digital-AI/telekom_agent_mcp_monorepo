@@ -112,7 +112,9 @@ class DPSGetClient:
         }
 
     async def get_parties_by_identification(
-        self, identification_id: str, identification_type: str,
+        self,
+        identification_id: str,
+        identification_type: str,
     ) -> list[dict[str, Any]]:
         """GET /party-management/3.54.0/v2/parties — resolve identification → party records."""
         result = await self._get(
@@ -124,7 +126,25 @@ class DPSGetClient:
             },
         )
         if not isinstance(result, list):
-            raise DPSInvalidResponseError("party-management expected JSON array")
+            msg = "party-management expected JSON array"
+            raise DPSInvalidResponseError(msg)
+        return result
+
+    async def get_customers_by_engaged_party(
+        self,
+        party_id: str,
+    ) -> list[dict[str, Any]]:
+        """GET /customer-management/4.67.0/customers — resolve PARTY_id → customer records."""
+        result = await self._get(
+            "/customer-management/4.67.0/customers",
+            {
+                "engagedParty.id": party_id,
+                "fields": "*",
+            },
+        )
+        if not isinstance(result, list):
+            msg = "customer-management expected JSON array"
+            raise DPSInvalidResponseError(msg)
         return result
 
     async def _get(self, path: str, params: dict[str, str]) -> Any:  # noqa: ANN401
