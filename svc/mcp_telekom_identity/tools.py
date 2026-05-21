@@ -12,7 +12,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Annotated, Any
 
-import pydantic
+from pydantic import Field
 
 from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
 from svc.mcp_telekom_identity.dps_get_client import (
@@ -172,7 +172,7 @@ def register(
     async def identifikacia_rodne_cislo(
         rodne_cislo: Annotated[
             str,
-            pydantic.Field(description="Rodné číslo — 9 alebo 10 cifier, bez lomky."),
+            Field(description="Rodné číslo — 9 alebo 10 cifier, bez lomky."),
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
