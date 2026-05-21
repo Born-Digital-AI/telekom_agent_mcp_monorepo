@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import pydantic
@@ -9,8 +10,14 @@ import pydantic
 from lib.mcp_service import MCPService, MCPServiceConfig
 from lib.mcp_service.legacy_compat import ToolRegistry
 
+from .dps_get_client import DPSGetClient
+from .tools import register
+
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
+
+
+_log = logging.getLogger(__name__)
 
 
 class MCPTelekomIdentityConfig(MCPServiceConfig):
@@ -36,11 +43,27 @@ class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
     CPU_LIMIT = "1000m"
     MEMORY_LIMIT = "512Mi"
 
+    def __init__(self, config: MCPTelekomIdentityConfig) -> None:
+        super().__init__(config)
+        if not config.dps_bearer_token:
+            _log.warning(
+                "APP_DPS_BEARER_TOKEN is empty — DPS calls will fail with auth_failed.",
+            )
+        self._dps_client = DPSGetClient(
+            base_url=config.dps_base_url,
+            bearer_token=config.dps_bearer_token,
+            timeout_seconds=config.dps_timeout_seconds,
+            verify_tls=config.dps_verify_tls,
+        )
+
     def setup_tools(self, mcp: FastMCP) -> None:
         """Register identification tools."""
         registry = ToolRegistry(mcp)
-        # tools wired in a later task
-        _ = registry
+        register(
+            registry,
+            client=self._dps_client,
+            max_candidates=self.config.dps_max_candidates,
+        )
 
 
 SERVICE_CLASS = MCPTelekomIdentity
