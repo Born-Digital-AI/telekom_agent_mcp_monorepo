@@ -45,6 +45,7 @@ class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
 
     def __init__(self, config: MCPTelekomIdentityConfig) -> None:
         super().__init__(config)
+        self._identity_config = config
         if not config.dps_bearer_token:
             _log.warning(
                 "APP_DPS_BEARER_TOKEN is empty — DPS calls will fail with auth_failed.",
@@ -62,7 +63,7 @@ class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
         register(
             registry,
             client=self._dps_client,
-            max_candidates=self.config.dps_max_candidates,
+            max_candidates=self._identity_config.dps_max_candidates,
         )
 
 
