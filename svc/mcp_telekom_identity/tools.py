@@ -6,6 +6,7 @@ identifikacia_rodne_cislo(rodne_cislo)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -33,25 +34,83 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-def _candidate_from_party_only(party: dict[str, Any]) -> dict[str, Any]:
-    """Build a candidate record from a Party with no Customer enrichment yet."""
+def _format_address(addr: dict[str, Any]) -> str:
+    street = addr.get("streetName") or ""
+    nr = addr.get("streetNr") or ""
+    postcode = addr.get("postcode") or ""
+    locality = addr.get("locality") or addr.get("city") or ""
+    street_part = " ".join(part for part in (street, nr) if part).strip()
+    postcode_part = " ".join(part for part in (postcode, locality) if part).strip()
+    return ", ".join(part for part in (street_part, postcode_part) if part)
+
+
+def _normalize_contacts(party_contacts: list[dict[str, Any]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for c in party_contacts:
+        ctype = c.get("type")
+        medium = c.get("medium") or {}
+        if ctype == "mobile" and medium.get("number"):
+            out.append({"type": "mobile", "value": str(medium["number"])})
+        elif ctype == "email" and medium.get("emailAddress"):
+            out.append({"type": "email", "value": str(medium["emailAddress"])})
+        elif ctype == "address" and isinstance(medium.get("address"), dict):
+            formatted = _format_address(medium["address"])
+            if formatted:
+                out.append({"type": "address", "value": formatted})
+    return out
+
+
+def _normalize_identifications(individual: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for ident in individual.get("individualIdentifications") or []:
+        itype = ident.get("type")
+        if itype == "socialSecurityNumber":
+            continue  # Never echo RČ back to the caller.
+        iid = ident.get("identificationId")
+        if isinstance(itype, str) and isinstance(iid, str):
+            out.append({"type": itype, "id": iid})
+    return out
+
+
+def _treatment_package(customer: dict[str, Any]) -> str | None:
+    for ch in customer.get("characteristics") or []:
+        if ch.get("name") == "treatmentPackage":
+            value = ch.get("value")
+            return str(value) if value is not None else None
+    return None
+
+
+def _valid_for(customer: dict[str, Any]) -> dict[str, str | None] | None:
+    vf = customer.get("validFor")
+    if not isinstance(vf, dict):
+        return None
+    return {
+        "start": vf.get("startDateTime"),
+        "end": vf.get("endDateTime"),
+    }
+
+
+def _candidate(
+    party: dict[str, Any],
+    customer: dict[str, Any] | None,
+) -> dict[str, Any]:
     ind = party.get("individual") or {}
     given = ind.get("givenName") or ""
     family = ind.get("familyName") or ""
     name = " ".join(part for part in (given, family) if part) or None
     return {
         "party_id": party.get("id"),
-        "customer_id": None,
+        "customer_id": (customer or {}).get("id"),
         "name": name,
         "given_name": given or None,
         "family_name": family or None,
-        "status": None,
-        "market_segment": None,
-        "customer_segment": None,
-        "treatment_package": None,
-        "valid_for": None,
-        "contacts": [],
-        "identifications": [],
+        "status": (customer or {}).get("status"),
+        "market_segment": (customer or {}).get("marketSegment"),
+        "customer_segment": (customer or {}).get("customerSegment"),
+        "treatment_package": _treatment_package(customer) if customer else None,
+        "valid_for": _valid_for(customer) if customer else None,
+        "contacts": _normalize_contacts(party.get("contacts") or []),
+        "identifications": _normalize_identifications(ind),
     }
 
 
@@ -122,12 +181,17 @@ def register(
         capped = parties[:max_candidates]
         truncated = total > max_candidates
 
-        # Step B is added in Task 8; for now emit candidates with customer_id=None.
-        candidates = [_candidate_from_party_only(p) for p in capped]
-        # Each Party also triggers a customer-management lookup (kept as a no-op
-        # call here so the cap test can assert the call count).
-        for p in capped:
-            await client.get_customers_by_engaged_party(p["id"])
+        # Step B fanout, concurrently per Party.
+        customer_lists = await asyncio.gather(
+            *(client.get_customers_by_engaged_party(p["id"]) for p in capped)
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for party, customers in zip(capped, customer_lists, strict=True):
+            if customers:
+                candidates.extend(_candidate(party, c) for c in customers)
+            else:
+                candidates.append(_candidate(party, None))
 
         return _json(
             {

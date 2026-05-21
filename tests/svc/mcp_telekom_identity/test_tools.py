@@ -180,3 +180,161 @@ async def test_dedup_by_party_id(make_tool, conv) -> None:  # noqa: ARG001
     result = await _call(tool, rodne_cislo="8753189467")
     assert {c["party_id"] for c in result["candidates"]} == {"PARTY_1", "PARTY_2"}
     assert result["total_party_matches"] == 2
+
+
+def _full_party(party_id: str = "PARTY_4482259100") -> dict:
+    return {
+        "id": party_id,
+        "status": "initialized",
+        "entityType": "Party",
+        "type": "individual",
+        "individual": {
+            "givenName": "Tester",
+            "familyName": "AT NECHYTAT",
+            "individualIdentifications": [
+                {
+                    "identificationId": "MM852148",
+                    "name": "IDNumber",
+                    "type": "nationalIdentityCard",
+                },
+                {
+                    "identificationId": "8753189467",
+                    "name": "OIBNumber",
+                    "type": "socialSecurityNumber",
+                },
+            ],
+        },
+        "contacts": [
+            {"type": "mobile", "role": {"name": "main"}, "medium": {"number": "0902555002"}},
+            {
+                "type": "email",
+                "role": {"name": "main"},
+                "medium": {"emailAddress": "test@telekom.sk"},
+            },
+            {
+                "type": "address",
+                "role": {"name": "main"},
+                "medium": {
+                    "address": {
+                        "streetName": "Hubeného",
+                        "streetNr": "9",
+                        "postcode": "83153",
+                        "locality": "Rača",
+                    },
+                },
+            },
+        ],
+    }
+
+
+def _customer(customer_id: str = "4482259100", party_id: str = "PARTY_4482259100") -> dict:
+    return {
+        "id": customer_id,
+        "name": "AT NECHYTAT,Tester",
+        "status": "preactive",
+        "marketSegment": "Basic",
+        "customerSegment": "B2C",
+        "validFor": {"startDateTime": "2026-02-01T00:00:00Z"},
+        "characteristics": [
+            {"name": "natcoClassType", "value": "Customer"},
+            {"name": "treatmentPackage", "value": "Premium Basic"},
+        ],
+        "engagedParty": {"entityReferredType": "Party", "id": party_id},
+    }
+
+
+@pytest.mark.unit
+async def test_single_match_merges_party_and_customer(make_tool, conv) -> None:  # noqa: ARG001
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is True
+    assert result["total_party_matches"] == 1
+    assert result["returned_count"] == 1
+    assert result["truncated"] is False
+    [c] = result["candidates"]
+    assert c["party_id"] == "PARTY_4482259100"
+    assert c["customer_id"] == "4482259100"
+    assert c["name"] == "Tester AT NECHYTAT"
+    assert c["given_name"] == "Tester"
+    assert c["family_name"] == "AT NECHYTAT"
+    assert c["status"] == "preactive"
+    assert c["market_segment"] == "Basic"
+    assert c["customer_segment"] == "B2C"
+    assert c["treatment_package"] == "Premium Basic"
+    assert c["valid_for"] == {"start": "2026-02-01T00:00:00Z", "end": None}
+    assert {"type": "mobile", "value": "0902555002"} in c["contacts"]
+    assert {"type": "email", "value": "test@telekom.sk"} in c["contacts"]
+    assert {"type": "address", "value": "Hubeného 9, 83153 Rača"} in c["contacts"]
+    # socialSecurityNumber must NOT appear in identifications
+    assert all(i["type"] != "socialSecurityNumber" for i in c["identifications"])
+    assert {"type": "nationalIdentityCard", "id": "MM852148"} in c["identifications"]
+
+
+@pytest.mark.unit
+async def test_party_with_no_customer_yields_candidate_with_null_customer_id(
+    make_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    tool, _ = make_tool(
+        parties=[_full_party()],
+        customers_by_party={"PARTY_4482259100": []},
+    )
+    result = await _call(tool, rodne_cislo="8753189467")
+    [c] = result["candidates"]
+    assert c["customer_id"] is None
+    assert c["status"] is None
+    assert c["name"] == "Tester AT NECHYTAT"
+    # Party contacts are still surfaced
+    assert any(x["type"] == "mobile" for x in c["contacts"])
+
+
+@pytest.mark.unit
+async def test_party_with_two_customers_yields_two_candidates_sharing_party_id(
+    make_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    party = _full_party()
+    tool, _ = make_tool(
+        parties=[party],
+        customers_by_party={
+            "PARTY_4482259100": [
+                _customer(customer_id="A1"),
+                _customer(customer_id="A2"),
+            ],
+        },
+    )
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["returned_count"] == 2
+    assert {c["customer_id"] for c in result["candidates"]} == {"A1", "A2"}
+    assert {c["party_id"] for c in result["candidates"]} == {"PARTY_4482259100"}
+
+
+@pytest.mark.unit
+async def test_address_formatting_handles_missing_pieces(make_tool, conv) -> None:  # noqa: ARG001
+    party = _full_party()
+    party["contacts"] = [
+        {
+            "type": "address",
+            "role": {"name": "main"},
+            "medium": {
+                "address": {
+                    "streetName": "Mierová",
+                    # no streetNr
+                    "postcode": "04001",
+                    "locality": "Košice",
+                },
+            },
+        },
+    ]
+    tool, _ = make_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [_customer()]},
+    )
+    result = await _call(tool, rodne_cislo="8753189467")
+    [c] = result["candidates"]
+    assert {"type": "address", "value": "Mierová, 04001 Košice"} in c["contacts"]
