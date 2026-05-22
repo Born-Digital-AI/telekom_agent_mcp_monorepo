@@ -490,7 +490,21 @@ async def test_op_rejects_empty_input(make_op_tool, conv) -> None:  # noqa: ARG0
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("bad", ["A1234567", "ABCDEF12", "12345", "A2B345678", " "])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "A1234567",  # 1 letter + 7 digits
+        "ABCDEF12",  # 6 letters + 2 digits
+        "12345",  # too short
+        "A2B345678",  # mixed
+        " ",  # blank
+        "12345678",  # all-numeric: no longer accepted (no legacy SK OP)
+        "123456789",  # 9 digits
+        "1234567",  # 7 digits
+        "AB12345",  # 5 digits (one short)
+        "AB1234567",  # 7 digits (one over)
+    ],
+)
 async def test_op_rejects_bad_format(make_op_tool, conv, bad) -> None:  # noqa: ARG001
     tool, stub = make_op_tool()
     result = await _call(tool, cislo_op=bad)
@@ -500,18 +514,27 @@ async def test_op_rejects_bad_format(make_op_tool, conv, bad) -> None:  # noqa: 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "good", ["AB123456", "ab123456", " AB123456 ", "12345678", "123456789", "1234567"]
+    ("good_input", "expected_normalized"),
+    [
+        ("AB123456", "AB123456"),
+        ("ab123456", "AB123456"),  # lowercase normalized
+        (" AB123456 ", "AB123456"),  # leading/trailing whitespace
+        ("AB-123456", "AB123456"),  # hyphen separator
+        ("AB 123 456", "AB123456"),  # spaces between groups
+        ("ea-123456", "EA123456"),  # combo: lowercase + hyphen
+    ],
 )
 async def test_op_valid_format_reaches_party_call_with_correct_type(
     make_op_tool,
     conv,  # noqa: ARG001
-    good,
+    good_input,
+    expected_normalized,
 ) -> None:
     tool, stub = make_op_tool(parties=[])
-    await _call(tool, cislo_op=good)
+    await _call(tool, cislo_op=good_input)
     assert len(stub.party_calls) == 1
     called_id, called_type = stub.party_calls[0]
-    assert called_id == good.strip().upper()
+    assert called_id == expected_normalized
     assert called_type == "nationalIdentityCard"
 
 

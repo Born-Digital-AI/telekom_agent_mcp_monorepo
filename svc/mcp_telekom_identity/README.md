@@ -26,9 +26,12 @@ cache instead of re-querying DPS.
 
 ### `identifikacia_op(cislo_op)` — Občiansky preukaz
 
-| Parameter | Format |
-|---|---|
-| `cislo_op` | New SK OP: `AB123456` (2 uppercase letters + 6 digits) or old format (6–9 digits) |
+| Parameter  | Format                                           |
+| ---------- | ------------------------------------------------ |
+| `cislo_op` | 2 uppercase letters + 6 digits (e.g. `AB123456`) |
+
+Lowercase letters, spaces, and hyphens in the input are normalized away
+(e.g. `ea-123456` → `EA123456`) before validation.
 
 ### `identifikacia_pas(cislo_pasu)` — Cestovný pas
 

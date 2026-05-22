@@ -50,14 +50,12 @@ _RC_TOOL_DESCRIPTION = (
     "— netreba ich od neho znova žiadať."
 )
 
-# New SK OP: 2 uppercase letters + 6 digits (e.g. "AB123456").
-# Old SK OP: 6-9 digits (legacy, still valid for some).
-# Be lenient: strip + uppercase before matching.
-_OP_PATTERN = re.compile(r"^([A-Z]{2}\d{6}|\d{6,9})$")
-_OP_INVALID_MESSAGE = (
-    "Číslo občianskeho preukazu nie je v správnom tvare. "
-    "Zadajte ho ako 2 písmená a 6 cifier (napr. AB123456) alebo ako 6 až 9 cifier."
-)
+# SK OP since 1993: exactly 2 uppercase letters + 6 digits (8 chars). Pre-1993
+# Czechoslovak numeric IDs are expired and not in active DPS records.
+# Strip whitespace/dashes + uppercase before matching so "EA 123 456" and "ea-123456" normalize.
+_OP_NORMALIZE_RE = re.compile(r"[\s\-]")
+_OP_PATTERN = re.compile(r"^[A-Z]{2}\d{6}$")
+_OP_INVALID_MESSAGE = "Číslo občianskeho preukazu má tvar 2 písmená a 6 cifier (napr. AB123456)."
 _OP_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť."
 _OP_TOOL_DESCRIPTION = (
     "Identifikuj zákazníka podľa čísla občianskeho preukazu. Po úspechu vráti meno "
@@ -361,11 +359,13 @@ def register(
     async def identifikacia_op(
         cislo_op: Annotated[
             str,
-            Field(description="Číslo občianskeho preukazu — napr. AB123456 alebo 6–9 cifier."),
+            Field(
+                description="Číslo občianskeho preukazu — 2 písmená a 6 cifier (napr. AB123456)."
+            ),
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        value = (cislo_op or "").strip().upper()
+        value = _OP_NORMALIZE_RE.sub("", cislo_op or "").upper()
         if not _OP_PATTERN.fullmatch(value):
             return _json({"found": False, "error": "invalid_input", "message": _OP_INVALID_MESSAGE})
         conv = (_meta or {}).get("conversation_id", "")
