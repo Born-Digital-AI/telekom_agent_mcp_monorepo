@@ -79,6 +79,7 @@ follow-up). Without MSISDN search the tool set has a real gap.
 | Customer-level `Customer.contacts` array on a fetched customer | customer-mgmt `/customers/{id}` | **Empty `[]`** for individuals. Only `billingAccount.contacts` is populated and it holds only `address`, no `mobile`. |
 
 Test data used:
+
 - `PARTY_1002203200` (Stano Muziková) → `Party.contacts[mobile] = 0996650543`
 - `PARTY_4482259100` (Tester AT NECHYTAT) → `Party.contacts[mobile] = 0902555002`
 
@@ -115,3 +116,64 @@ to the other four identification tools (`identifikacia_rodne_cislo`, `identifika
 
 A possible **stub-only** tool that responds with `not_supported_yet` was considered
 but deferred — surfacing a non-functional tool to the LLM mainly creates confusion.
+
+---
+
+## Q2: Walk-through of the full identification flow with DPS API owners + Security  🟡 Waiting
+
+**Raised:** 2026-05-22
+**Service:** `mcp_telekom_identity`
+
+### Context
+
+The identification toolset now spans **three DPS APIs** (party-management, customer-management,
+product-inventory) with **six tools** and several edge cases (B2C name reversal, MSISDN
+international normalization, customer-vs-billing-account dispatch by trailing digit, status
+filtering on Party records, IČO via `subjectRegistrationId`). Several of these were derived
+by live probing rather than from formal documentation — they work today but the
+"approved-by-owner" stamp is missing.
+
+### What needs to happen before this can be considered production-ready
+
+1. **DPS API ownership review** — walk each tool through the relevant API owner and confirm:
+   - Endpoint + query parameter choice is the intended way to look up by that field
+     (not a side effect that may disappear).
+   - Rate limits / throttling expectations.
+   - That returning >450 duplicate Party records for one socialSecurityNumber (test env) is
+     not expected in production.
+   - That `verify_tls=false` is acceptable for the test environment and that a CA-trusted
+     cert exists for production.
+   - That the static bearer token approach is right and what the rotation policy is.
+
+2. **Security review** of the end-to-end flow, covering:
+   - PII handling (what's logged, what's cached, where, for how long).
+   - The `_IDENTITY_STATE` in-memory TTL cache (30 min, keyed by `conversation_id`).
+   - The `customer-management ?id=<invalid value>` behaviour that returned the full
+     customer page (59 KB) — we don't use this path but it's a footgun worth flagging.
+   - Whether the response shape (`{found, name}`) is the right amount of disclosure for a
+     conversational AI agent in a customer-care line.
+
+### Who to ask (Q2)
+
+- **Party Management** (party-management/3.54.0) — Adam Zverka, [adam.zverka@telekom.sk](mailto:adam.zverka@telekom.sk)
+- **Customer Management** (customer-management/4.67.0) — Marián Žákovic (per swagger contact)
+- **Product Inventory** (product-inventory/4.64) — Adam Babik (tech), [adam.babik@telekom.sk](mailto:adam.babik@telekom.sk); Jakub Bednarik (business), [jakub.bednarik@telekom.sk](mailto:jakub.bednarik@telekom.sk)
+- **Cross-API business owner** — Peter Furucz, [peter.furucz@external.telekom.sk](mailto:peter.furucz@external.telekom.sk)
+- **General contact** — [omni.st.cit@telekom.sk](mailto:omni.st.cit@telekom.sk)
+- **Security** — BD security contact (TBD)
+
+### Unblocks (Q2)
+
+- A scheduled walk-through (30–60 min) with the four DPS owners + security.
+- The review document at [docs/identification-review.md](identification-review.md) maintained
+  alongside the code, sent ahead of the meeting.
+
+### Workaround in place (Q2)
+
+The tools work and are live-verified against the test DPS environment, with 124 unit
+tests. README has full test scenarios. But:
+
+- `APP_DPS_VERIFY_TLS=false` is the default — must be flipped before any production deploy.
+- The bearer token is static and lives in env — no rotation.
+- Q1 (MSISDN) was resolved by live probing, not by owner confirmation — could break if DPS
+  changes Product.publicIdentifier semantics.
