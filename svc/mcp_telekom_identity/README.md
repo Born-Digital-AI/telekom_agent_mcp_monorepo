@@ -63,11 +63,56 @@ APP_DPS_BEARER_TOKEN="$DPS_TOKEN" APP_DPS_VERIFY_TLS=false \
   python -m svc.mcp_telekom_identity
 ```
 
+The server then exposes:
+
+| Endpoint | URL | Notes |
+| --- | --- | --- |
+| MCP (Streamable HTTP) | `http://localhost:8765/mcp` | Paste this URL into mcp-tester or any MCP client |
+| Healthz | `http://localhost:8766/healthz` | Liveness/readiness probe |
+
+## Testing via mcp-tester GUI
+
+[`mcp-tester`](https://github.com/Born-Digital-AI/mcp-tester) is a small browser app for
+calling MCP tools manually. Start both processes locally:
+
+| Process | URL | Credentials |
+| --- | --- | --- |
+| `mcp-tester` GUI | `http://localhost:8080` | Basic Auth: `admin` / `admin` |
+| `mcp_telekom_identity` (this server) | `http://localhost:8765/mcp` | (no auth — `APP_MCP_AUTH_ENABLED=false`) |
+
+Start `mcp-tester` from `/Users/michaljurco/Documents/GitHub/mcp-tester#` (note the `#` in the path — quote it in shell):
+
+```bash
+cd '/Users/michaljurco/Documents/GitHub/mcp-tester#'
+APP_BASIC_AUTH_USER=admin APP_BASIC_AUTH_PASSWORD=admin \
+APP_SHARE_SECRET=local-dev-only-not-for-prod-aaaaaaaaaaaaaa APP_PORT=8080 \
+  python3 app.py
+```
+
+Then in the browser:
+
+1. Open `http://localhost:8080` and log in with `admin` / `admin`
+2. Paste `http://localhost:8765/mcp` into the MCP URL field
+3. Click _List tools_ → vyber konkrétny tool → vyplň parameter → _Call_
+
+End-to-end smoke test from CLI (skips the browser, useful for scripted checks):
+
+```bash
+curl -sS -u admin:admin -X POST http://localhost:8080/api/tools/call \
+  -H "Content-Type: application/json" \
+  -d '{"mcp_url":"http://localhost:8765/mcp","auth":{"type":"none"},
+       "tool_name":"identifikacia_rodne_cislo",
+       "arguments":{"rodne_cislo":"7304292105"}}'
+```
+
+For the reusable workflow (start/stop both processes, common gotchas), see the
+[`mcp-local-tester`](file:///Users/michaljurco/.claude/skills/mcp-local-tester/SKILL.md)
+skill.
+
 ## Live test scenarios (verified against DPS test environment)
 
 These inputs map to known parties in the DPS staging environment. Use them via the
-`mcp-tester` GUI (http://localhost:8080) or directly through any MCP client. **VPN
-required.**
+`mcp-tester` GUI above or directly through any MCP client. **VPN required.**
 
 ### `identifikacia_rodne_cislo`
 
