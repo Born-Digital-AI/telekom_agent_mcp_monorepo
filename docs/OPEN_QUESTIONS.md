@@ -19,10 +19,43 @@ Each question gets its own `## Q<N>` heading. Body fields:
 
 ---
 
-## Q1: How to look up a customer by MSISDN (telefónne číslo)?  🔴 Open
+## Q1: How to look up a customer by MSISDN (telefónne číslo)?  🟢 Answered
 
-**Raised:** 2026-05-22
+**Raised:** 2026-05-22 · **Resolved:** 2026-05-22
 **Service:** `mcp_telekom_identity`
+
+### Resolution
+
+The Product Inventory API (`/product-inventory/4.64/products`) supports MSISDN lookup
+via RQL on `publicIdentifier`. Mobile tariff products are stored with the MSISDN as their
+`publicIdentifier` in **international format without `+`** (e.g. `421902804660`).
+
+**Working query:**
+
+```http
+GET /omni/test1/product-inventory/4.64/products?query=publicIdentifier==421902804660&fields=*
+```
+
+Returns a list of `Product` objects, each carrying `customer: {id}` that links back to
+customer-management. From there we reuse the existing `get_customer_by_id` to build the
+candidate (same flow as `identifikacia_kod_zakaznika` from the billing-account branch).
+
+**MSISDN format normalization** required before the query:
+
+- `0902804660` (SK local) → strip leading `0`, prepend `421` → `421902804660`
+- `+421902804660` → strip leading `+` → `421902804660`
+- `421902804660` (already intl) → as-is
+- `00421902804660` → strip leading `00` → `421902804660`
+
+Search with the local format (`0902...`) returns an empty list — no exception, just no
+match. Validation must enforce international form before the call.
+
+**Implemented as** `identifikacia_telefon(telefon)` in `mcp_telekom_identity` (see commit
+on PR #2).
+
+---
+
+### Original investigation (preserved for context)
 
 ### Context
 
