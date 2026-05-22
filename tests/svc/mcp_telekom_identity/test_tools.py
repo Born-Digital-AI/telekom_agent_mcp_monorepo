@@ -36,15 +36,28 @@ class _FakeMCP:
 class _StubClient:
     """A stub DPSGetClient that returns canned responses and records calls."""
 
+    customer_by_id_calls: list[str]
+    billing_account_by_id_calls: list[str]
+    customer_by_id_map: dict[str, dict | None] | Exception
+    billing_account_by_id_map: dict[str, dict | None] | Exception
+
     def __init__(
         self,
         parties: list[dict] | Exception | None = None,
         customers_by_party: dict[str, list[dict]] | Exception | None = None,
+        customer_by_id_map: dict[str, dict | None] | Exception | None = None,
+        billing_account_by_id_map: dict[str, dict | None] | Exception | None = None,
     ) -> None:
         self.parties = parties if parties is not None else []
         self.customers_by_party = customers_by_party if customers_by_party is not None else {}
         self.party_calls: list[tuple[str, str]] = []
         self.customer_calls: list[str] = []
+        self.customer_by_id_calls = []
+        self.billing_account_by_id_calls = []
+        self.customer_by_id_map = customer_by_id_map if customer_by_id_map is not None else {}
+        self.billing_account_by_id_map = (
+            billing_account_by_id_map if billing_account_by_id_map is not None else {}
+        )
 
     async def get_parties_by_identification(
         self,
@@ -61,6 +74,18 @@ class _StubClient:
         if isinstance(self.customers_by_party, Exception):
             raise self.customers_by_party
         return self.customers_by_party.get(party_id, [])
+
+    async def get_customer_by_id(self, customer_id: str) -> dict | None:
+        self.customer_by_id_calls.append(customer_id)
+        if isinstance(self.customer_by_id_map, Exception):
+            raise self.customer_by_id_map
+        return self.customer_by_id_map.get(customer_id)
+
+    async def get_billing_account_by_id(self, account_id: str) -> dict | None:
+        self.billing_account_by_id_calls.append(account_id)
+        if isinstance(self.billing_account_by_id_map, Exception):
+            raise self.billing_account_by_id_map
+        return self.billing_account_by_id_map.get(account_id)
 
 
 @pytest.fixture
@@ -823,3 +848,157 @@ async def test_ico_org_candidate_has_null_given_and_family_name(
     [cached_candidate] = cached["candidates"]
     assert cached_candidate["given_name"] is None
     assert cached_candidate["family_name"] is None
+
+
+# ---- identifikacia_kod_zakaznika ----
+
+
+@pytest.fixture
+def make_kod_tool():
+    def _factory(**kwargs):
+        from svc.mcp_telekom_identity import tools as identity_tools
+
+        stub = _StubClient(
+            parties=kwargs.pop("parties", None),
+            customers_by_party=kwargs.pop("customers_by_party", None),
+            customer_by_id_map=kwargs.pop("customer_by_id_map", None),
+            billing_account_by_id_map=kwargs.pop("billing_account_by_id_map", None),
+        )
+        max_candidates = kwargs.pop("max_candidates", 10)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return fake.registered["identifikacia_kod_zakaznika"], stub
+
+    return _factory
+
+
+def _b2c_customer(customer_id: str = "1002203200", name: str = "Muziková,Stano") -> dict:
+    """B2C customer with comma-reversed surname,givenName name format."""
+    return {
+        "id": customer_id,
+        "name": name,
+        "status": "active",
+        "marketSegment": "Basic",
+        "customerSegment": "B2C",
+        "engagedParty": {"entityReferredType": "Party", "id": f"PARTY_{customer_id}"},
+        "customerAccounts": [],
+        "characteristics": [],
+    }
+
+
+def _b2b_customer(
+    customer_id: str = "2300000400", name: str = "Creditinfo Slovakia, S.R.O."
+) -> dict:
+    return {
+        "id": customer_id,
+        "name": name,
+        "status": "active",
+        "marketSegment": "Basic",
+        "customerSegment": "B2B",
+        "engagedParty": {"entityReferredType": "Party", "id": f"PARTY_{customer_id}"},
+        "customerAccounts": [],
+        "characteristics": [],
+    }
+
+
+@pytest.mark.unit
+async def test_kod_rejects_empty(make_kod_tool, conv) -> None:  # noqa: ARG001
+    tool, stub = make_kod_tool()
+    result = await _call(tool, kod_zakaznika="")
+    assert result["error"] == "invalid_input"
+    assert stub.customer_by_id_calls == []
+    assert stub.billing_account_by_id_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["abc", "1234567", "1234567890123", "12-345-678", " "])
+async def test_kod_rejects_bad_format(make_kod_tool, conv, bad) -> None:  # noqa: ARG001
+    tool, stub = make_kod_tool()
+    result = await _call(tool, kod_zakaznika=bad)
+    assert result["error"] == "invalid_input"
+    assert stub.customer_by_id_calls == []
+
+
+@pytest.mark.unit
+async def test_kod_b2c_customer_id_reverses_name(make_kod_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, stub = make_kod_tool(customer_by_id_map={"1002203200": cust})
+    result = await _call(tool, kod_zakaznika="1002203200")
+    assert result == {"found": True, "name": "Stano Muziková"}
+    assert stub.customer_by_id_calls == ["1002203200"]
+    assert stub.billing_account_by_id_calls == []
+
+
+@pytest.mark.unit
+async def test_kod_b2b_customer_id_keeps_name_with_comma(make_kod_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2b_customer("2300000400", "Creditinfo Slovakia, S.R.O.")
+    tool, _ = make_kod_tool(customer_by_id_map={"2300000400": cust})
+    result = await _call(tool, kod_zakaznika="2300000400")
+    assert result == {"found": True, "name": "Creditinfo Slovakia, S.R.O."}
+
+
+@pytest.mark.unit
+async def test_kod_billing_account_resolves_to_customer(make_kod_tool, conv) -> None:  # noqa: ARG001
+    ba = {"id": "1002203204", "customer": {"id": "1002203200"}}
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, stub = make_kod_tool(
+        billing_account_by_id_map={"1002203204": ba},
+        customer_by_id_map={"1002203200": cust},
+    )
+    result = await _call(tool, kod_zakaznika="1002203204")
+    assert result == {"found": True, "name": "Stano Muziková"}
+    assert stub.billing_account_by_id_calls == ["1002203204"]
+    assert stub.customer_by_id_calls == ["1002203200"]
+
+
+@pytest.mark.unit
+async def test_kod_billing_account_not_found_returns_not_found(make_kod_tool, conv) -> None:  # noqa: ARG001
+    tool, stub = make_kod_tool(
+        billing_account_by_id_map={"9999999999": None},
+    )
+    result = await _call(tool, kod_zakaznika="9999999999")
+    assert result["error"] == "not_found"
+    assert stub.customer_by_id_calls == []  # no fanout to customer
+
+
+@pytest.mark.unit
+async def test_kod_customer_id_not_found_returns_not_found(make_kod_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_kod_tool(customer_by_id_map={"4432948400": None})
+    result = await _call(tool, kod_zakaznika="4432948400")
+    assert result == {
+        "found": False,
+        "error": "not_found",
+        "message": "Zákazníka s týmto kódom sa nepodarilo nájsť.",
+    }
+
+
+@pytest.mark.unit
+async def test_kod_caches_candidate(make_kod_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_kod_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tool, kod_zakaznika="1002203200")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cand] = cached["candidates"]
+    assert cand["customer_id"] == "1002203200"
+    assert cand["party_id"] == "PARTY_1002203200"
+    assert cand["name"] == "Stano Muziková"
+    assert cand["given_name"] == "Stano"
+    assert cand["family_name"] == "Muziková"
+    assert cand["customer_segment"] == "B2C"
+    # Party-derived fields are empty for the customer-only flow
+    assert cand["contacts"] == []
+    assert cand["identifications"] == []
+
+
+@pytest.mark.unit
+async def test_kod_upstream_error_uses_unified_message(make_kod_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.dps_get_client import DPSAuthError
+
+    tool, _ = make_kod_tool(customer_by_id_map=DPSAuthError("bad token"))
+    result = await _call(tool, kod_zakaznika="1002203200")
+    assert result["error"] == "auth_failed"
+    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."

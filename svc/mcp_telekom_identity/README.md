@@ -47,6 +47,22 @@ Lowercase letters, spaces, and hyphens in the input are normalized away
 
 DPS stores IČO under `identificationType=subjectRegistrationId`.
 
+### `identifikacia_kod_zakaznika(kod_zakaznika)` — Kód zákazníka / fakturačného účtu
+
+| Parameter         | Format                                  |
+| ----------------- | --------------------------------------- |
+| `kod_zakaznika`   | 8–12 digits (e.g. `4482259100`)         |
+
+The tool dispatches based on the trailing digit:
+
+- Last digit is **`0`** → treated as **Customer ID**, fetched via `GET /customers/{id}`.
+- Last digit is **`1–9`** → treated as **Billing Account ID**, fetched via `GET /billingAccounts/{id}` → the linked Customer is then fetched via `GET /customers/{id}`.
+
+For B2C customers DPS stores the name as `"Surname,FirstName"` (no space after the comma).
+The tool detects this pattern and presents it as `"FirstName Surname"`. B2B names
+(which may legitimately contain a comma followed by a space, e.g. `"Creditinfo Slovakia, S.R.O."`)
+are returned verbatim.
+
 ## Environment variables
 
 | Var | Default | Notes |
@@ -154,3 +170,19 @@ These inputs map to known parties in the DPS staging environment. Use them via t
 | `86316923` | `{found, name: "Rmc S.R.O."}` | PARTY_2648241400 (organization) |
 | `00000000` | `{found: false, error: "not_found"}` | — |
 | `1234567`, `abcdefgh` | `{found: false, error: "invalid_input"}` | — |
+
+### `identifikacia_kod_zakaznika`
+
+| Input        | Branch                     | Expected                                            |
+| ------------ | -------------------------- | --------------------------------------------------- |
+| `4482259100` | Customer ID (B2C)          | `{found, name: "Tester AT NECHYTAT"}`               |
+| `1002203200` | Customer ID (B2C)          | `{found, name: "Stano Muziková"}`                   |
+| `4103349400` | Customer ID (B2C)          | `{found, name: "Valent Dorcak"}`                    |
+| `4059299000` | Customer ID (B2B)          | `{found, name: "A.B.Zrtv"}`                         |
+| `2300000400` | Customer ID (B2B)          | `{found, name: "Creditinfo Slovakia, S.R.O."}`      |
+| `4108064300` | Customer ID (B2B)          | `{found, name: "J A L & Š, S. R. O."}`              |
+| `1002203204` | Billing Account → customer | `{found, name: "Stano Muziková"}`                   |
+| `4108064301` | Billing Account → customer | `{found, name: "J A L & Š, S. R. O."}`              |
+| `4432948400` | Customer ID (404)          | `{found: false, error: "not_found"}`                |
+| `9999999999` | Billing Account (404)      | `{found: false, error: "not_found"}`                |
+| `abc`, `12345` | —                        | `{found: false, error: "invalid_input"}`            |

@@ -232,3 +232,70 @@ async def test_get_customers_by_engaged_party_empty_returns_empty_list() -> None
             ).mock(return_value=httpx.Response(200, json=[]))
             result = await client.get_customers_by_engaged_party("PARTY_UNKNOWN")
     assert result == []
+
+
+@pytest.mark.unit
+async def test_get_customer_by_id_returns_single_dict_on_200() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get(
+                "/omni/test1/customer-management/4.67.0/customers/4482259100",
+            ).mock(return_value=httpx.Response(200, json={"id": "4482259100", "name": "Tester"}))
+            result = await client.get_customer_by_id("4482259100")
+    assert result == {"id": "4482259100", "name": "Tester"}
+    assert route.calls.last.request.url.params["fields"] == "*"
+
+
+@pytest.mark.unit
+async def test_get_customer_by_id_returns_none_on_404() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/customer-management/4.67.0/customers/0000000000",
+            ).mock(return_value=httpx.Response(404, json={"error": "not found"}))
+            result = await client.get_customer_by_id("0000000000")
+    assert result is None
+
+
+@pytest.mark.unit
+async def test_get_customer_by_id_raises_on_other_errors() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/customer-management/4.67.0/customers/1234567890",
+            ).mock(return_value=httpx.Response(500, json={"error": "boom"}))
+            with pytest.raises(DPSUpstreamError) as excinfo:
+                await client.get_customer_by_id("1234567890")
+    assert excinfo.value.status_code == 500
+
+
+@pytest.mark.unit
+async def test_get_billing_account_by_id_returns_single_dict_on_200() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/customer-management/4.67.0/billingAccounts/1002203204",
+            ).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"id": "1002203204", "customer": {"id": "1002203200"}},
+                )
+            )
+            result = await client.get_billing_account_by_id("1002203204")
+    assert result == {"id": "1002203204", "customer": {"id": "1002203200"}}
+
+
+@pytest.mark.unit
+async def test_get_billing_account_by_id_returns_none_on_404() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/customer-management/4.67.0/billingAccounts/9999999999",
+            ).mock(return_value=httpx.Response(404, json={"error": "not found"}))
+            result = await client.get_billing_account_by_id("9999999999")
+    assert result is None

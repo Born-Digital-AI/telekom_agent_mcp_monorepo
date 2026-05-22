@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 _HTTP_CLIENT_ERROR_THRESHOLD = 400
+_HTTP_NOT_FOUND = 404
 
 
 class DPSError(Exception):
@@ -144,6 +145,37 @@ class DPSGetClient:
         )
         if not isinstance(result, list):
             msg = "customer-management expected JSON array"
+            raise DPSInvalidResponseError(msg)
+        return result
+
+    async def get_customer_by_id(self, customer_id: str) -> dict[str, Any] | None:
+        """GET /customer-management/4.67.0/customers/{id} — single Customer or None on 404."""
+        try:
+            result = await self._get(
+                f"/customer-management/4.67.0/customers/{customer_id}", {"fields": "*"}
+            )
+        except DPSUpstreamError as exc:
+            if exc.status_code == _HTTP_NOT_FOUND:
+                return None
+            raise
+        if not isinstance(result, dict):
+            msg = "customer-management single fetch expected JSON object"
+            raise DPSInvalidResponseError(msg)
+        return result
+
+    async def get_billing_account_by_id(self, account_id: str) -> dict[str, Any] | None:
+        """GET /customer-management/4.67.0/billingAccounts/{id} — single BillingAccount or None on 404."""
+        try:
+            result = await self._get(
+                f"/customer-management/4.67.0/billingAccounts/{account_id}",
+                {"fields": "*"},
+            )
+        except DPSUpstreamError as exc:
+            if exc.status_code == _HTTP_NOT_FOUND:
+                return None
+            raise
+        if not isinstance(result, dict):
+            msg = "billingAccount single fetch expected JSON object"
             raise DPSInvalidResponseError(msg)
         return result
 

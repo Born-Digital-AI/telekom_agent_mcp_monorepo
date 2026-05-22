@@ -92,6 +92,19 @@ _ICO_TOOL_DESCRIPTION = (
 
 _log = logging.getLogger(__name__)
 
+# "Kód zákazníka" or "Kód účtu" — numeric code 8-12 digits, no separators.
+# Ends in 0  → Customer ID
+# Ends in 1-9 → Billing Account ID (resolves to Customer via billingAccount.customer.id)
+_KOD_PATTERN = re.compile(r"^\d{8,12}$")
+_KOD_INVALID_MESSAGE = "Kód zákazníka má tvar 8 až 12 cifier (napr. 4482259100)."
+_KOD_NOT_FOUND_MESSAGE = "Zákazníka s týmto kódom sa nepodarilo nájsť."
+_KOD_TOOL_DESCRIPTION = (
+    "Identifikuj zákazníka podľa číselného kódu — môže byť kód zákazníka "
+    "(končí cifrou 0) alebo kód fakturačného účtu (končí inou cifrou). "
+    "Po úspechu vráti meno zákazníka. Interné identifikátory si tool uloží "
+    "do pamäte konverzácie pre ďalšie nástroje."
+)
+
 _IDENTITY_TTL_SECONDS = 30 * 60
 _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_SECONDS)
 
@@ -189,6 +202,50 @@ def _candidate(
         "valid_for": _valid_for(customer) if customer else None,
         "contacts": _normalize_contacts(party.get("contacts") or []),
         "identifications": _normalize_identifications(identifications_src),
+    }
+
+
+def _customer_display_name(customer: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """Return (display_name, given_name, family_name) from a Customer.name field.
+
+    B2C customers store name as "Surname,FirstName" (comma, no space after) — reverse it.
+    B2B customers may have legitimate commas in company names (e.g. "J A L & Š, S. R. O.")
+    — those must NOT be reversed.
+    """
+    raw = (customer.get("name") or "").strip()
+    if not raw:
+        return None, None, None
+    segment = customer.get("customerSegment")
+    # Reverse only when B2C AND the name has the "Surname,FirstName" pattern
+    # (single comma, no whitespace immediately after the comma).
+    if segment == "B2C" and raw.count(",") == 1:
+        family, given = raw.split(",", 1)
+        if given and not given[0].isspace():
+            return f"{given} {family}".strip(), given.strip(), family.strip()
+    return raw, None, None
+
+
+def _candidate_from_customer(customer: dict[str, Any]) -> dict[str, Any]:
+    """Build a candidate from a Customer record alone (no Party fetched).
+
+    Party-derived fields (contacts, identifications) are empty — downstream tools that
+    need them can fetch the Party via the cached `party_id`.
+    """
+    display, given, family = _customer_display_name(customer)
+    party_id = (customer.get("engagedParty") or {}).get("id")
+    return {
+        "party_id": party_id,
+        "customer_id": customer.get("id"),
+        "name": display,
+        "given_name": given,
+        "family_name": family,
+        "status": customer.get("status"),
+        "market_segment": customer.get("marketSegment"),
+        "customer_segment": customer.get("customerSegment"),
+        "treatment_package": _treatment_package(customer),
+        "valid_for": _valid_for(customer),
+        "contacts": [],
+        "identifications": [],
     }
 
 
@@ -420,3 +477,62 @@ def register(
             conversation_id=conv,
             log_id_tag="ico_last4",
         )
+
+    @mcp_tool(
+        name="identifikacia_kod_zakaznika", description=_KOD_TOOL_DESCRIPTION, registry=registry
+    )
+    async def identifikacia_kod_zakaznika(
+        kod_zakaznika: Annotated[
+            str,
+            Field(
+                description="Kód zákazníka alebo fakturačného účtu — len cifry (napr. 4482259100)."
+            ),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        value = (kod_zakaznika or "").strip()
+        if not _KOD_PATTERN.fullmatch(value):
+            return _json(
+                {"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE}
+            )
+
+        conv = (_meta or {}).get("conversation_id", "")
+        _log.info("identifikacia_kod_zakaznika called code_suffix=%s conv=%s", value[-1], conv)
+
+        try:
+            if value.endswith("0"):
+                customer = await client.get_customer_by_id(value)
+            else:
+                ba = await client.get_billing_account_by_id(value)
+                if ba is None:
+                    customer = None
+                else:
+                    cust_id = (ba.get("customer") or {}).get("id")
+                    if not isinstance(cust_id, str):
+                        _log.warning(
+                            "billing account %s has no customer.id — treating as not_found", value
+                        )
+                        customer = None
+                    else:
+                        customer = await client.get_customer_by_id(cust_id)
+        except DPSError as exc:
+            _log.warning("identifikacia_kod_zakaznika failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        if customer is None:
+            return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
+
+        candidate = _candidate_from_customer(customer)
+        if not candidate.get("name"):
+            # Defensive: the Customer record exists but has no usable name field
+            return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
+
+        if conv:
+            _IDENTITY_STATE.set(
+                conv,
+                {"rc_last4": value[-4:], "candidates": [candidate]},
+            )
+        else:
+            _log.warning("identifikacia_kod_zakaznika: no conversation_id — cache skipped")
+
+        return _json({"found": True, "name": candidate["name"]})
