@@ -428,3 +428,111 @@ async def test_successful_identification_caches_full_candidates(make_tool, conv)
     assert cached_candidate["customer_id"] == "4482259100"
     # Contacts still cached for downstream tools
     assert any(c["type"] == "mobile" for c in cached_candidate["contacts"])
+
+
+# ---- identifikacia_op ----
+
+
+@pytest.fixture
+def make_op_tool():
+    """Factory specifically for the identifikacia_op tool."""
+
+    def _factory(
+        parties=None,
+        customers_by_party=None,
+        max_candidates: int = 10,
+    ):
+        stub = _StubClient(parties=parties, customers_by_party=customers_by_party)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return fake.registered["identifikacia_op"], stub
+
+    return _factory
+
+
+@pytest.mark.unit
+async def test_op_rejects_empty_input(make_op_tool, conv) -> None:  # noqa: ARG001
+    tool, stub = make_op_tool()
+    result = await _call(tool, cislo_op="")
+    assert result["found"] is False
+    assert result["error"] == "invalid_input"
+    assert "občianskeho preukazu" in result["message"]
+    assert stub.party_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["A1234567", "ABCDEF12", "12345", "A2B345678", " "])
+async def test_op_rejects_bad_format(make_op_tool, conv, bad) -> None:  # noqa: ARG001
+    tool, stub = make_op_tool()
+    result = await _call(tool, cislo_op=bad)
+    assert result["error"] == "invalid_input"
+    assert stub.party_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "good", ["AB123456", "ab123456", " AB123456 ", "12345678", "123456789", "1234567"]
+)
+async def test_op_valid_format_reaches_party_call_with_correct_type(
+    make_op_tool,
+    conv,  # noqa: ARG001
+    good,
+) -> None:
+    tool, stub = make_op_tool(parties=[])
+    await _call(tool, cislo_op=good)
+    assert len(stub.party_calls) == 1
+    called_id, called_type = stub.party_calls[0]
+    assert called_id == good.strip().upper()
+    assert called_type == "nationalIdentityCard"
+
+
+@pytest.mark.unit
+async def test_op_single_match_returns_name_only(make_op_tool, conv) -> None:  # noqa: ARG001
+    party = _full_party()  # default name "Tester AT NECHYTAT", id PARTY_4482259100
+    customer = _customer()
+    tool, _ = make_op_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    result = await _call(tool, cislo_op="MM852148")
+    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
+
+
+@pytest.mark.unit
+async def test_op_not_found_uses_op_specific_message(make_op_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_op_tool(parties=[])
+    result = await _call(tool, cislo_op="MM852148")
+    assert result == {
+        "found": False,
+        "error": "not_found",
+        "message": "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť.",
+    }
+
+
+@pytest.mark.unit
+async def test_op_caches_full_candidates(make_op_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_op_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    await _call(tool, cislo_op="MM852148")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cached_candidate] = cached["candidates"]
+    assert cached_candidate["party_id"] == "PARTY_4482259100"
+    assert cached_candidate["customer_id"] == "4482259100"
+
+
+@pytest.mark.unit
+async def test_op_upstream_error_uses_unified_message(make_op_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.dps_get_client import DPSAuthError
+
+    tool, _ = make_op_tool(parties=DPSAuthError("bad token"))
+    result = await _call(tool, cislo_op="MM852148")
+    assert result["error"] == "auth_failed"
+    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."

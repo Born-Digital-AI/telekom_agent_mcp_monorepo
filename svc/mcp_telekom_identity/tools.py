@@ -2,6 +2,9 @@
 
 identifikacia_rodne_cislo(rodne_cislo)
 — Find Telekom customer(s) by Slovak personal identification number (rodné číslo).
+
+identifikacia_op(cislo_op)
+— Find Telekom customer(s) by Slovak national ID card number (občiansky preukaz).
 """
 
 from __future__ import annotations
@@ -30,12 +33,33 @@ if TYPE_CHECKING:
 
 
 _RC_PATTERN = re.compile(r"^\d{9,10}$")
-_TOOL_DESCRIPTION = (
+_RC_INVALID_MESSAGE = (
+    "Rodné číslo nie je v správnom tvare. Zadajte ho ako 9 alebo 10 cifier bez lomky."
+)
+_RC_NOT_FOUND_MESSAGE = "Zákazníka s týmto rodným číslom sa nepodarilo nájsť."
+_RC_TOOL_DESCRIPTION = (
     "Identifikuj zákazníka podľa rodného čísla. Po úspechu vráti meno "
     "(alebo zoznam mien ak je záznamov viac). Interné identifikátory "
     "a kontakty si tool uloží do pamäte konverzácie pre ďalšie nástroje "
     "— netreba ich od neho znova žiadať."
 )
+
+# New SK OP: 2 uppercase letters + 6 digits (e.g. "AB123456").
+# Old SK OP: 6-9 digits (legacy, still valid for some).
+# Be lenient: strip + uppercase before matching.
+_OP_PATTERN = re.compile(r"^([A-Z]{2}\d{6}|\d{6,9})$")
+_OP_INVALID_MESSAGE = (
+    "Číslo občianskeho preukazu nie je v správnom tvare. "
+    "Zadajte ho ako 2 písmená a 6 cifier (napr. AB123456) alebo ako 6 až 9 cifier."
+)
+_OP_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť."
+_OP_TOOL_DESCRIPTION = (
+    "Identifikuj zákazníka podľa čísla občianskeho preukazu. Po úspechu vráti meno "
+    "(alebo zoznam mien ak je záznamov viac). Interné identifikátory a kontakty "
+    "si tool uloží do pamäte konverzácie pre ďalšie nástroje — netreba ich od neho "
+    "znova žiadať."
+)
+
 _log = logging.getLogger(__name__)
 
 _IDENTITY_TTL_SECONDS = 30 * 60
@@ -168,38 +192,30 @@ def register(
 ) -> None:
     """Register identity tools onto the FastMCP registry."""
 
-    @mcp_tool(
-        name="identifikacia_rodne_cislo",
-        description=_TOOL_DESCRIPTION,
-        registry=registry,
-    )
-    async def identifikacia_rodne_cislo(
-        rodne_cislo: Annotated[
-            str,
-            Field(description="Rodné číslo zákazníka — 9 alebo 10 cifier, bez lomky."),
-        ],
-        _meta: dict[str, Any] | None = None,
+    async def _identify_and_respond(
+        identification_id: str,
+        identification_type: str,
+        not_found_message: str,
+        conversation_id: str,
+        log_id_tag: str,
     ) -> str:
-        rc = (rodne_cislo or "").strip()
-        if not _RC_PATTERN.fullmatch(rc):
-            return _json(
-                {
-                    "found": False,
-                    "error": "invalid_input",
-                    "message": "Rodné číslo nie je v správnom tvare. Zadajte ho ako 9 alebo 10 cifier bez lomky.",
-                }
-            )
+        """Shared identification flow used by all identification tools.
 
+        ``identification_id`` must already be validated by the caller.
+        """
         _log.info(
-            "identifikacia_rodne_cislo called rc_last4=%s max_candidates=%s",
-            rc[-4:],
+            "identification called %s=%s max_candidates=%s",
+            log_id_tag,
+            identification_id[-4:],
             max_candidates,
         )
 
         try:
-            parties_raw = await client.get_parties_by_identification(rc, "socialSecurityNumber")
+            parties_raw = await client.get_parties_by_identification(
+                identification_id, identification_type
+            )
         except DPSError as exc:
-            _log.warning("identifikacia_rodne_cislo party lookup failed: %s", exc)
+            _log.warning("party lookup failed (%s): %s", identification_type, exc)
             return _json(_dps_error_payload(exc))
 
         # Filter to Party records with status=initialized, dedup by id.
@@ -221,7 +237,7 @@ def register(
                 {
                     "found": False,
                     "error": "not_found",
-                    "message": "Zákazníka s týmto rodným číslom sa nepodarilo nájsť.",
+                    "message": not_found_message,
                 }
             )
 
@@ -233,7 +249,7 @@ def register(
                 *(client.get_customers_by_engaged_party(p["id"]) for p in capped)
             )
         except DPSError as exc:
-            _log.warning("identifikacia_rodne_cislo customer fanout failed: %s", exc)
+            _log.warning("customer fanout failed (%s): %s", identification_type, exc)
             return _json(_dps_error_payload(exc))
 
         candidates: list[dict[str, Any]] = []
@@ -247,17 +263,20 @@ def register(
         unique_party_ids = {c["party_id"] for c in candidates}
 
         # Cache full candidates for downstream tools.
-        conversation_id = (_meta or {}).get("conversation_id", "")
+        # rc_last4 key name is kept stable across both tools for schema consistency.
         if conversation_id:
             _IDENTITY_STATE.set(
                 conversation_id,
                 {
-                    "rc_last4": rc[-4:],
-                    "candidates": candidates,  # full list with party_id, customer_id, contacts, etc.
+                    "rc_last4": identification_id[-4:],
+                    "candidates": candidates,
                 },
             )
         else:
-            _log.warning("identifikacia_rodne_cislo: no conversation_id in _meta — cache skipped")
+            _log.warning(
+                "identification (%s): no conversation_id in _meta — cache skipped",
+                identification_type,
+            )
 
         if len(unique_party_ids) == 1:
             # Single match — return just the name.
@@ -271,6 +290,46 @@ def register(
                 "found": True,
                 "multiple_matches": True,
                 "names": names,
-                "message": "Pre toto rodné číslo som našla viacero záznamov. Bude potrebné si vyžiadať dodatočné údaje.",
+                "message": "Pre toto identifikačné číslo som našla viacero záznamov. Bude potrebné si vyžiadať dodatočné údaje.",
             }
+        )
+
+    @mcp_tool(name="identifikacia_rodne_cislo", description=_RC_TOOL_DESCRIPTION, registry=registry)
+    async def identifikacia_rodne_cislo(
+        rodne_cislo: Annotated[
+            str,
+            Field(description="Rodné číslo zákazníka — 9 alebo 10 cifier, bez lomky."),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        value = (rodne_cislo or "").strip()
+        if not _RC_PATTERN.fullmatch(value):
+            return _json({"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE})
+        conv = (_meta or {}).get("conversation_id", "")
+        return await _identify_and_respond(
+            identification_id=value,
+            identification_type="socialSecurityNumber",
+            not_found_message=_RC_NOT_FOUND_MESSAGE,
+            conversation_id=conv,
+            log_id_tag="rc_last4",
+        )
+
+    @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=registry)
+    async def identifikacia_op(
+        cislo_op: Annotated[
+            str,
+            Field(description="Číslo občianskeho preukazu — napr. AB123456 alebo 6–9 cifier."),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        value = (cislo_op or "").strip().upper()
+        if not _OP_PATTERN.fullmatch(value):
+            return _json({"found": False, "error": "invalid_input", "message": _OP_INVALID_MESSAGE})
+        conv = (_meta or {}).get("conversation_id", "")
+        return await _identify_and_respond(
+            identification_id=value,
+            identification_type="nationalIdentityCard",
+            not_found_message=_OP_NOT_FOUND_MESSAGE,
+            conversation_id=conv,
+            log_id_tag="op_last4",
         )
