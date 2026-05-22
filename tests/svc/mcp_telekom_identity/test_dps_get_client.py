@@ -339,3 +339,43 @@ async def test_get_products_by_public_identifier_returns_empty_list_when_no_matc
             ).mock(return_value=httpx.Response(200, json=[]))
             result = await client.get_products_by_public_identifier("421000000000")
     assert result == []
+
+
+@pytest.mark.unit
+async def test_get_products_by_serial_number_calls_correct_query() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get(
+                "/omni/test1/product-inventory/4.64/products",
+            ).mock(
+                return_value=httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": "M-2B1PT-1",
+                            "productSerialNumber": "M91450EB0603",
+                            "customer": {"id": "1002203200"},
+                        }
+                    ],
+                ),
+            )
+            result = await client.get_products_by_serial_number("M91450EB0603")
+    assert len(result) == 1
+    assert result[0]["customer"]["id"] == "1002203200"
+    request = route.calls.last.request
+    assert request.url.params["query"] == "productSerialNumber==M91450EB0603"
+    assert request.url.params["fields"] == "*"
+    assert request.url.params["size"] == "20"
+
+
+@pytest.mark.unit
+async def test_get_products_by_serial_number_returns_empty_list_when_no_match() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/product-inventory/4.64/products",
+            ).mock(return_value=httpx.Response(200, json=[]))
+            result = await client.get_products_by_serial_number("UNKNOWNSN001")
+    assert result == []

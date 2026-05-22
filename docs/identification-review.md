@@ -19,8 +19,8 @@
 `mcp_telekom_identity` is an MCP (Model Context Protocol) server consumed by a
 voice AI agent on the Slovak Telekom customer-care line. Its job is **only
 identification** — given an identifier the caller provides (rodné číslo,
-občiansky preukaz, pas, IČO, customer/billing code, or phone number), look the
-customer up in DPS and return their name. The full record (`party_id`,
+občiansky preukaz, pas, IČO, customer/billing code, phone number, or device
+serial number), look the customer up in DPS and return their name. The full record (`party_id`,
 `customer_id`, contacts, accounts) is cached internally for follow-up tools
 (account lookup, bill resend, …) which will be added later.
 
@@ -33,7 +33,7 @@ outside the identification surface.
 
 ## 2. Tools and the APIs they call
 
-Six tools, all served by a single MCP server. Each one returns the same
+Seven tools, all served by a single MCP server. Each one returns the same
 minimal response shape (`{"found": true, "name": "..."}` on success); the
 internal flow differs.
 
@@ -45,6 +45,7 @@ internal flow differs.
 | 4 | `identifikacia_ico`             | IČO (8 digits)           | Party Management → Customer Management (organization branch)                  |
 | 5 | `identifikacia_kod_zakaznika`   | numeric code (8–12)      | Customer Management direct (or Billing Account → Customer)                    |
 | 6 | `identifikacia_telefon`         | telefónne číslo (SK or intl) | Product Inventory → Customer Management                                   |
+| 7 | `identifikacia_seriove_cislo`   | sériové číslo (`M91450EB0603`) | Product Inventory → Customer Management                               |
 
 ---
 
@@ -203,6 +204,39 @@ tested and **do not work** — they return either empty arrays or time out.
 on Product Inventory will remain stable — i.e. mobile tariff products will
 continue to use the MSISDN as `publicIdentifier`. If the schema changes (e.g.
 move MSISDN into a separate field or normalize stored format), the tool breaks.
+
+### 3.7 `identifikacia_seriove_cislo`
+
+**Caller input:** sériové číslo zariadenia (router, STB, modem). Input is
+normalized (strip whitespace, dashes, slashes, dots; uppercase letters) and
+validated against `^[A-Z0-9]{8,30}$`.
+
+**API call A — Product Inventory:**
+
+```http
+GET /product-inventory/4.64/products
+  ?query=productSerialNumber==<sn>
+  &fields=*
+  &size=20
+```
+
+The RQL filter on `productSerialNumber` is case-sensitive in DPS — normalization
+is mandatory before the query. Unknown serials return an empty list (no error).
+
+**API call B — Customer Management** (per unique `customer.id`, concurrently):
+same as 3.6 (`GET /customers/{id}`). Applies B2C name reversal.
+
+**Verified live test cases:**
+
+- `M91450EB0603` → Stano Muziková (Magio Box s HDD)
+- `K5D0M374LXO` → Stano Muziková (Magio Box bez HDD)
+- `J252BS000119` → Stano Muziková (HAG)
+- `m91450eb0603` (lowercase) / `M9145-0EB-0603` (with hyphens) → normalized then same as first
+
+**Note for owners:** `Product.productSerialNumber` is the canonical field per
+the Product Inventory swagger ("A serial number for the product, e.g. for
+broadband routers"). Confirmation requested that this field is populated
+across all device types (router / STB / SIM / modem) consistently in production.
 
 ---
 
@@ -395,6 +429,10 @@ or a correction before going to production. They are also tracked in
   We use `customer.id==<id>` which works. Confirm.
 - RQL on `phoneNumber` ⇒ `400 "Could not resolve attribute 'phoneNumber'"`.
   So `phoneNumber` is a top-level filter only, not RQL — confirm.
+- `query=productSerialNumber==<sn>` is case-sensitive (live probe shows
+  lowercase serial returns empty). Confirm intended and stable, and confirm
+  `productSerialNumber` is populated for all device types we care about
+  (Magio Box / HAG / router / modem / SIM).
 
 ### To Security
 

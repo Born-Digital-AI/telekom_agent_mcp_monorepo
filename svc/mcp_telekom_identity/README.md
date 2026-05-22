@@ -74,6 +74,20 @@ then queries Product Inventory `GET /products?query=publicIdentifier==<msisdn>`.
 matched product carries `customer.id` which is resolved via the same path used by
 `identifikacia_kod_zakaznika`.
 
+### `identifikacia_seriove_cislo(seriove_cislo)` — Sériové číslo zariadenia
+
+| Parameter         | Format                                                |
+| ----------------- | ----------------------------------------------------- |
+| `seriove_cislo`   | 8–30 alphanumeric characters (e.g. `M91450EB0603`)    |
+
+Suited for the customer reading the serial off a router, set-top box, modem
+or similar device. The tool strips spaces, dashes, slashes and dots from the
+input and uppercases letters before the lookup, then queries Product Inventory
+via `GET /products?query=productSerialNumber==<sn>`. The matched product
+carries `customer.id` which is resolved through customer-management. The
+backing field is case-sensitive in DPS — normalization is the responsibility
+of the tool.
+
 ## Environment variables
 
 | Var | Default | Notes |
@@ -208,3 +222,15 @@ These inputs map to known parties in the DPS staging environment. Use them via t
 | `0902 804 660`     | `421902804660`   | same as above (whitespace stripped)                     |
 | `0000000000`       | `421000000000`   | `{found: false, error: "not_found"}`                    |
 | `abc`, `+abc`, ` ` | —                | `{found: false, error: "invalid_input"}`                |
+
+### `identifikacia_seriove_cislo`
+
+| Input              | Normalized       | Expected                                                                |
+| ------------------ | ---------------- | ----------------------------------------------------------------------- |
+| `M91450EB0603`     | `M91450EB0603`   | `{found, name: "Stano Muziková"}` (Magio Box s HDD, customer 1002203200) |
+| `K5D0M374LXO`      | `K5D0M374LXO`    | `{found, name: "Stano Muziková"}` (Magio Box bez HDD)                    |
+| `J252BS000119`     | `J252BS000119`   | `{found, name: "Stano Muziková"}` (HAG)                                  |
+| `m91450eb0603`     | `M91450EB0603`   | same as first row (lowercase normalized)                                |
+| `M9145-0EB-0603`   | `M91450EB0603`   | same (hyphens stripped)                                                 |
+| `UNKNOWNSN001`     | `UNKNOWNSN001`   | `{found: false, error: "not_found"}`                                    |
+| `abc`, `#`, ` `    | —                | `{found: false, error: "invalid_input"}`                                |

@@ -197,6 +197,24 @@ class DPSGetClient:
             raise DPSInvalidResponseError(msg)
         return result
 
+    async def get_products_by_serial_number(
+        self,
+        serial_number: str,
+    ) -> list[dict[str, Any]]:
+        """GET /product-inventory/4.64/products?query=productSerialNumber==<sn> — list of products."""
+        result = await self._get(
+            "/product-inventory/4.64/products",
+            {
+                "query": f"productSerialNumber=={serial_number}",
+                "fields": "*",
+                "size": "20",
+            },
+        )
+        if not isinstance(result, list):
+            msg = "product-inventory expected JSON array"
+            raise DPSInvalidResponseError(msg)
+        return result
+
     async def _get(self, path: str, params: dict[str, str]) -> Any:  # noqa: ANN401
         client = self._ensure_client()
         url = self._base_url + path

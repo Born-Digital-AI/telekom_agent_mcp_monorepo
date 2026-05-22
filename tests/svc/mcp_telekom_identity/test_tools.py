@@ -42,8 +42,10 @@ class _StubClient:
     billing_account_by_id_map: dict[str, dict | None] | Exception
     products_by_public_identifier_calls: list[str]
     products_by_public_identifier_map: dict[str, list[dict] | Exception] | Exception
+    products_by_serial_number_calls: list[str]
+    products_by_serial_number_map: dict[str, list[dict] | Exception] | Exception
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         parties: list[dict] | Exception | None = None,
         customers_by_party: dict[str, list[dict]] | Exception | None = None,
@@ -52,6 +54,7 @@ class _StubClient:
         products_by_public_identifier_map: dict[str, list[dict] | Exception]
         | Exception
         | None = None,
+        products_by_serial_number_map: dict[str, list[dict] | Exception] | Exception | None = None,
     ) -> None:
         self.parties = parties if parties is not None else []
         self.customers_by_party = customers_by_party if customers_by_party is not None else {}
@@ -60,6 +63,7 @@ class _StubClient:
         self.customer_by_id_calls = []
         self.billing_account_by_id_calls = []
         self.products_by_public_identifier_calls = []
+        self.products_by_serial_number_calls = []
         self.customer_by_id_map = customer_by_id_map if customer_by_id_map is not None else {}
         self.billing_account_by_id_map = (
             billing_account_by_id_map if billing_account_by_id_map is not None else {}
@@ -68,6 +72,9 @@ class _StubClient:
             products_by_public_identifier_map
             if products_by_public_identifier_map is not None
             else {}
+        )
+        self.products_by_serial_number_map = (
+            products_by_serial_number_map if products_by_serial_number_map is not None else {}
         )
 
     async def get_parties_by_identification(
@@ -103,6 +110,15 @@ class _StubClient:
         if isinstance(self.products_by_public_identifier_map, Exception):
             raise self.products_by_public_identifier_map
         return self.products_by_public_identifier_map.get(public_identifier, [])
+
+    async def get_products_by_serial_number(self, serial_number: str) -> list[dict]:
+        self.products_by_serial_number_calls.append(serial_number)
+        if isinstance(self.products_by_serial_number_map, Exception):
+            raise self.products_by_serial_number_map
+        val = self.products_by_serial_number_map.get(serial_number, [])
+        if isinstance(val, Exception):
+            raise val
+        return val
 
 
 @pytest.fixture
@@ -1159,5 +1175,128 @@ async def test_tel_upstream_error_uses_unified_message(make_tel_tool, conv) -> N
 
     tool, _ = make_tel_tool(products_by_public_identifier_map=DPSAuthError("bad token"))
     result = await _call(tool, telefon="0902804660")
+    assert result["error"] == "auth_failed"
+    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+
+# ---- identifikacia_seriove_cislo ----
+
+
+@pytest.fixture
+def make_serial_tool():
+    def _factory(**kwargs):
+        stub = _StubClient(
+            products_by_serial_number_map=kwargs.pop("products_by_serial_number_map", None),
+            customer_by_id_map=kwargs.pop("customer_by_id_map", None),
+        )
+        max_candidates = kwargs.pop("max_candidates", 10)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return fake.registered["identifikacia_seriove_cislo"], stub
+
+    return _factory
+
+
+@pytest.mark.unit
+async def test_serial_rejects_empty(make_serial_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_serial_tool()
+    result = await _call(tool, seriove_cislo="")
+    assert result["error"] == "invalid_input"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["abc", "1234567", "#" * 12, "AB CD!1234", " ", "A" * 31])
+async def test_serial_rejects_bad_format(make_serial_tool, conv, bad) -> None:  # noqa: ARG001
+    tool, stub = make_serial_tool()
+    result = await _call(tool, seriove_cislo=bad)
+    assert result["error"] == "invalid_input"
+    assert stub.products_by_serial_number_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("M91450EB0603", "M91450EB0603"),
+        ("m91450eb0603", "M91450EB0603"),  # lowercase normalized
+        (" M91450EB0603 ", "M91450EB0603"),  # whitespace
+        ("M9145-0EB-0603", "M91450EB0603"),  # hyphens stripped
+        ("M9145/0EB/0603", "M91450EB0603"),  # slashes stripped
+        ("12345678", "12345678"),  # minimum length, all digits
+        ("A" * 30, "A" * 30),  # maximum length
+    ],
+)
+async def test_serial_normalizes_and_queries(
+    make_serial_tool,
+    conv,  # noqa: ARG001
+    raw,
+    expected,
+) -> None:
+    tool, stub = make_serial_tool(products_by_serial_number_map={expected: []})
+    await _call(tool, seriove_cislo=raw)
+    assert stub.products_by_serial_number_calls == [expected]
+
+
+@pytest.mark.unit
+async def test_serial_single_match(make_serial_tool, conv) -> None:  # noqa: ARG001
+    product = {
+        "id": "M-2B1PT-1",
+        "productSerialNumber": "M91450EB0603",
+        "customer": {"id": "1002203200"},
+        "status": "Active",
+    }
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_serial_tool(
+        products_by_serial_number_map={"M91450EB0603": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    result = await _call(tool, seriove_cislo="M91450EB0603")
+    assert result == {"found": True, "name": "Stano Muziková"}
+
+
+@pytest.mark.unit
+async def test_serial_no_products_returns_not_found(make_serial_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_serial_tool(products_by_serial_number_map={"UNKNOWNSN001": []})
+    result = await _call(tool, seriove_cislo="UNKNOWNSN001")
+    assert result["error"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_serial_product_without_customer_returns_not_found(make_serial_tool, conv) -> None:  # noqa: ARG001
+    product_no_cust = {"id": "P1", "productSerialNumber": "M91450EB0603", "status": "Active"}
+    tool, _ = make_serial_tool(products_by_serial_number_map={"M91450EB0603": [product_no_cust]})
+    result = await _call(tool, seriove_cislo="M91450EB0603")
+    assert result["error"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_serial_caches_candidate(make_serial_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    product = {
+        "id": "M-2B1PT-1",
+        "productSerialNumber": "M91450EB0603",
+        "customer": {"id": "1002203200"},
+    }
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_serial_tool(
+        products_by_serial_number_map={"M91450EB0603": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    await _call(tool, seriove_cislo="M91450EB0603")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cand] = cached["candidates"]
+    assert cand["customer_id"] == "1002203200"
+    assert cand["name"] == "Stano Muziková"
+
+
+@pytest.mark.unit
+async def test_serial_upstream_error_uses_unified_message(make_serial_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.dps_get_client import DPSAuthError
+
+    tool, _ = make_serial_tool(products_by_serial_number_map=DPSAuthError("bad token"))
+    result = await _call(tool, seriove_cislo="M91450EB0603")
     assert result["error"] == "auth_failed"
     assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."

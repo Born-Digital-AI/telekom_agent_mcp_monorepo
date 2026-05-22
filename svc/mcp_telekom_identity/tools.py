@@ -79,6 +79,14 @@ def _normalize_msisdn(raw: str) -> str | None:
     return None
 
 
+def _normalize_serial(raw: str) -> str | None:
+    """Return canonical serial number (uppercase, no separators) or None if invalid format."""
+    cleaned = _SERIAL_STRIP_RE.sub("", raw or "").upper()
+    if _SERIAL_PATTERN.fullmatch(cleaned):
+        return cleaned
+    return None
+
+
 _OP_PATTERN = re.compile(r"^[A-Z]{2}\d{6}$")
 _OP_INVALID_MESSAGE = "Číslo občianskeho preukazu má tvar 2 písmená a 6 cifier (napr. AB123456)."
 _OP_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť."
@@ -140,6 +148,22 @@ _TEL_TOOL_DESCRIPTION = (
     "Akceptuje slovenský tvar (0904...), medzinárodný tvar (+421904... alebo 421904...). "
     "Po úspechu vráti meno zákazníka. Interné identifikátory si tool uloží "
     "do pamäte konverzácie pre ďalšie nástroje."
+)
+
+# Serial number normalization: strip whitespace, dashes, slashes, dots; uppercase.
+# Then validate as alphanumeric 8-30 chars. Real test data is 12 chars but production
+# routers/STBs use a wide variety of lengths and formats — keep the pattern permissive.
+_SERIAL_STRIP_RE = re.compile(r"[\s\-/.]")
+_SERIAL_PATTERN = re.compile(r"^[A-Z0-9]{8,30}$")
+_SERIAL_INVALID_MESSAGE = (
+    "Sériové číslo nie je v správnom tvare. Zadajte ho ako 8 až 30 alfanumerických "
+    "znakov (napr. M91450EB0603)."
+)
+_SERIAL_NOT_FOUND_MESSAGE = "Zákazníka s týmto sériovým číslom sa nepodarilo nájsť."
+_SERIAL_TOOL_DESCRIPTION = (
+    "Identifikuj zákazníka podľa sériového čísla zariadenia "
+    "(router, set-top box, modem, …). Po úspechu vráti meno zákazníka. "
+    "Interné identifikátory si tool uloží do pamäte konverzácie pre ďalšie nástroje."
 )
 
 _IDENTITY_TTL_SECONDS = 30 * 60
@@ -650,6 +674,102 @@ def register(
                 "names": names,
                 "message": (
                     "Pre toto telefónne číslo som našla viacero záznamov. "
+                    "Bude potrebné si vyžiadať dodatočné údaje."
+                ),
+            }
+        )
+
+    @mcp_tool(
+        name="identifikacia_seriove_cislo", description=_SERIAL_TOOL_DESCRIPTION, registry=registry
+    )
+    async def identifikacia_seriove_cislo(
+        seriove_cislo: Annotated[
+            str,
+            Field(
+                description="Sériové číslo zariadenia — 8 až 30 alfanumerických znakov (napr. M91450EB0603)."
+            ),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        normalized = _normalize_serial(seriove_cislo or "")
+        if not normalized:
+            return _json(
+                {"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE}
+            )
+
+        conv = (_meta or {}).get("conversation_id", "")
+        _log.info(
+            "identifikacia_seriove_cislo called serial_last4=%s conv=%s", normalized[-4:], conv
+        )
+
+        try:
+            products = await client.get_products_by_serial_number(normalized)
+        except DPSError as exc:
+            _log.warning("identifikacia_seriove_cislo product lookup failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        if not products:
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        # Extract unique customer ids
+        customer_ids: list[str] = []
+        seen: set[str] = set()
+        for p in products:
+            cid = (p.get("customer") or {}).get("id")
+            if isinstance(cid, str) and cid not in seen:
+                seen.add(cid)
+                customer_ids.append(cid)
+
+        if not customer_ids:
+            _log.warning(
+                "identifikacia_seriove_cislo: products returned but no customer.id linkage"
+            )
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        try:
+            customers_raw = await asyncio.gather(
+                *(client.get_customer_by_id(cid) for cid in customer_ids)
+            )
+        except DPSError as exc:
+            _log.warning("identifikacia_seriove_cislo customer fanout failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        customers = [c for c in customers_raw if c is not None]
+        if not customers:
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        candidates = [_candidate_from_customer(c) for c in customers]
+        candidates = [c for c in candidates if c.get("name")]
+        if not candidates:
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        if conv:
+            _IDENTITY_STATE.set(
+                conv,
+                {"rc_last4": normalized[-4:], "candidates": candidates},
+            )
+        else:
+            _log.warning("identifikacia_seriove_cislo: no conversation_id — cache skipped")
+
+        if len(candidates) == 1:
+            return _json({"found": True, "name": candidates[0]["name"]})
+
+        names = sorted({c["name"] for c in candidates if c["name"]})
+        return _json(
+            {
+                "found": True,
+                "multiple_matches": True,
+                "names": names,
+                "message": (
+                    "Pre toto sériové číslo som našla viacero záznamov. "
                     "Bude potrebné si vyžiadať dodatočné údaje."
                 ),
             }
