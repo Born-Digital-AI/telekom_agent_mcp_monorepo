@@ -167,20 +167,48 @@ async def test_not_found_when_no_party_matches(make_tool, conv) -> None:  # noqa
 
 
 @pytest.mark.unit
-async def test_filters_contactparty_and_non_initialized(make_tool, conv) -> None:  # noqa: ARG001
+async def test_filters_contactparty_and_terminal_statuses(make_tool, conv) -> None:  # noqa: ARG001
+    # P1: Party, initialized → accepted
+    # P2: ContactParty, initialized → rejected (wrong entityType)
+    # P3: Party, deceased → rejected (terminal)
+    # P4: Party, validated → accepted
     parties = [
-        _party("PARTY_1", name=("Jana", "Nováková")),
+        _party("PARTY_1", status="initialized", name=("A", "A")),
         _party("PARTY_2", entity_type="ContactParty"),
-        _party("PARTY_3", status="terminated"),
-        _party("PARTY_4", name=("Peter", "Sloboda")),
+        _party("PARTY_3", status="deceased"),
+        _party("PARTY_4", status="validated", name=("B", "B")),
     ]
     tool, _stub = make_tool(parties=parties)
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is True
     # 2 unique party_ids → multiple_matches
     assert result["multiple_matches"] is True
-    assert "Jana Nováková" in result["names"]
-    assert "Peter Sloboda" in result["names"]
+    assert "A A" in result["names"]
+    assert "B B" in result["names"]
+
+
+@pytest.mark.unit
+async def test_filters_closed_status(make_tool, conv) -> None:  # noqa: ARG001
+    parties = [
+        _party("PARTY_1", status="closed"),
+        _party("PARTY_2", name=("Jana", "Nováková")),
+    ]
+    tool, _stub = make_tool(parties=parties)
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is True
+    # Only PARTY_2 passes → single match
+    assert result.get("multiple_matches") is None
+    assert result["name"] == "Jana Nováková"
+
+
+@pytest.mark.unit
+async def test_accepts_party_with_null_status(make_tool, conv) -> None:  # noqa: ARG001
+    party = _party("PARTY_NULL", name=("Org", "Test"))
+    party["status"] = None  # mirror the org case
+    tool, _ = make_tool(parties=[party])
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is True
+    assert result["name"] == "Org Test"
 
 
 @pytest.mark.unit
@@ -536,3 +564,239 @@ async def test_op_upstream_error_uses_unified_message(make_op_tool, conv) -> Non
     result = await _call(tool, cislo_op="MM852148")
     assert result["error"] == "auth_failed"
     assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+
+# ---- identifikacia_pas ----
+
+
+@pytest.fixture
+def make_pas_tool():
+    """Factory specifically for the identifikacia_pas tool."""
+
+    def _factory(
+        parties=None,
+        customers_by_party=None,
+        max_candidates: int = 10,
+    ):
+        stub = _StubClient(parties=parties, customers_by_party=customers_by_party)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return fake.registered["identifikacia_pas"], stub
+
+    return _factory
+
+
+@pytest.mark.unit
+async def test_pas_rejects_empty_input(make_pas_tool, conv) -> None:  # noqa: ARG001
+    tool, stub = make_pas_tool()
+    result = await _call(tool, cislo_pasu="")
+    assert result["found"] is False
+    assert result["error"] == "invalid_input"
+    assert "cestovného pasu" in result["message"]
+    assert stub.party_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["123", "ABCD12345", "A1234567890", " "])
+async def test_pas_rejects_bad_format(make_pas_tool, conv, bad) -> None:  # noqa: ARG001
+    tool, stub = make_pas_tool()
+    result = await _call(tool, cislo_pasu=bad)
+    assert result["error"] == "invalid_input"
+    assert stub.party_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("good", ["BR154151", "br154151", " BR154151 ", "AB123456", "X1234567"])
+async def test_pas_valid_format_reaches_party_call_with_correct_type(
+    make_pas_tool,
+    conv,  # noqa: ARG001
+    good,
+) -> None:
+    tool, stub = make_pas_tool(parties=[])
+    await _call(tool, cislo_pasu=good)
+    assert len(stub.party_calls) == 1
+    called_id, called_type = stub.party_calls[0]
+    assert called_id == good.strip().upper()
+    assert called_type == "passport"
+
+
+@pytest.mark.unit
+async def test_pas_single_match_returns_name_only(make_pas_tool, conv) -> None:  # noqa: ARG001
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_pas_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    result = await _call(tool, cislo_pasu="BR154151")
+    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
+
+
+@pytest.mark.unit
+async def test_pas_not_found_uses_pas_specific_message(make_pas_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_pas_tool(parties=[])
+    result = await _call(tool, cislo_pasu="BR154151")
+    assert result == {
+        "found": False,
+        "error": "not_found",
+        "message": "Zákazníka s týmto číslom cestovného pasu sa nepodarilo nájsť.",
+    }
+
+
+@pytest.mark.unit
+async def test_pas_upstream_error_uses_unified_message(make_pas_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_pas_tool(parties=DPSAuthError("bad token"))
+    result = await _call(tool, cislo_pasu="BR154151")
+    assert result["error"] == "auth_failed"
+    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+
+@pytest.mark.unit
+async def test_pas_caches_full_candidates(make_pas_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_pas_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    await _call(tool, cislo_pasu="BR154151")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cached_candidate] = cached["candidates"]
+    assert cached_candidate["party_id"] == "PARTY_4482259100"
+    assert cached_candidate["customer_id"] == "4482259100"
+
+
+# ---- identifikacia_ico ----
+
+
+def _full_org_party(party_id: str = "PARTY_2648241400", name: str = "Rmc S.R.O.") -> dict:
+    return {
+        "id": party_id,
+        "status": None,
+        "entityType": "Party",
+        "type": "organization",
+        "organization": {
+            "tradingName": name,
+            "organizationIdentifications": [
+                {
+                    "type": "subjectRegistrationId",
+                    "identificationId": "86316923",
+                    "name": "registrationNumber",
+                },
+            ],
+        },
+        "contacts": [],
+    }
+
+
+@pytest.fixture
+def make_ico_tool():
+    """Factory specifically for the identifikacia_ico tool."""
+
+    def _factory(
+        parties=None,
+        customers_by_party=None,
+        max_candidates: int = 10,
+    ):
+        stub = _StubClient(parties=parties, customers_by_party=customers_by_party)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return fake.registered["identifikacia_ico"], stub
+
+    return _factory
+
+
+@pytest.mark.unit
+async def test_ico_rejects_empty_input(make_ico_tool, conv) -> None:  # noqa: ARG001
+    tool, stub = make_ico_tool()
+    result = await _call(tool, ico="")
+    assert result["found"] is False
+    assert result["error"] == "invalid_input"
+    assert "IČO" in result["message"]
+    assert stub.party_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["1234567", "123456789", "ABCDEFGH", "1234567a"])
+async def test_ico_rejects_bad_format(make_ico_tool, conv, bad) -> None:  # noqa: ARG001
+    tool, stub = make_ico_tool()
+    result = await _call(tool, ico=bad)
+    assert result["error"] == "invalid_input"
+    assert stub.party_calls == []
+
+
+@pytest.mark.unit
+async def test_ico_valid_format_reaches_party_call_with_correct_type(
+    make_ico_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    tool, stub = make_ico_tool(parties=[])
+    await _call(tool, ico="86316923")
+    assert len(stub.party_calls) == 1
+    called_id, called_type = stub.party_calls[0]
+    assert called_id == "86316923"
+    assert called_type == "subjectRegistrationId"
+
+
+@pytest.mark.unit
+async def test_ico_single_match_returns_org_name(make_ico_tool, conv) -> None:  # noqa: ARG001
+    party = _full_org_party()
+    tool, _ = make_ico_tool(
+        parties=[party],
+        customers_by_party={"PARTY_2648241400": []},
+    )
+    result = await _call(tool, ico="86316923")
+    assert result == {"found": True, "name": "Rmc S.R.O."}
+
+
+@pytest.mark.unit
+async def test_ico_not_found_uses_ico_specific_message(make_ico_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_ico_tool(parties=[])
+    result = await _call(tool, ico="00000000")
+    assert result == {
+        "found": False,
+        "error": "not_found",
+        "message": "Spoločnosť s týmto IČO sa nepodarilo nájsť.",
+    }
+
+
+@pytest.mark.unit
+async def test_ico_caches_party_id_and_trading_name(make_ico_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    party = _full_org_party()
+    tool, _ = make_ico_tool(
+        parties=[party],
+        customers_by_party={"PARTY_2648241400": []},
+    )
+    await _call(tool, ico="86316923")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cached_candidate] = cached["candidates"]
+    assert cached_candidate["party_id"] == "PARTY_2648241400"
+    assert cached_candidate["name"] == "Rmc S.R.O."
+
+
+@pytest.mark.unit
+async def test_ico_org_candidate_has_null_given_and_family_name(
+    make_ico_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    party = _full_org_party()
+    tool, _ = make_ico_tool(
+        parties=[party],
+        customers_by_party={"PARTY_2648241400": []},
+    )
+    await _call(tool, ico="86316923")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cached_candidate] = cached["candidates"]
+    assert cached_candidate["given_name"] is None
+    assert cached_candidate["family_name"] is None

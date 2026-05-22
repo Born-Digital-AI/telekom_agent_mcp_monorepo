@@ -5,6 +5,12 @@ identifikacia_rodne_cislo(rodne_cislo)
 
 identifikacia_op(cislo_op)
 — Find Telekom customer(s) by Slovak national ID card number (občiansky preukaz).
+
+identifikacia_pas(cislo_pasu)
+— Find Telekom customer(s) by passport number.
+
+identifikacia_ico(ico)
+— Find Telekom customer(s) by Slovak company ID (IČO).
 """
 
 from __future__ import annotations
@@ -60,6 +66,32 @@ _OP_TOOL_DESCRIPTION = (
     "znova žiadať."
 )
 
+# Passport format: 2 letters + 6-8 digits (SK) or 1-2 letters + 6-8 digits (international).
+# Strip + uppercase before matching.
+_PAS_PATTERN = re.compile(r"^[A-Z]{1,2}\d{6,8}$")
+_PAS_INVALID_MESSAGE = (
+    "Číslo cestovného pasu nie je v správnom tvare. "
+    "Zadajte ho ako 1 alebo 2 písmená a 6 až 8 cifier (napr. BR154151)."
+)
+_PAS_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom cestovného pasu sa nepodarilo nájsť."
+_PAS_TOOL_DESCRIPTION = (
+    "Identifikuj zákazníka podľa čísla cestovného pasu. Po úspechu vráti meno "
+    "(alebo zoznam mien ak je záznamov viac). Interné identifikátory a kontakty "
+    "si tool uloží do pamäte konverzácie pre ďalšie nástroje — netreba ich od neho "
+    "znova žiadať."
+)
+
+# Slovak IČO: exactly 8 digits.
+_ICO_PATTERN = re.compile(r"^\d{8}$")
+_ICO_INVALID_MESSAGE = "IČO nie je v správnom tvare. Zadajte ho ako 8 cifier."
+_ICO_NOT_FOUND_MESSAGE = "Spoločnosť s týmto IČO sa nepodarilo nájsť."
+_ICO_TOOL_DESCRIPTION = (
+    "Identifikuj firemného zákazníka podľa IČO. Po úspechu vráti názov spoločnosti "
+    "(alebo zoznam názvov ak je záznamov viac). Interné identifikátory a kontakty "
+    "si tool uloží do pamäte konverzácie pre ďalšie nástroje — netreba ich od neho "
+    "znova žiadať."
+)
+
 _log = logging.getLogger(__name__)
 
 _IDENTITY_TTL_SECONDS = 30 * 60
@@ -98,9 +130,9 @@ def _normalize_contacts(party_contacts: list[dict[str, Any]]) -> list[dict[str, 
     return out
 
 
-def _normalize_identifications(individual: dict[str, Any]) -> list[dict[str, str]]:
+def _normalize_identifications(idents: list[dict[str, Any]]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
-    for ident in individual.get("individualIdentifications") or []:
+    for ident in idents or []:
         itype = ident.get("type")
         if itype == "socialSecurityNumber":
             continue  # Never echo RČ back to the caller.
@@ -133,9 +165,19 @@ def _candidate(
     customer: dict[str, Any] | None,
 ) -> dict[str, Any]:
     ind = party.get("individual") or {}
+    org = party.get("organization") or {}
+    party_type = party.get("type")
+
     given = ind.get("givenName") or ""
     family = ind.get("familyName") or ""
-    name = " ".join(part for part in (given, family) if part) or None
+
+    if party_type == "organization":
+        name = org.get("tradingName") or org.get("name") or party.get("name") or None
+        identifications_src = org.get("organizationIdentifications") or []
+    else:
+        name = " ".join(part for part in (given, family) if part) or None
+        identifications_src = ind.get("individualIdentifications") or []
+
     return {
         "party_id": party.get("id"),
         "customer_id": (customer or {}).get("id"),
@@ -148,7 +190,7 @@ def _candidate(
         "treatment_package": _treatment_package(customer) if customer else None,
         "valid_for": _valid_for(customer) if customer else None,
         "contacts": _normalize_contacts(party.get("contacts") or []),
-        "identifications": _normalize_identifications(ind),
+        "identifications": _normalize_identifications(identifications_src),
     }
 
 
@@ -218,14 +260,15 @@ def register(
             _log.warning("party lookup failed (%s): %s", identification_type, exc)
             return _json(_dps_error_payload(exc))
 
-        # Filter to Party records with status=initialized, dedup by id.
+        # Filter to Party records; accept initialized, validated, null/missing.
+        # Reject only terminal states: deceased, closed.
         seen: set[str] = set()
         parties: list[dict[str, Any]] = []
         for p in parties_raw:
             if p.get("entityType") != "Party":
                 continue
-            if p.get("status") != "initialized":
-                continue
+            if p.get("status") in ("deceased", "closed"):
+                continue  # accept initialized, validated, null/missing
             pid = p.get("id")
             if not isinstance(pid, str) or pid in seen:
                 continue
@@ -332,4 +375,48 @@ def register(
             not_found_message=_OP_NOT_FOUND_MESSAGE,
             conversation_id=conv,
             log_id_tag="op_last4",
+        )
+
+    @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=registry)
+    async def identifikacia_pas(
+        cislo_pasu: Annotated[
+            str,
+            Field(description="Číslo cestovného pasu — napr. BR154151."),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        value = (cislo_pasu or "").strip().upper()
+        if not _PAS_PATTERN.fullmatch(value):
+            return _json(
+                {"found": False, "error": "invalid_input", "message": _PAS_INVALID_MESSAGE}
+            )
+        conv = (_meta or {}).get("conversation_id", "")
+        return await _identify_and_respond(
+            identification_id=value,
+            identification_type="passport",
+            not_found_message=_PAS_NOT_FOUND_MESSAGE,
+            conversation_id=conv,
+            log_id_tag="pas_last4",
+        )
+
+    @mcp_tool(name="identifikacia_ico", description=_ICO_TOOL_DESCRIPTION, registry=registry)
+    async def identifikacia_ico(
+        ico: Annotated[
+            str,
+            Field(description="IČO spoločnosti — 8 cifier."),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        value = (ico or "").strip()
+        if not _ICO_PATTERN.fullmatch(value):
+            return _json(
+                {"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE}
+            )
+        conv = (_meta or {}).get("conversation_id", "")
+        return await _identify_and_respond(
+            identification_id=value,
+            identification_type="subjectRegistrationId",
+            not_found_message=_ICO_NOT_FOUND_MESSAGE,
+            conversation_id=conv,
+            log_id_tag="ico_last4",
         )

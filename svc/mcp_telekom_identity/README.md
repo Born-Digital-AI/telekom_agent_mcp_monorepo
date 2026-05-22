@@ -1,12 +1,48 @@
 # mcp_telekom_identity
 
 MCP server for identifying (and later authenticating) Slovak Telekom customers
-against the DPS API.
+against the DPS API (party-management + customer-management).
 
 ## Tools
 
-- `identifikacia_rodne_cislo(rodne_cislo)` — find customer(s) by Slovak personal
-  identification number. Chains party-management → customer-management.
+All identification tools share the same response shape:
+
+- **Single match** (1 unique party_id found): `{"found": true, "name": "..."}`
+- **Multi match** (more than 1 party): `{"found": true, "multiple_matches": true, "names": [...], "message": "..."}`
+- **Not found**: `{"found": false, "error": "not_found", "message": "..."}`
+- **Invalid input** (bad format): `{"found": false, "error": "invalid_input", "message": "..."}`
+- **System error** (auth/timeout/network/upstream): `{"found": false, "error": "<code>", "message": "Vyskytol sa technický problém. Prepojím vás na operátora."}`
+
+After any successful identification the full candidate set (with `party_id`, `customer_id`,
+`contacts`, `identifications`, account info, etc.) is cached in a 30-minute TTL store keyed
+by the MCP `X-Conversation-Id` header. Subsequent tools (e.g. account lookup) read this
+cache instead of re-querying DPS.
+
+### `identifikacia_rodne_cislo(rodne_cislo)` — Rodné číslo
+
+| Parameter | Format |
+|---|---|
+| `rodne_cislo` | 9 or 10 digits, no slash |
+
+### `identifikacia_op(cislo_op)` — Občiansky preukaz
+
+| Parameter | Format |
+|---|---|
+| `cislo_op` | New SK OP: `AB123456` (2 uppercase letters + 6 digits) or old format (6–9 digits) |
+
+### `identifikacia_pas(cislo_pasu)` — Cestovný pas
+
+| Parameter | Format |
+|---|---|
+| `cislo_pasu` | 1–2 uppercase letters + 6–8 digits (e.g. `BR154151`) |
+
+### `identifikacia_ico(ico)` — IČO firmy
+
+| Parameter | Format |
+|---|---|
+| `ico` | Exactly 8 digits |
+
+DPS stores IČO under `identificationType=subjectRegistrationId`.
 
 ## Environment variables
 
@@ -26,3 +62,47 @@ APP_MCP_PORT=8765 APP_HEALTHZ_PORT=8766 APP_COLLECT_METRICS=false \
 APP_DPS_BEARER_TOKEN="$DPS_TOKEN" APP_DPS_VERIFY_TLS=false \
   python -m svc.mcp_telekom_identity
 ```
+
+## Live test scenarios (verified against DPS test environment)
+
+These inputs map to known parties in the DPS staging environment. Use them via the
+`mcp-tester` GUI (http://localhost:8080) or directly through any MCP client. **VPN
+required.**
+
+### `identifikacia_rodne_cislo`
+
+| Input | Expected | Backing party |
+|---|---|---|
+| `7304292105` | `{found, name: "Stano Muziková"}` | PARTY_1002203200 (validated) |
+| `8407160630` | `{found, name: "Valent Dorcak"}` | PARTY_4103349400 (validated) |
+| `7210055589` | `{found, name: "Imre Mlynarcik"}` | PARTY_1138860700 (initialized) |
+| `6862147292` | `{found, name: "Libusa Sotakova"}` | PARTY_1200456600 (initialized) |
+| `8753189467` | `{found, multiple_matches: true, names: [...]}` | Test pollution: ~450 records |
+| `0000000000` | `{found: false, error: "not_found"}` | — |
+| `abc`, `12345` | `{found: false, error: "invalid_input"}` | — |
+
+### `identifikacia_op`
+
+| Input | Expected | Backing party |
+|---|---|---|
+| `RC932733` | `{found, name: "Stano Muziková"}` | PARTY_1002203200 |
+| `HY258342` | `{found, name: "Valent Dorcak"}` | PARTY_4103349400 |
+| `MM852148` | `{found, multiple_matches: true, names: [...]}` | Test pollution |
+| `XX000000` | `{found: false, error: "not_found"}` | — |
+| `123`, `ABCDEF12` | `{found: false, error: "invalid_input"}` | — |
+
+### `identifikacia_pas`
+
+| Input | Expected | Backing party |
+|---|---|---|
+| `BR154151` | `{found, name: "Imre Mlynarcik"}` | PARTY_1138860700 |
+| `XX000000` | `{found: false, error: "not_found"}` | — |
+| `123`, `ABCD12345` | `{found: false, error: "invalid_input"}` | — |
+
+### `identifikacia_ico`
+
+| Input | Expected | Backing party |
+|---|---|---|
+| `86316923` | `{found, name: "Rmc S.R.O."}` | PARTY_2648241400 (organization) |
+| `00000000` | `{found: false, error: "not_found"}` | — |
+| `1234567`, `abcdefgh` | `{found: false, error: "invalid_input"}` | — |
