@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
+from lib.mcp_service.state import TTLStore
 from svc.mcp_telekom_identity.dps_get_client import (
     DPSAuthError,
     DPSError,
@@ -30,12 +31,17 @@ if TYPE_CHECKING:
 
 _RC_PATTERN = re.compile(r"^\d{9,10}$")
 _TOOL_DESCRIPTION = (
-    "Identifikuj zákazníka v systéme DPS podľa rodného čísla.\n"
-    "Vstup: rodne_cislo — 9 alebo 10 cifier (bez lomky).\n"
-    "Výstup: JSON so zoznamom kandidátov (party_id, customer_id, meno, status, "
-    "segment, kontakty). Tool zreťazí volania DPS party-management a customer-management."
+    "Identifikuj zákazníka podľa rodného čísla. Po úspechu vráti meno "
+    "(alebo zoznam mien ak je záznamov viac). Interné identifikátory "
+    "a kontakty si tool uloží do pamäte konverzácie pre ďalšie nástroje "
+    "— netreba ich od neho znova žiadať."
 )
 _log = logging.getLogger(__name__)
+
+_IDENTITY_TTL_SECONDS = 30 * 60
+_IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_SECONDS)
+
+_UPSTREAM_ERROR_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
 
 
 def _json(obj: Any) -> str:
@@ -127,32 +133,30 @@ def _dps_error_payload(exc: DPSError) -> dict[str, Any]:
         return {
             "found": False,
             "error": "auth_failed",
-            "message": (
-                "Autentifikácia voči systému DPS zlyhala. Skontrolujte konfiguráciu tokenu."
-            ),
+            "message": _UPSTREAM_ERROR_MESSAGE,
         }
     if isinstance(exc, DPSTimeoutError):
         return {
             "found": False,
             "error": "upstream_timeout",
-            "message": "Systém DPS nestihol odpovedať v limite. Skúste znova.",
+            "message": _UPSTREAM_ERROR_MESSAGE,
         }
     if isinstance(exc, DPSNetworkError):
         return {
             "found": False,
             "error": "upstream_unreachable",
-            "message": ("Nedá sa pripojiť k systému DPS. Skontrolujte sieťové pripojenie."),
+            "message": _UPSTREAM_ERROR_MESSAGE,
         }
     if isinstance(exc, (DPSUpstreamError, DPSInvalidResponseError)):
         return {
             "found": False,
             "error": "upstream_error",
-            "message": ("Systém DPS momentálne nie je dostupný. Skúste o chvíľu znova."),
+            "message": _UPSTREAM_ERROR_MESSAGE,
         }
     return {
         "found": False,
         "error": "upstream_error",
-        "message": ("Systém DPS momentálne nie je dostupný. Skúste o chvíľu znova."),
+        "message": _UPSTREAM_ERROR_MESSAGE,
     }
 
 
@@ -172,7 +176,7 @@ def register(
     async def identifikacia_rodne_cislo(
         rodne_cislo: Annotated[
             str,
-            Field(description="Rodné číslo — 9 alebo 10 cifier, bez lomky."),
+            Field(description="Rodné číslo zákazníka — 9 alebo 10 cifier, bez lomky."),
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
@@ -182,7 +186,7 @@ def register(
                 {
                     "found": False,
                     "error": "invalid_input",
-                    "message": "Rodné číslo musí mať 9 alebo 10 cifier (bez lomky).",
+                    "message": "Rodné číslo nie je v správnom tvare. Zadajte ho ako 9 alebo 10 cifier bez lomky.",
                 }
             )
 
@@ -217,15 +221,11 @@ def register(
                 {
                     "found": False,
                     "error": "not_found",
-                    "message": (
-                        "Pre zadané rodné číslo nebol nájdený žiadny zákazník v systéme DPS."
-                    ),
+                    "message": "Zákazníka s týmto rodným číslom sa nepodarilo nájsť.",
                 }
             )
 
-        total = len(parties)
         capped = parties[:max_candidates]
-        truncated = total > max_candidates
 
         # Step B fanout, concurrently per Party.
         try:
@@ -243,12 +243,34 @@ def register(
             else:
                 candidates.append(_candidate(party, None))
 
+        # Count unique party_ids to determine single vs. multi-match.
+        unique_party_ids = {c["party_id"] for c in candidates}
+
+        # Cache full candidates for downstream tools.
+        conversation_id = (_meta or {}).get("conversation_id", "")
+        if conversation_id:
+            _IDENTITY_STATE.set(
+                conversation_id,
+                {
+                    "rc_last4": rc[-4:],
+                    "candidates": candidates,  # full list with party_id, customer_id, contacts, etc.
+                },
+            )
+        else:
+            _log.warning("identifikacia_rodne_cislo: no conversation_id in _meta — cache skipped")
+
+        if len(unique_party_ids) == 1:
+            # Single match — return just the name.
+            name = candidates[0]["name"]
+            return _json({"found": True, "name": name})
+
+        # Multiple matches — return deduplicated sorted names.
+        names = sorted({c["name"] for c in candidates if c["name"]})
         return _json(
             {
                 "found": True,
-                "total_party_matches": total,
-                "returned_count": len(candidates),
-                "truncated": truncated,
-                "candidates": candidates,
+                "multiple_matches": True,
+                "names": names,
+                "message": "Pre toto rodné číslo som našla viacero záznamov. Bude potrebné si vyžiadať dodatočné údaje.",
             }
         )

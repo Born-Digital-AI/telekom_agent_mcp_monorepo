@@ -18,6 +18,8 @@ from svc.mcp_telekom_identity.dps_get_client import (
     DPSUpstreamError,
 )
 
+_UPSTREAM_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
+
 
 class _FakeMCP:
     def __init__(self) -> None:
@@ -79,6 +81,15 @@ def make_tool():
     return _factory
 
 
+@pytest.fixture(autouse=True)
+def _reset_identity_state():
+    from svc.mcp_telekom_identity import tools as identity_tools
+
+    identity_tools._IDENTITY_STATE = type(identity_tools._IDENTITY_STATE)(
+        ttl_seconds=identity_tools._IDENTITY_TTL_SECONDS,
+    )
+
+
 @pytest.fixture
 def conv():
     token_c = current_conversation_id.set("conv-test")
@@ -101,7 +112,7 @@ async def test_rejects_empty_input(make_tool, conv) -> None:  # noqa: ARG001
     assert result == {
         "found": False,
         "error": "invalid_input",
-        "message": "Rodné číslo musí mať 9 alebo 10 cifier (bez lomky).",
+        "message": "Rodné číslo nie je v správnom tvare. Zadajte ho ako 9 alebo 10 cifier bez lomky.",
     }
     assert stub.party_calls == []
 
@@ -124,15 +135,20 @@ async def test_valid_format_reaches_party_call(make_tool, conv, good) -> None:  
     assert stub.party_calls == [(good, "socialSecurityNumber")]
 
 
-def _party(party_id: str, status: str = "initialized", entity_type: str = "Party") -> dict:
+def _party(
+    party_id: str,
+    status: str = "initialized",
+    entity_type: str = "Party",
+    name: tuple[str, str] = ("Tester", "AT NECHYTAT"),
+) -> dict:
     return {
         "id": party_id,
         "status": status,
         "entityType": entity_type,
         "type": "individual",
         "individual": {
-            "givenName": "Tester",
-            "familyName": "AT NECHYTAT",
+            "givenName": name[0],
+            "familyName": name[1],
             "individualIdentifications": [],
         },
         "contacts": [],
@@ -146,26 +162,25 @@ async def test_not_found_when_no_party_matches(make_tool, conv) -> None:  # noqa
     assert result == {
         "found": False,
         "error": "not_found",
-        "message": "Pre zadané rodné číslo nebol nájdený žiadny zákazník v systéme DPS.",
+        "message": "Zákazníka s týmto rodným číslom sa nepodarilo nájsť.",
     }
 
 
 @pytest.mark.unit
 async def test_filters_contactparty_and_non_initialized(make_tool, conv) -> None:  # noqa: ARG001
     parties = [
-        _party("PARTY_1"),
+        _party("PARTY_1", name=("Jana", "Nováková")),
         _party("PARTY_2", entity_type="ContactParty"),
         _party("PARTY_3", status="terminated"),
-        _party("PARTY_4"),
+        _party("PARTY_4", name=("Peter", "Sloboda")),
     ]
     tool, _stub = make_tool(parties=parties)
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is True
-    assert {c["party_id"] for c in result["candidates"]} == {"PARTY_1", "PARTY_4"}
-    assert result["total_party_matches"] == 2
-    assert result["truncated"] is False
-    # No customer lookups stubbed → customer_id remains null
-    assert all(c["customer_id"] is None for c in result["candidates"])
+    # 2 unique party_ids → multiple_matches
+    assert result["multiple_matches"] is True
+    assert "Jana Nováková" in result["names"]
+    assert "Peter Sloboda" in result["names"]
 
 
 @pytest.mark.unit
@@ -174,10 +189,13 @@ async def test_caps_candidates_at_max_and_marks_truncated(make_tool, conv) -> No
     tool, stub = make_tool(parties=parties, max_candidates=10)
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is True
-    assert result["total_party_matches"] == 25
-    assert result["returned_count"] == 10
-    assert result["truncated"] is True
+    assert result["multiple_matches"] is True
+    assert len(result["names"]) >= 1
     assert len(stub.customer_calls) == 10
+    # Cache holds the 10 capped candidates.
+    cached = identity_tools._IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    assert len(cached["candidates"]) == 10
 
 
 @pytest.mark.unit
@@ -185,8 +203,9 @@ async def test_dedup_by_party_id(make_tool, conv) -> None:  # noqa: ARG001
     parties = [_party("PARTY_1"), _party("PARTY_1"), _party("PARTY_2")]
     tool, _ = make_tool(parties=parties)
     result = await _call(tool, rodne_cislo="8753189467")
-    assert {c["party_id"] for c in result["candidates"]} == {"PARTY_1", "PARTY_2"}
-    assert result["total_party_matches"] == 2
+    # 2 unique party_ids → multiple_matches
+    assert result["found"] is True
+    assert result["multiple_matches"] is True
 
 
 def _full_party(party_id: str = "PARTY_4482259100") -> dict:
@@ -259,27 +278,7 @@ async def test_single_match_merges_party_and_customer(make_tool, conv) -> None: 
         customers_by_party={"PARTY_4482259100": [customer]},
     )
     result = await _call(tool, rodne_cislo="8753189467")
-    assert result["found"] is True
-    assert result["total_party_matches"] == 1
-    assert result["returned_count"] == 1
-    assert result["truncated"] is False
-    [c] = result["candidates"]
-    assert c["party_id"] == "PARTY_4482259100"
-    assert c["customer_id"] == "4482259100"
-    assert c["name"] == "Tester AT NECHYTAT"
-    assert c["given_name"] == "Tester"
-    assert c["family_name"] == "AT NECHYTAT"
-    assert c["status"] == "preactive"
-    assert c["market_segment"] == "Basic"
-    assert c["customer_segment"] == "B2C"
-    assert c["treatment_package"] == "Premium Basic"
-    assert c["valid_for"] == {"start": "2026-02-01T00:00:00Z", "end": None}
-    assert {"type": "mobile", "value": "0902555002"} in c["contacts"]
-    assert {"type": "email", "value": "test@telekom.sk"} in c["contacts"]
-    assert {"type": "address", "value": "Hubeného 9, 83153 Rača"} in c["contacts"]
-    # socialSecurityNumber must NOT appear in identifications
-    assert all(i["type"] != "socialSecurityNumber" for i in c["identifications"])
-    assert {"type": "nationalIdentityCard", "id": "MM852148"} in c["identifications"]
+    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
 
 
 @pytest.mark.unit
@@ -292,12 +291,8 @@ async def test_party_with_no_customer_yields_candidate_with_null_customer_id(
         customers_by_party={"PARTY_4482259100": []},
     )
     result = await _call(tool, rodne_cislo="8753189467")
-    [c] = result["candidates"]
-    assert c["customer_id"] is None
-    assert c["status"] is None
-    assert c["name"] == "Tester AT NECHYTAT"
-    # Party contacts are still surfaced
-    assert any(x["type"] == "mobile" for x in c["contacts"])
+    # Single party_id → single match shape with name from Party
+    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
 
 
 @pytest.mark.unit
@@ -316,9 +311,13 @@ async def test_party_with_two_customers_yields_two_candidates_sharing_party_id(
         },
     )
     result = await _call(tool, rodne_cislo="8753189467")
-    assert result["returned_count"] == 2
-    assert {c["customer_id"] for c in result["candidates"]} == {"A1", "A2"}
-    assert {c["party_id"] for c in result["candidates"]} == {"PARTY_4482259100"}
+    # 1 unique party_id → single match externally
+    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
+    # But cache holds both internal candidates
+    cached = identity_tools._IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    assert len(cached["candidates"]) == 2
+    assert {c["customer_id"] for c in cached["candidates"]} == {"A1", "A2"}
 
 
 @pytest.mark.unit
@@ -343,8 +342,12 @@ async def test_address_formatting_handles_missing_pieces(make_tool, conv) -> Non
         customers_by_party={"PARTY_4482259100": [_customer()]},
     )
     result = await _call(tool, rodne_cislo="8753189467")
-    [c] = result["candidates"]
-    assert {"type": "address", "value": "Mierová, 04001 Košice"} in c["contacts"]
+    # Response is minimal — verify address is in the cache
+    assert result["found"] is True
+    cached = identity_tools._IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cached_candidate] = cached["candidates"]
+    assert {"type": "address", "value": "Mierová, 04001 Košice"} in cached_candidate["contacts"]
 
 
 @pytest.mark.unit
@@ -354,7 +357,7 @@ async def test_auth_error_maps_to_auth_failed_json(make_tool, conv) -> None:  # 
     assert result == {
         "found": False,
         "error": "auth_failed",
-        "message": ("Autentifikácia voči systému DPS zlyhala. Skontrolujte konfiguráciu tokenu."),
+        "message": _UPSTREAM_MESSAGE,
     }
 
 
@@ -364,7 +367,7 @@ async def test_upstream_error_maps_to_upstream_error_json(make_tool, conv) -> No
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is False
     assert result["error"] == "upstream_error"
-    assert "DPS" in result["message"]
+    assert result["message"] == _UPSTREAM_MESSAGE
 
 
 @pytest.mark.unit
@@ -373,6 +376,7 @@ async def test_timeout_error_maps_to_upstream_timeout_json(make_tool, conv) -> N
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is False
     assert result["error"] == "upstream_timeout"
+    assert result["message"] == _UPSTREAM_MESSAGE
 
 
 @pytest.mark.unit
@@ -381,6 +385,7 @@ async def test_network_error_maps_to_upstream_unreachable_json(make_tool, conv) 
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is False
     assert result["error"] == "upstream_unreachable"
+    assert result["message"] == _UPSTREAM_MESSAGE
 
 
 @pytest.mark.unit
@@ -389,6 +394,7 @@ async def test_invalid_response_maps_to_upstream_error_json(make_tool, conv) -> 
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["found"] is False
     assert result["error"] == "upstream_error"
+    assert result["message"] == _UPSTREAM_MESSAGE
 
 
 @pytest.mark.unit
@@ -399,3 +405,26 @@ async def test_customer_call_auth_error_also_maps_cleanly(make_tool, conv) -> No
     )
     result = await _call(tool, rodne_cislo="8753189467")
     assert result["error"] == "auth_failed"
+    assert result["message"] == _UPSTREAM_MESSAGE
+
+
+@pytest.mark.unit
+async def test_successful_identification_caches_full_candidates(make_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    result = await _call(tool, rodne_cislo="8753189467")
+    assert result["found"] is True
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    assert cached["rc_last4"] == "9467"
+    [cached_candidate] = cached["candidates"]
+    assert cached_candidate["party_id"] == "PARTY_4482259100"
+    assert cached_candidate["customer_id"] == "4482259100"
+    # Contacts still cached for downstream tools
+    assert any(c["type"] == "mobile" for c in cached_candidate["contacts"])
