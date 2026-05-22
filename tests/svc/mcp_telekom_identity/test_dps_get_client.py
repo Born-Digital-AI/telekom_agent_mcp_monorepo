@@ -299,3 +299,43 @@ async def test_get_billing_account_by_id_returns_none_on_404() -> None:
             ).mock(return_value=httpx.Response(404, json={"error": "not found"}))
             result = await client.get_billing_account_by_id("9999999999")
     assert result is None
+
+
+@pytest.mark.unit
+async def test_get_products_by_public_identifier_calls_correct_path_and_query() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get(
+                "/omni/test1/product-inventory/4.64/products",
+            ).mock(
+                return_value=httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": "P1",
+                            "publicIdentifier": "421902804660",
+                            "customer": {"id": "1002203200"},
+                        }
+                    ],
+                ),
+            )
+            result = await client.get_products_by_public_identifier("421902804660")
+    assert len(result) == 1
+    assert result[0]["customer"]["id"] == "1002203200"
+    request = route.calls.last.request
+    assert request.url.params["query"] == "publicIdentifier==421902804660"
+    assert request.url.params["fields"] == "*"
+    assert request.url.params["size"] == "20"
+
+
+@pytest.mark.unit
+async def test_get_products_by_public_identifier_returns_empty_list_when_no_match() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/product-inventory/4.64/products",
+            ).mock(return_value=httpx.Response(200, json=[]))
+            result = await client.get_products_by_public_identifier("421000000000")
+    assert result == []

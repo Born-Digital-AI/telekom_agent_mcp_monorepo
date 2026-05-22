@@ -40,6 +40,8 @@ class _StubClient:
     billing_account_by_id_calls: list[str]
     customer_by_id_map: dict[str, dict | None] | Exception
     billing_account_by_id_map: dict[str, dict | None] | Exception
+    products_by_public_identifier_calls: list[str]
+    products_by_public_identifier_map: dict[str, list[dict] | Exception] | Exception
 
     def __init__(
         self,
@@ -47,6 +49,9 @@ class _StubClient:
         customers_by_party: dict[str, list[dict]] | Exception | None = None,
         customer_by_id_map: dict[str, dict | None] | Exception | None = None,
         billing_account_by_id_map: dict[str, dict | None] | Exception | None = None,
+        products_by_public_identifier_map: dict[str, list[dict] | Exception]
+        | Exception
+        | None = None,
     ) -> None:
         self.parties = parties if parties is not None else []
         self.customers_by_party = customers_by_party if customers_by_party is not None else {}
@@ -54,9 +59,15 @@ class _StubClient:
         self.customer_calls: list[str] = []
         self.customer_by_id_calls = []
         self.billing_account_by_id_calls = []
+        self.products_by_public_identifier_calls = []
         self.customer_by_id_map = customer_by_id_map if customer_by_id_map is not None else {}
         self.billing_account_by_id_map = (
             billing_account_by_id_map if billing_account_by_id_map is not None else {}
+        )
+        self.products_by_public_identifier_map = (
+            products_by_public_identifier_map
+            if products_by_public_identifier_map is not None
+            else {}
         )
 
     async def get_parties_by_identification(
@@ -86,6 +97,12 @@ class _StubClient:
         if isinstance(self.billing_account_by_id_map, Exception):
             raise self.billing_account_by_id_map
         return self.billing_account_by_id_map.get(account_id)
+
+    async def get_products_by_public_identifier(self, public_identifier: str) -> list[dict]:
+        self.products_by_public_identifier_calls.append(public_identifier)
+        if isinstance(self.products_by_public_identifier_map, Exception):
+            raise self.products_by_public_identifier_map
+        return self.products_by_public_identifier_map.get(public_identifier, [])
 
 
 @pytest.fixture
@@ -1000,5 +1017,147 @@ async def test_kod_upstream_error_uses_unified_message(make_kod_tool, conv) -> N
 
     tool, _ = make_kod_tool(customer_by_id_map=DPSAuthError("bad token"))
     result = await _call(tool, kod_zakaznika="1002203200")
+    assert result["error"] == "auth_failed"
+    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+
+# ---- identifikacia_telefon ----
+
+
+@pytest.fixture
+def make_tel_tool():
+    def _factory(**kwargs):
+        stub = _StubClient(
+            products_by_public_identifier_map=kwargs.pop("products_by_public_identifier_map", None),
+            customer_by_id_map=kwargs.pop("customer_by_id_map", None),
+        )
+        max_candidates = kwargs.pop("max_candidates", 10)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return fake.registered["identifikacia_telefon"], stub
+
+    return _factory
+
+
+@pytest.mark.unit
+async def test_tel_rejects_empty(make_tel_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tel_tool()
+    result = await _call(tool, telefon="")
+    assert result["error"] == "invalid_input"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bad",
+    ["abc", "123", "+421abc", "421-abc-def", " "],
+)
+async def test_tel_rejects_bad_format(make_tel_tool, conv, bad) -> None:  # noqa: ARG001
+    tool, stub = make_tel_tool()
+    result = await _call(tool, telefon=bad)
+    assert result["error"] == "invalid_input"
+    assert stub.products_by_public_identifier_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw", "expected_intl"),
+    [
+        ("0902804660", "421902804660"),
+        ("+421902804660", "421902804660"),
+        ("421902804660", "421902804660"),
+        ("00421902804660", "421902804660"),
+        (" 0902 804 660 ", "421902804660"),
+        ("0902-804-660", "421902804660"),
+        ("(0902) 804 660", "421902804660"),
+    ],
+)
+async def test_tel_normalizes_and_queries_intl_format(
+    make_tel_tool,
+    conv,  # noqa: ARG001
+    raw,
+    expected_intl,
+) -> None:
+    tool, stub = make_tel_tool(products_by_public_identifier_map={expected_intl: []})
+    await _call(tool, telefon=raw)
+    assert stub.products_by_public_identifier_calls == [expected_intl]
+
+
+@pytest.mark.unit
+async def test_tel_single_match(make_tel_tool, conv) -> None:  # noqa: ARG001
+    product = {
+        "id": "1-A6FN4UEC",
+        "publicIdentifier": "421902804660",
+        "customer": {"id": "1002203200"},
+        "status": "Active",
+    }
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_tel_tool(
+        products_by_public_identifier_map={"421902804660": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    result = await _call(tool, telefon="0902804660")
+    assert result == {"found": True, "name": "Stano Muziková"}
+
+
+@pytest.mark.unit
+async def test_tel_no_products_returns_not_found(make_tel_tool, conv) -> None:  # noqa: ARG001
+    tool, _ = make_tel_tool(products_by_public_identifier_map={"421000000000": []})
+    result = await _call(tool, telefon="0000000000")
+    assert result["error"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_tel_product_without_customer_returns_not_found(make_tel_tool, conv) -> None:  # noqa: ARG001
+    product_no_cust = {"id": "P1", "publicIdentifier": "421902804660", "status": "Active"}
+    tool, _ = make_tel_tool(
+        products_by_public_identifier_map={"421902804660": [product_no_cust]},
+    )
+    result = await _call(tool, telefon="0902804660")
+    assert result["error"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_tel_multiple_customers_returns_multi_match(make_tel_tool, conv) -> None:  # noqa: ARG001
+    products = [
+        {"id": "P1", "publicIdentifier": "421902804660", "customer": {"id": "1002203200"}},
+        {"id": "P2", "publicIdentifier": "421902804660", "customer": {"id": "4103349400"}},
+    ]
+    cust1 = _b2c_customer("1002203200", "Muziková,Stano")
+    cust2 = _b2c_customer("4103349400", "Dorcak,Valent")
+    tool, _ = make_tel_tool(
+        products_by_public_identifier_map={"421902804660": products},
+        customer_by_id_map={"1002203200": cust1, "4103349400": cust2},
+    )
+    result = await _call(tool, telefon="0902804660")
+    assert result["found"] is True
+    assert result["multiple_matches"] is True
+    assert set(result["names"]) == {"Stano Muziková", "Valent Dorcak"}
+
+
+@pytest.mark.unit
+async def test_tel_caches_candidate(make_tel_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    product = {"id": "P1", "publicIdentifier": "421902804660", "customer": {"id": "1002203200"}}
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_tel_tool(
+        products_by_public_identifier_map={"421902804660": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    await _call(tool, telefon="0902804660")
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cand] = cached["candidates"]
+    assert cand["customer_id"] == "1002203200"
+    assert cand["name"] == "Stano Muziková"
+
+
+@pytest.mark.unit
+async def test_tel_upstream_error_uses_unified_message(make_tel_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.dps_get_client import DPSAuthError
+
+    tool, _ = make_tel_tool(products_by_public_identifier_map=DPSAuthError("bad token"))
+    result = await _call(tool, telefon="0902804660")
     assert result["error"] == "auth_failed"
     assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."

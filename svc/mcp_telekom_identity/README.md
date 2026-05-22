@@ -63,6 +63,17 @@ The tool detects this pattern and presents it as `"FirstName Surname"`. B2B name
 (which may legitimately contain a comma followed by a space, e.g. `"Creditinfo Slovakia, S.R.O."`)
 are returned verbatim.
 
+### `identifikacia_telefon(telefon)` — Telefónne číslo (MSISDN)
+
+| Parameter | Format                                                              |
+| --------- | ------------------------------------------------------------------- |
+| `telefon` | SK local (`0904...`) or international (`+421904...` / `421904...`) |
+
+The tool normalizes the input to international format `421XXXXXXXXX` (12 digits, no `+`),
+then queries Product Inventory `GET /products?query=publicIdentifier==<msisdn>`. The
+matched product carries `customer.id` which is resolved via the same path used by
+`identifikacia_kod_zakaznika`.
+
 ## Environment variables
 
 | Var | Default | Notes |
@@ -186,3 +197,14 @@ These inputs map to known parties in the DPS staging environment. Use them via t
 | `4432948400` | Customer ID (404)          | `{found: false, error: "not_found"}`                |
 | `9999999999` | Billing Account (404)      | `{found: false, error: "not_found"}`                |
 | `abc`, `12345` | —                        | `{found: false, error: "invalid_input"}`            |
+
+### `identifikacia_telefon`
+
+| Input              | Normalized       | Expected                                                |
+| ------------------ | ---------------- | ------------------------------------------------------- |
+| `0902804660`       | `421902804660`   | `{found, name: "Stano Muziková"}` (PARTY_1002203200)    |
+| `+421902804660`    | `421902804660`   | same as above                                           |
+| `421902804660`     | `421902804660`   | same as above                                           |
+| `0902 804 660`     | `421902804660`   | same as above (whitespace stripped)                     |
+| `0000000000`       | `421000000000`   | `{found: false, error: "not_found"}`                    |
+| `abc`, `+abc`, ` ` | —                | `{found: false, error: "invalid_input"}`                |

@@ -54,6 +54,31 @@ _RC_TOOL_DESCRIPTION = (
 # Czechoslovak numeric IDs are expired and not in active DPS records.
 # Strip whitespace/dashes + uppercase before matching so "EA 123 456" and "ea-123456" normalize.
 _OP_NORMALIZE_RE = re.compile(r"[\s\-]")
+
+# MSISDN normalization:
+# - strip whitespace, dashes, parentheses, dots, leading "+"
+# - "0904..." (SK local, 10 digits)  → "421904..."   (replace leading 0 with 421)
+# - "00421904..."                    → "421904..."   (strip 00)
+# - "+421904..." or "421904..."      → "421904..."   (already intl or with +)
+_MSISDN_STRIP_RE = re.compile(r"[\s\-().+]")
+
+
+def _normalize_msisdn(raw: str) -> str | None:
+    """Return canonical MSISDN form ``421XXXXXXXXX`` (12 digits, no +) or None if not valid SK MSISDN."""
+    cleaned = _MSISDN_STRIP_RE.sub("", raw or "")
+    if not cleaned.isdigit():
+        return None
+    if cleaned.startswith("00421"):
+        cleaned = cleaned[2:]  # 00421... → 421...
+    elif cleaned.startswith("0") and len(cleaned) == 10:
+        cleaned = "421" + cleaned[1:]  # 0904... → 421904...
+    # Now must match SK intl format: 421 + 9 digits (mobile starts with 9, but accept
+    # other prefixes for fixed-line MSISDN too)
+    if re.fullmatch(r"421\d{9}", cleaned):
+        return cleaned
+    return None
+
+
 _OP_PATTERN = re.compile(r"^[A-Z]{2}\d{6}$")
 _OP_INVALID_MESSAGE = "Číslo občianskeho preukazu má tvar 2 písmená a 6 cifier (napr. AB123456)."
 _OP_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť."
@@ -101,6 +126,18 @@ _KOD_NOT_FOUND_MESSAGE = "Zákazníka s týmto kódom sa nepodarilo nájsť."
 _KOD_TOOL_DESCRIPTION = (
     "Identifikuj zákazníka podľa číselného kódu — môže byť kód zákazníka "
     "(končí cifrou 0) alebo kód fakturačného účtu (končí inou cifrou). "
+    "Po úspechu vráti meno zákazníka. Interné identifikátory si tool uloží "
+    "do pamäte konverzácie pre ďalšie nástroje."
+)
+
+_TEL_INVALID_MESSAGE = (
+    "Telefónne číslo nie je v správnom tvare. Zadajte ho ako 0904... (10 cifier) "
+    "alebo +421904... (medzinárodný tvar)."
+)
+_TEL_NOT_FOUND_MESSAGE = "Zákazníka s týmto telefónnym číslom sa nepodarilo nájsť."
+_TEL_TOOL_DESCRIPTION = (
+    "Identifikuj zákazníka podľa telefónneho čísla (mobilné aj pevné). "
+    "Akceptuje slovenský tvar (0904...), medzinárodný tvar (+421904... alebo 421904...). "
     "Po úspechu vráti meno zákazníka. Interné identifikátory si tool uloží "
     "do pamäte konverzácie pre ďalšie nástroje."
 )
@@ -536,3 +573,84 @@ def register(
             _log.warning("identifikacia_kod_zakaznika: no conversation_id — cache skipped")
 
         return _json({"found": True, "name": candidate["name"]})
+
+    @mcp_tool(name="identifikacia_telefon", description=_TEL_TOOL_DESCRIPTION, registry=registry)
+    async def identifikacia_telefon(
+        telefon: Annotated[
+            str,
+            Field(description="Telefónne číslo — 0904... alebo +421904... / 421904..."),
+        ],
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        normalized = _normalize_msisdn(telefon or "")
+        if not normalized:
+            return _json(
+                {"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE}
+            )
+
+        conv = (_meta or {}).get("conversation_id", "")
+        _log.info("identifikacia_telefon called msisdn_last4=%s conv=%s", normalized[-4:], conv)
+
+        try:
+            products = await client.get_products_by_public_identifier(normalized)
+        except DPSError as exc:
+            _log.warning("identifikacia_telefon product lookup failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        if not products:
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+        # Extract unique customer ids from returned products
+        customer_ids: list[str] = []
+        seen: set[str] = set()
+        for p in products:
+            cid = (p.get("customer") or {}).get("id")
+            if isinstance(cid, str) and cid not in seen:
+                seen.add(cid)
+                customer_ids.append(cid)
+
+        if not customer_ids:
+            _log.warning("identifikacia_telefon: products returned but no customer.id linkage")
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+        # Fetch each unique customer
+        try:
+            customers_raw = await asyncio.gather(
+                *(client.get_customer_by_id(cid) for cid in customer_ids)
+            )
+        except DPSError as exc:
+            _log.warning("identifikacia_telefon customer fanout failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        customers = [c for c in customers_raw if c is not None]
+        if not customers:
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+        candidates = [_candidate_from_customer(c) for c in customers]
+        candidates = [c for c in candidates if c.get("name")]
+        if not candidates:
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+        if conv:
+            _IDENTITY_STATE.set(
+                conv,
+                {"rc_last4": normalized[-4:], "candidates": candidates},
+            )
+        else:
+            _log.warning("identifikacia_telefon: no conversation_id — cache skipped")
+
+        if len(candidates) == 1:
+            return _json({"found": True, "name": candidates[0]["name"]})
+
+        names = sorted({c["name"] for c in candidates if c["name"]})
+        return _json(
+            {
+                "found": True,
+                "multiple_matches": True,
+                "names": names,
+                "message": (
+                    "Pre toto telefónne číslo som našla viacero záznamov. "
+                    "Bude potrebné si vyžiadať dodatočné údaje."
+                ),
+            }
+        )
