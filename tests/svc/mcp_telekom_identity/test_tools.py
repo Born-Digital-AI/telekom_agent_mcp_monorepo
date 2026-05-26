@@ -1710,6 +1710,36 @@ async def test_auth_trusted_source_via_party_contacts(make_auth_tool, conv) -> N
 
 
 @pytest.mark.unit
+async def test_auth_trusted_source_via_telefon_identification_msisdn(
+    make_auth_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    # When the customer was identified via `identifikacia_telefon`, the queried MSISDN
+    # is injected into candidate.contacts (no Party fetch needed). Setting input_source
+    # to the same number must auto-credit factor 1, even though the Customer-only flow
+    # didn't fetch the Party.
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    product = {
+        "id": "P1",
+        "publicIdentifier": "421902804660",
+        "customer": {"id": "1002203200"},
+    }
+    tools, _ = make_auth_tool(
+        products_by_public_identifier_map={"421902804660": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    await _call(tools["identifikacia_telefon"], telefon="0902804660")
+    # input_source as SK local form — `_check_trusted_source` normalizes both sides
+    await _call(tools["nastav_test_kontext"], input_source="0902804660")
+    # factor 1 credited (from injected contact) → only 1 more factor needed for standard
+    result = await _call(tools["autentifikacia"])
+    assert not result["authenticated"]
+    assert "trusted_source" in result["factors_satisfied"]
+    assert result["factors_remaining"] == 1
+    assert result["next_factor"] == "name"
+
+
+@pytest.mark.unit
 async def test_auth_name_lenient_match(make_auth_tool, conv) -> None:  # noqa: ARG001
     tools, _ = make_auth_tool(
         parties=[_full_party()],

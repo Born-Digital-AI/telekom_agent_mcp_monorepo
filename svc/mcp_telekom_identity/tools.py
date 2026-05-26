@@ -971,6 +971,20 @@ def register(
         if not candidates:
             return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
 
+        # The queried MSISDN matched the customer's Product.publicIdentifier — that is a
+        # verified mobile contact for this customer. Inject it into candidate.contacts so
+        # the auth tool's `trusted_source` factor can match against it without an extra
+        # Party fetch.
+        for cand in candidates:
+            existing = list(cand.get("contacts") or [])
+            if not any(
+                ct.get("type") == "mobile"
+                and _normalize_msisdn(ct.get("value") or "") == normalized
+                for ct in existing
+            ):
+                existing.append({"type": "mobile", "value": normalized})
+                cand["contacts"] = existing
+
         _persist_identification(
             conversation_id=conv,
             method="telefon",
