@@ -148,6 +148,30 @@ nastav_test_kontext(
 )
 ```
 
+## Known test customers (DPS test env)
+
+Pick a row, then paste any of the values into the matching tool input in mcp-tester.
+Empty cell = that customer has no value of that kind in DPS.
+
+| Customer | `rodne_cislo` | `cislo_op` | `cislo_pasu` | `ico` | `kod_zakaznika` (customer id) | `kod_zakaznika` / `kod_adresata` (billing acc) | `telefon` | `seriove_cislo` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Stano Muziková | `7304292105` | `RC932733` | — | — | `1002203200` | `1002203204`, `1002203202` | `0902804660`, `0996650543` | `M91450EB0603`, `K5D0M374LXO`, `J252BS000119` |
+| Valent Dorcak | `8407160630` | `HY258342` | — | — | `4103349400` | `4103349402`, `4103349401` | — | — |
+| Imre Mlynarcik | `7210055589` | — | `BR154151` | — | `1138860700` | `1138860703` | — | — |
+| Libusa Sotakova | `6862147292` | — | — | — | `1200456600` | `1200456601` | — | — |
+| Tester AT NECHYTAT _(multi)_ | `8753189467` | `MM852148` | — | — | `4482259100` | — | `0902555002` | — |
+| Rmc S.R.O. _(organization)_ | — | — | — | `86316923` | — | — | — | — |
+| A.B.Zrtv _(B2B)_ | — | — | — | — | `4059299000` | `4059299001` | — | — |
+| Creditinfo Slovakia, S.R.O. _(B2B)_ | — | — | — | — | `2300000400` | `2300000404`, `2300000401`, `2300000405`, `2300000406` | — | — |
+| J A L & Š, S. R. O. _(B2B)_ | — | — | — | — | `4108064300` | `4108064301`, `4108064302` | — | — |
+
+Notes:
+
+- `kod_zakaznika` ending in **`0`** is the Customer ID; ending in **`1–9`** is a Billing Account ID (also the value to use as `kod_adresata` in `autentifikacia`).
+- "Tester AT NECHYTAT" RČ and OP return **multi-match** because the DPS test environment contains ~450 duplicate records under that identifier.
+- All `telefon` values can be entered in SK local form (`0902…`), with `+` (`+421…`), or without (`421…`); the tool normalizes.
+- All `seriove_cislo` values are case-insensitive and ignore spaces / dashes / dots / slashes.
+
 ## Tools
 
 All identification tools share the same response shape:
