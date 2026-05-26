@@ -215,6 +215,22 @@ class DPSGetClient:
             raise DPSInvalidResponseError(msg)
         return result
 
+    async def get_party_by_id(self, party_id: str) -> dict[str, Any] | None:
+        """GET /party-management/3.54.0/v2/parties/{id} — single Party or None on 404."""
+        try:
+            result = await self._get(
+                f"/party-management/3.54.0/v2/parties/{party_id}",
+                {"fields": "*"},
+            )
+        except DPSUpstreamError as exc:
+            if exc.status_code == _HTTP_NOT_FOUND:
+                return None
+            raise
+        if not isinstance(result, dict):
+            msg = "party-management single fetch expected JSON object"
+            raise DPSInvalidResponseError(msg)
+        return result
+
     async def _get(self, path: str, params: dict[str, str]) -> Any:  # noqa: ANN401
         client = self._ensure_client()
         url = self._base_url + path

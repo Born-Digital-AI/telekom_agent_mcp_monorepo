@@ -136,13 +136,19 @@ _NLP_TIMEOUT_SECONDS = 1.0
 
 
 def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
-    """Fire-and-forget PUT to the NLP engine's conversation-state endpoint.
+    """Mirror locally + fire-and-forget PUT to the NLP engine state endpoint.
 
-    Daemon thread + 1-second timeout. Errors logged at WARNING, never raised
-    — a slow or down NLP engine must not impact the tool's response latency.
+    Daemon thread + 1-second timeout. Errors logged at WARNING, never raised.
     """
     if not conversation_id:
         return
+
+    # Mirror locally so we can read these entries back without a real NLP GET.
+    current = _NLP_MIRROR_STATE.get(conversation_id) or {}
+    # Coerce to str for downstream consumers; named_entities only carries scalars.
+    current.update({k: str(v) for k, v in named_entities.items()})
+    _NLP_MIRROR_STATE.set(conversation_id, current)
+
     url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
     payload = {"named_entities": named_entities}
     body = json.dumps(payload, ensure_ascii=False).encode()
@@ -161,6 +167,13 @@ def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None
             _log.warning("NLP state PUT %s -> error: %s", url, exc)
 
     threading.Thread(target=_do, daemon=True, name="nlp-state-put-identity").start()
+
+
+def _nlp_get_named_entities(conversation_id: str) -> dict[str, str]:
+    """Read mirrored NLP named_entities for the conversation."""
+    if not conversation_id:
+        return {}
+    return _NLP_MIRROR_STATE.get(conversation_id) or {}
 
 
 # "Kód zákazníka" or "Kód účtu" — numeric code 8-12 digits, no separators.
@@ -206,6 +219,14 @@ _SERIAL_TOOL_DESCRIPTION = (
 
 _IDENTITY_TTL_SECONDS = 30 * 60
 _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_SECONDS)
+
+# Mirror of named_entities we PUT to NLP, plus externally-set entities like
+# input_source and authentication_type. In production we will (Q3 in
+# docs/OPEN_QUESTIONS.md) replace this read path with a GET /named_entities
+# call against the real NLP engine. For now it lets tests and the
+# `nastav_test_kontext` debug tool simulate that state without a real NLP.
+_NLP_MIRROR_TTL_SECONDS = 30 * 60
+_NLP_MIRROR_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
 
 _UPSTREAM_ERROR_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
 
@@ -312,6 +333,32 @@ def _valid_for(customer: dict[str, Any]) -> dict[str, str | None] | None:
     }
 
 
+def _extract_billing_account_ids(customer: dict[str, Any] | None) -> list[str]:
+    """Collect string-valued BillingAccount.id from a Customer record."""
+    if not customer:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for ca in customer.get("customerAccounts") or []:
+        for ba in ca.get("billingAccounts") or []:
+            bid = ba.get("id")
+            if isinstance(bid, str) and bid not in seen:
+                seen.add(bid)
+                out.append(bid)
+    return out
+
+
+def _extract_rc_last4_from_party(party: dict[str, Any]) -> str | None:
+    """Return the last 4 chars of the party's socialSecurityNumber identification, or None."""
+    ind = party.get("individual") or {}
+    for ident in ind.get("individualIdentifications") or []:
+        if ident.get("type") == "socialSecurityNumber":
+            value = ident.get("identificationId")
+            if isinstance(value, str) and len(value) >= 4:
+                return value[-4:]
+    return None
+
+
 def _candidate(
     party: dict[str, Any],
     customer: dict[str, Any] | None,
@@ -343,6 +390,8 @@ def _candidate(
         "valid_for": _valid_for(customer) if customer else None,
         "contacts": _normalize_contacts(party.get("contacts") or []),
         "identifications": _normalize_identifications(identifications_src),
+        "billing_account_ids": _extract_billing_account_ids(customer),
+        "auth_rc_last4": _extract_rc_last4_from_party(party),
     }
 
 
@@ -387,6 +436,8 @@ def _candidate_from_customer(customer: dict[str, Any]) -> dict[str, Any]:
         "valid_for": _valid_for(customer),
         "contacts": [],
         "identifications": [],
+        "billing_account_ids": _extract_billing_account_ids(customer),
+        "auth_rc_last4": None,
     }
 
 

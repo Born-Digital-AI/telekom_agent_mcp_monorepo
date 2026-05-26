@@ -44,6 +44,8 @@ class _StubClient:
     products_by_public_identifier_map: dict[str, list[dict] | Exception] | Exception
     products_by_serial_number_calls: list[str]
     products_by_serial_number_map: dict[str, list[dict] | Exception] | Exception
+    party_by_id_calls: list[str]
+    party_by_id_map: dict[str, dict | None] | Exception
 
     def __init__(  # noqa: PLR0913
         self,
@@ -55,6 +57,7 @@ class _StubClient:
         | Exception
         | None = None,
         products_by_serial_number_map: dict[str, list[dict] | Exception] | Exception | None = None,
+        party_by_id_map: dict[str, dict | None] | Exception | None = None,
     ) -> None:
         self.parties = parties if parties is not None else []
         self.customers_by_party = customers_by_party if customers_by_party is not None else {}
@@ -64,6 +67,7 @@ class _StubClient:
         self.billing_account_by_id_calls = []
         self.products_by_public_identifier_calls = []
         self.products_by_serial_number_calls = []
+        self.party_by_id_calls = []
         self.customer_by_id_map = customer_by_id_map if customer_by_id_map is not None else {}
         self.billing_account_by_id_map = (
             billing_account_by_id_map if billing_account_by_id_map is not None else {}
@@ -76,6 +80,7 @@ class _StubClient:
         self.products_by_serial_number_map = (
             products_by_serial_number_map if products_by_serial_number_map is not None else {}
         )
+        self.party_by_id_map = party_by_id_map if party_by_id_map is not None else {}
 
     async def get_parties_by_identification(
         self,
@@ -120,6 +125,12 @@ class _StubClient:
             raise val
         return val
 
+    async def get_party_by_id(self, party_id: str) -> dict | None:
+        self.party_by_id_calls.append(party_id)
+        if isinstance(self.party_by_id_map, Exception):
+            raise self.party_by_id_map
+        return self.party_by_id_map.get(party_id)
+
 
 @pytest.fixture
 def make_tool():
@@ -147,11 +158,20 @@ def _reset_identity_state_and_silence_nlp(monkeypatch):
     identity_tools._IDENTITY_STATE = type(identity_tools._IDENTITY_STATE)(
         ttl_seconds=identity_tools._IDENTITY_TTL_SECONDS,
     )
+    identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
+        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
+    )
+
     # Silence + capture NLP pushes for assertions
     calls: list[tuple[str, dict]] = []
 
     def _capture(conversation_id, named_entities):
         calls.append((conversation_id, named_entities))
+        # Still mirror into _NLP_MIRROR_STATE so tests that assert on mirror work.
+        if conversation_id:
+            current = identity_tools._NLP_MIRROR_STATE.get(conversation_id) or {}
+            current.update({k: str(v) for k, v in named_entities.items()})
+            identity_tools._NLP_MIRROR_STATE.set(conversation_id, current)
 
     monkeypatch.setattr(identity_tools, "_nlp_set_state", _capture)
     return calls  # tests that need the list can use the `_reset_identity_state_and_silence_nlp` fixture
@@ -366,6 +386,8 @@ def _customer(customer_id: str = "4482259100", party_id: str = "PARTY_4482259100
 
 @pytest.mark.unit
 async def test_single_match_merges_party_and_customer(make_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
     party = _full_party()
     customer = _customer()
     tool, _ = make_tool(
@@ -374,6 +396,11 @@ async def test_single_match_merges_party_and_customer(make_tool, conv) -> None: 
     )
     result = await _call(tool, rodne_cislo="8753189467")
     assert result == {"found": True, "name": "Tester AT NECHYTAT"}
+    cached = _IDENTITY_STATE.get("conv-test")
+    assert cached is not None
+    [cand] = cached["candidates"]
+    assert cand["billing_account_ids"] == []  # _customer() has no customerAccounts
+    assert cand["auth_rc_last4"] == "9467"  # last 4 of 8753189467
 
 
 @pytest.mark.unit
@@ -917,8 +944,21 @@ def make_kod_tool():
     return _factory
 
 
-def _b2c_customer(customer_id: str = "1002203200", name: str = "Muziková,Stano") -> dict:
+def _b2c_customer(
+    customer_id: str = "1002203200",
+    name: str = "Muziková,Stano",
+    billing_account_ids: list[str] | None = None,
+) -> dict:
     """B2C customer with comma-reversed surname,givenName name format."""
+    accounts = []
+    if billing_account_ids:
+        accounts = [
+            {
+                "id": customer_id,
+                "type": "individual",
+                "billingAccounts": [{"id": bid} for bid in billing_account_ids],
+            }
+        ]
     return {
         "id": customer_id,
         "name": name,
@@ -926,7 +966,7 @@ def _b2c_customer(customer_id: str = "1002203200", name: str = "Muziková,Stano"
         "marketSegment": "Basic",
         "customerSegment": "B2C",
         "engagedParty": {"entityReferredType": "Party", "id": f"PARTY_{customer_id}"},
-        "customerAccounts": [],
+        "customerAccounts": accounts,
         "characteristics": [],
     }
 
@@ -1039,6 +1079,8 @@ async def test_kod_caches_candidate(make_kod_tool, conv) -> None:  # noqa: ARG00
     # Party-derived fields are empty for the customer-only flow
     assert cand["contacts"] == []
     assert cand["identifications"] == []
+    assert cand["billing_account_ids"] == []
+    assert cand["auth_rc_last4"] is None
 
 
 @pytest.mark.unit
@@ -1469,3 +1511,65 @@ async def test_no_conversation_id_does_not_push_to_nlp(
     # NOTE: no `conv` fixture used — ContextVars default to empty
     await _call(tool, kod_zakaznika="1002203200")
     assert _reset_identity_state_and_silence_nlp == []
+
+
+# ---- billing_account_ids extraction ----
+
+
+@pytest.mark.unit
+async def test_kod_zakaznika_extracts_billing_account_ids(make_kod_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204", "1002203202"],
+    )
+    tool, _ = make_kod_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tool, kod_zakaznika="1002203200")
+    cached = _IDENTITY_STATE.get("conv-test")
+    [cand] = cached["candidates"]
+    assert cand["billing_account_ids"] == ["1002203204", "1002203202"]
+    assert cand["auth_rc_last4"] is None
+
+
+# ---- auth_rc_last4 extraction ----
+
+
+@pytest.mark.unit
+async def test_rodne_cislo_caches_auth_rc_last4(make_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
+
+    party = _full_party()  # already has socialSecurityNumber=8753189467
+    customer = _customer()
+    tool, _ = make_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    await _call(tool, rodne_cislo="8753189467")
+    cached = _IDENTITY_STATE.get("conv-test")
+    [cand] = cached["candidates"]
+    assert cand["auth_rc_last4"] == "9467"
+
+
+# ---- NLP mirror tests ----
+
+
+@pytest.mark.unit
+async def test_nlp_mirror_captures_set_state_writes(make_kod_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _NLP_MIRROR_STATE
+
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_kod_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tool, kod_zakaznika="1002203200")
+    mirror = _NLP_MIRROR_STATE.get("conv-test")
+    assert mirror is not None
+    assert mirror["identification_method"] == "kod_zakaznika"
+    assert mirror["identification"] == "1002203200"
+
+
+@pytest.mark.unit
+def test_nlp_get_named_entities_returns_empty_for_unknown_conv() -> None:
+    from svc.mcp_telekom_identity.tools import _nlp_get_named_entities
+
+    assert _nlp_get_named_entities("nonexistent-conv") == {}

@@ -379,3 +379,33 @@ async def test_get_products_by_serial_number_returns_empty_list_when_no_match() 
             ).mock(return_value=httpx.Response(200, json=[]))
             result = await client.get_products_by_serial_number("UNKNOWNSN001")
     assert result == []
+
+
+@pytest.mark.unit
+async def test_get_party_by_id_returns_single_dict_on_200() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            route = router.get(
+                "/omni/test1/party-management/3.54.0/v2/parties/PARTY_1002203200",
+            ).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"id": "PARTY_1002203200", "type": "individual"},
+                ),
+            )
+            result = await client.get_party_by_id("PARTY_1002203200")
+    assert result == {"id": "PARTY_1002203200", "type": "individual"}
+    assert route.calls.last.request.url.params["fields"] == "*"
+
+
+@pytest.mark.unit
+async def test_get_party_by_id_returns_none_on_404() -> None:
+    client = _make_client()
+    async with client:
+        with respx.mock(base_url="https://dps.test") as router:
+            router.get(
+                "/omni/test1/party-management/3.54.0/v2/parties/PARTY_UNKNOWN",
+            ).mock(return_value=httpx.Response(404, json={"error": "not found"}))
+            result = await client.get_party_by_id("PARTY_UNKNOWN")
+    assert result is None
