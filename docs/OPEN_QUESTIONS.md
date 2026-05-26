@@ -124,7 +124,7 @@ but deferred — surfacing a non-functional tool to the LLM mainly creates confu
 **Raised:** 2026-05-22
 **Service:** `mcp_telekom_identity`
 
-### Context
+### Context (Q2)
 
 The identification toolset now spans **three DPS APIs** (party-management, customer-management,
 product-inventory) with **six tools** and several edge cases (B2C name reversal, MSISDN
@@ -177,3 +177,64 @@ tests. README has full test scenarios. But:
 - The bearer token is static and lives in env — no rotation.
 - Q1 (MSISDN) was resolved by live probing, not by owner confirmation — could break if DPS
   changes Product.publicIdentifier semantics.
+
+---
+
+## Q3: Wire real NLP `GET /named_entities` read path  🟡 Waiting
+
+**Raised:** 2026-05-26
+**Service:** `mcp_telekom_identity`
+
+### Context (Q3)
+
+The auth flow needs `input_source` (caller phone / email from caller-ID or
+email headers, used to score factor 1 "trusted source") and
+`authentication_type` (`standard` | `sensitive`, used to decide if 2 or 3
+factors are needed). Both are _produced_ by the NLP engine and consumed by
+our auth tool.
+
+Today the tool reads these from `_NLP_MIRROR_STATE`, a process-local TTL
+cache that:
+
+1. Mirrors every `_nlp_set_state` PUT we make (so our own writes round-trip).
+2. Is externally populated only by the debug tool `nastav_test_kontext`,
+   which we ship for test / `mcp-tester` flows.
+
+This is fine for development but in production the NLP engine is the source
+of truth. We need to fetch named entities from it on each auth call:
+
+```http
+GET <APP_GOODBOT_URL>/conversations/<conversation_id>/named_entities
+```
+
+### What needs to happen (Q3)
+
+1. Add a client (or inline `urllib`) for the GET endpoint with same timeout
+   semantics as `_nlp_set_state` (1 s aggressive cap, daemon-thread is fine if
+   we cache + use stale value on timeout).
+2. Change `_nlp_get_named_entities` to: try the GET first, fall back to mirror.
+3. Decide on debug-tool fate: either gate `nastav_test_kontext` behind an env
+   flag (e.g. only when `APP_NLP_MIRROR_ONLY=true`) or remove its registration
+   in production deployments entirely.
+4. Update `docs/identification-review.md` §6.6 (PII gradient) once the read
+   contract is confirmed with NLP team.
+
+### Who to ask (Q3)
+
+- **NLP engine owner** — confirm the exact `GET /named_entities` path,
+  response shape, and what keys can be expected to be populated when the
+  conversation hits the auth tool (specifically `input_source` and
+  `authentication_type`).
+
+### Unblocks (Q3)
+
+- A documented `GET /conversations/{id}/named_entities` endpoint on goodbot.
+- Decision on whether `nastav_test_kontext` stays as a controlled debug tool
+  or is removed.
+
+### Workaround in place (Q3)
+
+`_NLP_MIRROR_STATE` + `nastav_test_kontext`. The mirror is populated by our
+own `_nlp_set_state` writes AND any external write via `nastav_test_kontext`.
+Production parity is the only thing missing — the logic on top of the mirror
+read already exists.

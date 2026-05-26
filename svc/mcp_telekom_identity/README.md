@@ -32,6 +32,122 @@ Validation failures and `not_found` do **not** push to NLP. The push runs on a
 daemon thread with a 1-second timeout; a slow or down NLP engine never affects
 tool response latency.
 
+## Authentication
+
+Once the customer is identified, `autentifikacia` runs a multi-step factor check.
+Two levels:
+
+- **`standard`** — 2 factors needed (e.g. invoice resend)
+- **`sensitive`** — 3 factors needed (e.g. password change, billing change)
+
+The auth type comes from NLP `named_entities.authentication_type`. Default if
+absent is `standard`.
+
+### Factor order
+
+The tool always asks in order 1 → 2 → 3 → 4. The LLM/agent may skip the
+current factor (if the customer doesn't have that data) by calling
+`autentifikacia(skip_current_factor=true)`.
+
+| # | Factor           | Source                                            | How verified                                                                                      |
+| - | ---------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 1 | `trusted_source` | NLP `input_source` (caller-ID phone / from email) | match against the identified party's `contacts` (mobile or email)                                 |
+| 2 | `name`           | customer says (LLM passes via `meno_priezvisko=`) | lenient compare against `candidate.name`: case-insensitive, strip diacritics, token order ignored |
+| 3 | `kod_adresata`   | customer reads off invoice (`kod_adresata=`)      | exact match against `candidate.billing_account_ids[]`                                             |
+| 4 | `rc_last4`       | customer says (`rc_last4=`)                       | match against last 4 of Party's `socialSecurityNumber` identification                             |
+
+### Auto-credit from identification
+
+| Identification method                                                  | Factor auto-credited                         |
+| ---------------------------------------------------------------------- | -------------------------------------------- |
+| `identifikacia_rodne_cislo`                                            | **4** (caller already proved RČ knowledge)   |
+| `identifikacia_kod_zakaznika`, ends `1–9` (billing account)            | **3** (billing account = kod adresáta)       |
+| `identifikacia_kod_zakaznika`, ends `0` (customer id)                  | none                                         |
+| `identifikacia_op` / `_pas` / `_ico` / `_telefon` / `_seriove_cislo`  | none                                          |
+
+Factor 1 (trusted source) is **always** re-evaluated on each call against
+the current `input_source` from the NLP mirror — it can credit later if
+NLP arrives late.
+
+### Lazy Party fetch for `rc_last4`
+
+Identification tools 1–4 (Party-based) extract and cache `auth_rc_last4`
+during identification. Tools 5–7 (`kod_zakaznika`, `telefon`, `seriove_cislo`)
+don't fetch the Party — they only have the Customer. When the auth tool
+needs factor 4 in those cases, it lazy-fetches the Party via
+`GET /party-management/3.54.0/v2/parties/{id}` using the cached `party_id`.
+This keeps identification fast and only pays the extra request when factor 4
+is actually asked.
+
+### Response shapes
+
+**Need next factor:**
+
+```json
+{
+  "authenticated": false,
+  "level_required": "standard",
+  "factors_satisfied": ["trusted_source"],
+  "factors_remaining": 1,
+  "next_factor": "name",
+  "suggested_response": "Pre overenie totožnosti mi povedzte vaše meno a priezvisko.",
+  "instruction": "Počkaj na odpoveď zákazníka a zavolaj autentifikacia s parametrom meno_priezvisko=<odpoveď>. Ak zákazník daný údaj nemá, zavolaj autentifikacia(skip_current_factor=True)."
+}
+```
+
+**Success:**
+
+```json
+{
+  "authenticated": true,
+  "level": "standard",
+  "factors_satisfied": ["trusted_source", "name"],
+  "suggested_response": "Ďakujem, overenie prebehlo úspešne. S čím vám môžem pomôcť?"
+}
+```
+
+**Wrong value (attempts remaining):**
+
+```json
+{
+  "authenticated": false,
+  "factor_failed": "name",
+  "attempts_remaining": 2,
+  "suggested_response": "Tento údaj sa nezhoduje. Skúste, prosím, znova. Zostávajú vám 2 pokusy.",
+  "instruction": "..."
+}
+```
+
+**Other errors:** `identification_required`, `out_of_order` (with `expected_factor`),
+`multiple_factors_in_call`, `ambiguous_identification`, `cannot_authenticate`,
+`missing_conversation_id`.
+
+### Test scenarios (verified live)
+
+| Sequence                                                                                                   | Outcome                                                    |
+| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `identifikacia_rodne_cislo("7304292105")` → `autentifikacia(meno_priezvisko="Stano Muzikova")`             | standard ✓ (factors: name + rc_last4 auto)                 |
+| `identifikacia_rodne_cislo` → `nastav_test_kontext(authentication_type="sensitive")` → meno → kod_adresata | sensitive ✓ (factors: name + kod_adresata + rc_last4 auto) |
+| `identifikacia_kod_zakaznika("1002203204")` (billing acc) → meno                                           | standard ✓ (factors: kod_adresata auto + name)             |
+| `identifikacia_kod_zakaznika("1002203200")` (customer id) → meno → kod_adresata                            | standard ✓                                                 |
+| `identifikacia_telefon("0902804660")` → name → kod_adresata → rc_last4 (sensitive)                         | sensitive ✓ (lazy Party fetch for rc_last4)                |
+| No identification → `autentifikacia()`                                                                     | `identification_required`                                  |
+| 3× wrong name                                                                                              | `factors_failed[name]`, next factor advances               |
+
+### Test/debug tool: `nastav_test_kontext`
+
+Sets `input_source` and/or `authentication_type` in the local NLP mirror cache
+— used in tests and `mcp-tester` while the read path from the real NLP engine
+is not yet wired (tracked in [docs/OPEN_QUESTIONS.md](../../docs/OPEN_QUESTIONS.md)).
+In production this tool should be removed or restricted; values arrive from NLP.
+
+```python
+nastav_test_kontext(
+  input_source="0902555002",     # simulates caller-ID phone (factor 1 source)
+  authentication_type="sensitive" # default is "standard"
+)
+```
+
 ## Tools
 
 All identification tools share the same response shape:

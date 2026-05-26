@@ -33,19 +33,20 @@ outside the identification surface.
 
 ## 2. Tools and the APIs they call
 
-Seven tools, all served by a single MCP server. Each one returns the same
+Eight tools, all served by a single MCP server. Each identification tool returns the same
 minimal response shape (`{"found": true, "name": "..."}` on success); the
 internal flow differs.
 
-| # | Tool                            | Caller input             | API(s) called                                                                 |
-| - | ------------------------------- | ------------------------ | ----------------------------------------------------------------------------- |
-| 1 | `identifikacia_rodne_cislo`     | rodné číslo (9–10 digits) | Party Management → Customer Management                                        |
-| 2 | `identifikacia_op`              | občiansky preukaz (`AB123456`) | Party Management → Customer Management                                  |
-| 3 | `identifikacia_pas`             | passport (`BR154151`)    | Party Management → Customer Management                                        |
-| 4 | `identifikacia_ico`             | IČO (8 digits)           | Party Management → Customer Management (organization branch)                  |
-| 5 | `identifikacia_kod_zakaznika`   | numeric code (8–12)      | Customer Management direct (or Billing Account → Customer)                    |
-| 6 | `identifikacia_telefon`         | telefónne číslo (SK or intl) | Product Inventory → Customer Management                                   |
-| 7 | `identifikacia_seriove_cislo`   | sériové číslo (`M91450EB0603`) | Product Inventory → Customer Management                               |
+| # | Tool                            | Caller input                   | API(s) called                                                                                         |
+| - | ------------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| 1 | `identifikacia_rodne_cislo`     | rodné číslo (9–10 digits)      | Party Management → Customer Management                                                                |
+| 2 | `identifikacia_op`              | občiansky preukaz (`AB123456`) | Party Management → Customer Management                                                                |
+| 3 | `identifikacia_pas`             | passport (`BR154151`)          | Party Management → Customer Management                                                                |
+| 4 | `identifikacia_ico`             | IČO (8 digits)                 | Party Management → Customer Management (organization branch)                                          |
+| 5 | `identifikacia_kod_zakaznika`   | numeric code (8–12)            | Customer Management direct (or Billing Account → Customer)                                            |
+| 6 | `identifikacia_telefon`         | telefónne číslo (SK or intl)   | Product Inventory → Customer Management                                                               |
+| 7 | `identifikacia_seriove_cislo`   | sériové číslo (`M91450EB0603`) | Product Inventory → Customer Management                                                               |
+| 8 | `autentifikacia`                | (no caller arg)                | _none directly_ — reads `_IDENTITY_STATE` + `_NLP_MIRROR_STATE`, lazy-fetches Party for factor 4      |
 
 ---
 
@@ -238,11 +239,70 @@ the Product Inventory swagger ("A serial number for the product, e.g. for
 broadband routers"). Confirmation requested that this field is populated
 across all device types (router / STB / SIM / modem) consistently in production.
 
+### 3.8 `autentifikacia`
+
+**Caller input:** one of `meno_priezvisko`, `kod_adresata`, `rc_last4`, or
+`skip_current_factor=True`; multi-step tool — call repeatedly as the customer
+provides each factor.
+
+**Prerequisites:**
+
+- `_IDENTITY_STATE[conversation_id]` populated by a prior `identifikacia_*` call.
+- Optional but recommended: `_NLP_MIRROR_STATE[conversation_id]` carrying
+  `input_source` (caller phone/email from NLP) and `authentication_type`
+  (`standard` or `sensitive`).
+
+**Factor model:**
+
+| # | Factor           | Verification                                                                                 |
+| - | ---------------- | -------------------------------------------------------------------------------------------- |
+| 1 | `trusted_source` | normalize MSISDN / lowercase email and compare against `candidate.contacts`                  |
+| 2 | `name`           | strip diacritics + lower-case + token sort on both sides, exact compare                      |
+| 3 | `kod_adresata`   | exact string match against `candidate.billing_account_ids[]`                                 |
+| 4 | `rc_last4`       | strip non-digit from input, last 4 == `candidate.auth_rc_last4` (lazy Party fetch if `None`) |
+
+**Auto-credit at the start of every call:**
+
+- `trusted_source` if `input_source` matches any party contact
+- `kod_adresata` if `identification_method == "kod_zakaznika"` and the cached
+  `identification_value` does NOT end in `0`
+- `rc_last4` if `identification_method == "rodne_cislo"` (the caller already
+  produced the full RČ at identification)
+
+**Required factor count:**
+
+- `authentication_type == "standard"` (or missing) → 2 factors
+- `authentication_type == "sensitive"` → 3 factors
+
+**Ordering:** factors are asked 1 → 2 → 3 → 4. Customer-side input must
+match the current expected factor; otherwise `out_of_order` is returned.
+Skipping is allowed via `skip_current_factor=True` for cases where the
+customer doesn't have the data.
+
+**Locking:** each factor allows 3 attempts. After 3 misses, the factor is
+marked `failed` and the tool advances to the next; this is _not_ a session
+lock — the customer may still authenticate via remaining factors.
+
+**On success:** the tool PUTs to NLP `authenticated_standard`,
+`authenticated_sensitive`, `authentication_level` named entities (mirrored
+locally for downstream tools to read).
+
+**Side-effect API calls:**
+
+- `GET /party-management/3.54.0/v2/parties/{party_id}` — only when the
+  identification path didn't populate `auth_rc_last4` (tools 5–7) AND
+  the caller is asked for factor 4. Otherwise no upstream call.
+
+**Note for owners:** "kód adresáta" is implemented as the customer-facing
+identifier of a billing account (i.e. `BillingAccount.id` whose last digit
+is 1–9, distinct from the customer ID which ends in 0). Confirmation
+requested that this is the formal definition used on Slovak Telekom invoices.
+
 ---
 
 ## 4. Shared data flow
 
-```
+```text
 caller input
     │
     ▼
@@ -332,15 +392,15 @@ the same line in every case.
 
 ### 6.1 PII surface
 
-| Asset                      | Location            | Treatment                                                                |
-| -------------------------- | ------------------- | ------------------------------------------------------------------------ |
-| Caller input (RČ, OP, …)   | Tool argument       | Validated; never logged in full; only `last4` appears in INFO logs.      |
-| Bearer token (`APP_DPS_BEARER_TOKEN`) | Env var      | `pydantic.Field(exclude=True)` ⇒ never appears in `repr(config)` or any log. |
-| Authorization header       | HTTPS to DPS only   | Composed at request time; never logged.                                  |
-| Party / Customer record    | TTL cache (30 min)  | In-process memory, keyed by `X-Conversation-Id`. Cleared on TTL.         |
-| Customer name              | Response to LLM     | The only PII field returned. The LLM consumes it to speak to the caller. |
-| `Identification.socialSecurityNumber` from DPS response | Dropped at normalization | Never echoed back in the response. The caller already provided it as input. |
-| Logs                       | stdout + Logstash   | INFO records carry `application`, `conversation_id`, `interaction_id`, `trace_id`, `rc_last4`. No raw PII. |
+| Asset                                                   | Location                 | Treatment                                                                                                  |
+| ------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Caller input (RČ, OP, …)                                | Tool argument            | Validated; never logged in full; only `last4` appears in INFO logs.                                        |
+| Bearer token (`APP_DPS_BEARER_TOKEN`)                   | Env var                  | `pydantic.Field(exclude=True)` ⇒ never appears in `repr(config)` or any log.                               |
+| Authorization header                                    | HTTPS to DPS only        | Composed at request time; never logged.                                                                    |
+| Party / Customer record                                 | TTL cache (30 min)       | In-process memory, keyed by `X-Conversation-Id`. Cleared on TTL.                                           |
+| Customer name                                           | Response to LLM          | The only PII field returned. The LLM consumes it to speak to the caller.                                   |
+| `Identification.socialSecurityNumber` from DPS response | Dropped at normalization | Never echoed back in the response. The caller already provided it as input.                                |
+| Logs                                                    | stdout + Logstash        | INFO records carry `application`, `conversation_id`, `interaction_id`, `trace_id`, `rc_last4`. No raw PII. |
 
 ### 6.2 Transport security
 
@@ -376,21 +436,53 @@ the same line in every case.
 The cache holds the full identification value (process-local, 30 min TTL).
 The NLP-engine PUT is selective:
 
-| Method                                       | NLP `identification` value |
-| -------------------------------------------- | -------------------------- |
-| `ico` (organization registry number)         | full value, e.g. `86316923`            |
-| `kod_zakaznika` (customer ID / billing ref)  | full value, e.g. `1002203204`          |
-| `telefon` (MSISDN, intl form)                | full value, e.g. `421902804660`        |
-| `seriove_cislo` (device serial)              | full value, e.g. `M91450EB0603`        |
-| `rodne_cislo`                                | marker only: `last4=9467`              |
-| `op` (občiansky preukaz)                     | marker only: `last4=2148`              |
-| `pas` (passport)                             | marker only: `last4=4151`              |
+| Method                                       | NLP `identification` value              |
+| -------------------------------------------- | --------------------------------------- |
+| `ico` (organization registry number)         | full value, e.g. `86316923`             |
+| `kod_zakaznika` (customer ID / billing ref)  | full value, e.g. `1002203204`           |
+| `telefon` (MSISDN, intl form)                | full value, e.g. `421902804660`         |
+| `seriove_cislo` (device serial)              | full value, e.g. `M91450EB0603`         |
+| `rodne_cislo`                                | marker only: `last4=9467`               |
+| `op` (občiansky preukaz)                     | marker only: `last4=2148`               |
+| `pas` (passport)                             | marker only: `last4=4151`               |
 
 PII identifiers (RČ, OP, passport) never leave the identity service in plain
-text via the NLP channel. The downstream NLP/agent layer learns *that*
+text via the NLP channel. The downstream NLP/agent layer learns _that_
 identification happened (and the method) but not the raw value — it still has
 access to `name` via the MCP response, which is the only PII surfaced to the
 LLM by design.
+
+### 6.6 PII surface of the authentication flow
+
+What `_AUTH_STATE` holds (process-local, 30 min TTL, keyed by conversation):
+
+- Which factors are satisfied / failed / skipped (set names, not values)
+- Per-factor attempt counter
+- `authenticated_standard` / `authenticated_sensitive` boolean flags
+
+The actual factor _values_ (the name the customer said, the kód adresáta they
+read, etc.) are **never** stored in `_AUTH_STATE`. They are compared in-flight
+against the cached identity record and discarded.
+
+What goes to NLP on auth success:
+
+```json
+{
+  "named_entities": {
+    "authenticated_standard": "true",
+    "authenticated_sensitive": "true",
+    "authentication_level": "standard"
+  }
+}
+```
+
+No factor values, no name, no kód adresáta, no RČ digits ever leave the
+identity service via the NLP channel.
+
+`candidate.auth_rc_last4` (the last 4 of the customer's RČ) IS held in the
+identity cache when identification was Party-based. This is the only PII
+material introduced specifically for auth. For tools 5–7 it is lazily
+populated only when factor 4 is actually requested.
 
 ---
 
@@ -398,14 +490,14 @@ LLM by design.
 
 Required env vars (all prefixed `APP_`; secrets carry `pydantic.Field(exclude=True)`):
 
-| Var                       | Default                                       | Notes                                                      |
-| ------------------------- | --------------------------------------------- | ---------------------------------------------------------- |
-| `APP_DPS_BASE_URL`        | `https://teai.st.sk:8243/omni/test1`         | DPS gateway root.                                           |
-| `APP_DPS_BEARER_TOKEN`    | (empty)                                       | **Required.** Static bearer token. Masked in logs.          |
-| `APP_DPS_TIMEOUT_SECONDS` | `10`                                          | Per-request HTTP timeout.                                   |
-| `APP_DPS_VERIFY_TLS`      | `false`                                       | Test env has self-signed cert. **Flip for production.**     |
-| `APP_DPS_MAX_CANDIDATES`  | `10`                                          | Cap on Party records before the customer-management fanout. |
-| `APP_GOODBOT_URL`         | `http://goodbot.internal-test.svc.cluster.local:8121` | NLP engine base URL for state updates. |
+| Var                       | Default                                               | Notes                                                       |
+| ------------------------- | ----------------------------------------------------- | ----------------------------------------------------------- |
+| `APP_DPS_BASE_URL`        | `https://teai.st.sk:8243/omni/test1`                  | DPS gateway root.                                           |
+| `APP_DPS_BEARER_TOKEN`    | (empty)                                               | **Required.** Static bearer token. Masked in logs.          |
+| `APP_DPS_TIMEOUT_SECONDS` | `10`                                                  | Per-request HTTP timeout.                                   |
+| `APP_DPS_VERIFY_TLS`      | `false`                                               | Test env has self-signed cert. **Flip for production.**     |
+| `APP_DPS_MAX_CANDIDATES`  | `10`                                                  | Cap on Party records before the customer-management fanout. |
+| `APP_GOODBOT_URL`         | `http://goodbot.internal-test.svc.cluster.local:8121` | NLP engine base URL for state updates.                      |
 
 ---
 
@@ -479,3 +571,33 @@ or a correction before going to production. They are also tracked in
 - `APP_DPS_VERIFY_TLS=false` default — confirm acceptable for non-prod, and
   what's the right approach for prod (CA bundle vs. service-mesh TLS).
 - Static bearer token — confirm rotation policy.
+
+### To owners — authentication flow
+
+- **Kód adresáta definition.** Implementation treats it as `BillingAccount.id`
+  whose last digit is 1–9. Customer ID (last digit 0) is _not_ considered a
+  kód adresáta. Confirm this is the formal definition.
+- **Max attempts per factor.** We allow 3 retries per factor, then mark that
+  factor as failed (not a session lock; remaining factors stay available).
+  Confirm this is the right policy, or specify session-lock semantics.
+- **Trusted source matching.** `input_source` is compared against the party's
+  cached `contacts` (mobile MSISDN normalized to `421...` form, email
+  lower-cased). Confirm: do we need to handle blocked/private caller-IDs
+  (i.e. `input_source` empty) any differently than "skip factor 1"?
+- **Lazy Party fetch.** When customer was identified via `kod_zakaznika` /
+  `telefon` / `seriove_cislo` and the auth flow asks for factor 4 (rc_last4),
+  the tool does a single `GET /party-management/v2/parties/{party_id}` to read
+  the RČ. Confirm this is acceptable from an audit-log / rate-limit perspective.
+
+### To security — authentication flow
+
+- The `_AUTH_STATE` TTL is 30 minutes (process-local). The TTL extends on
+  every write. A long-running conversation could keep auth state alive
+  beyond 30 minutes. Confirm acceptable, or specify a hard ceiling.
+- `nastav_test_kontext` is a test/debug MCP tool that lets a caller set
+  `input_source` and `authentication_type` directly. It MUST be disabled or
+  removed in production deployments. Tracked in OPEN_QUESTIONS Q3.
+- Auth success writes `authenticated_*` flags to the NLP engine. Downstream
+  tools rely on these flags to gate sensitive actions. Confirm the flag-based
+  gating model is acceptable, or whether a signed token / short-lived nonce
+  is needed.
