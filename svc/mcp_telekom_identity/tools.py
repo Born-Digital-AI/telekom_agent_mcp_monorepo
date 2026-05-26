@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Annotated, Any
@@ -227,6 +228,45 @@ _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_S
 # `nastav_test_kontext` debug tool simulate that state without a real NLP.
 _NLP_MIRROR_TTL_SECONDS = 30 * 60
 _NLP_MIRROR_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
+
+# Authentication
+_AUTH_TTL_SECONDS = 30 * 60
+_AUTH_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_AUTH_TTL_SECONDS)
+
+_MAX_AUTH_ATTEMPTS_PER_FACTOR = 3
+
+# Factor names (use as dict keys + in factors_satisfied set + as "next_factor" value)
+_FACTOR_TRUSTED_SOURCE = "trusted_source"
+_FACTOR_NAME = "name"
+_FACTOR_KOD_ADRESATA = "kod_adresata"
+_FACTOR_RC_LAST4 = "rc_last4"
+_FACTOR_ORDER = (
+    _FACTOR_TRUSTED_SOURCE,
+    _FACTOR_NAME,
+    _FACTOR_KOD_ADRESATA,
+    _FACTOR_RC_LAST4,
+)
+
+_AUTH_TYPE_STANDARD = "standard"
+_AUTH_TYPE_SENSITIVE = "sensitive"
+
+_AUTH_TOOL_DESCRIPTION = (
+    "Overí totožnosť zákazníka. Volaj OPAKOVANE — pri každom volaní zaeviduje "
+    "aktuálny faktor a vráti, čo treba ešte. Najprv treba zavolať jeden z "
+    "identifikacia_* toolov (autentifikacia vychádza z výsledku identifikácie). "
+    "Faktory sa pýtajú v pevnom poradí: 1) dôveryhodný zdroj (automaticky z volania), "
+    "2) meno a priezvisko, 3) kód adresáta z faktúry, 4) posledné 4 cifry rodného čísla. "
+    "Pre štandardné transakcie treba 2 faktory, pre citlivé 3 faktory. "
+    "Bez parametrov tool vyhodnotí aktuálny stav a vráti ďalší krok. "
+    "Ak zákazník daný údaj nemá, zavolaj s skip_current_factor=true."
+)
+
+_TEST_KONTEXT_DESCRIPTION = (
+    "DEBUG/TEST IBA: nastaví hodnoty v lokálnej mirror cache, ktoré inak prichádzajú "
+    "z NLP engine cez named_entities (input_source = telefón/email zákazníka z caller ID, "
+    "authentication_type = 'standard' alebo 'sensitive' podľa zámeru transakcie). "
+    "V produkčnom prostredí tieto hodnoty plne setuje NLP engine."
+)
 
 _UPSTREAM_ERROR_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
 
@@ -471,6 +511,155 @@ def _dps_error_payload(exc: DPSError) -> dict[str, Any]:
         "error": "upstream_error",
         "message": _UPSTREAM_ERROR_MESSAGE,
     }
+
+
+def _strip_diacritics(s: str) -> str:
+    nfd = unicodedata.normalize("NFD", s)
+    return "".join(c for c in nfd if not unicodedata.combining(c))
+
+
+def _normalize_name_for_match(s: str) -> str:
+    """Lower-case, strip diacritics, collapse whitespace, sort tokens.
+
+    'Stano Muziková' → 'muzikova stano'  (sorted tokens)
+    'MUZIKOVÁ STANO' → 'muzikova stano'  (same)
+    """
+    if not s:
+        return ""
+    cleaned = _strip_diacritics(s).lower()
+    tokens = [t for t in re.split(r"\s+", cleaned.strip()) if t]
+    return " ".join(sorted(tokens))
+
+
+def _check_name(provided: str, candidate_name: str | None) -> bool:
+    if not candidate_name:
+        return False
+    return _normalize_name_for_match(provided) == _normalize_name_for_match(candidate_name)
+
+
+def _check_kod_adresata(provided: str, billing_account_ids: list[str]) -> bool:
+    val = (provided or "").strip()
+    if not val:
+        return False
+    return val in billing_account_ids
+
+
+def _check_rc_last4(provided: str, candidate_rc_last4: str | None) -> bool:
+    if not candidate_rc_last4:
+        return False
+    digits = re.sub(r"\D", "", provided or "")
+    if len(digits) < 4:
+        return False
+    return digits[-4:] == candidate_rc_last4
+
+
+def _normalize_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _check_trusted_source(input_source: str, contacts: list[dict[str, str]]) -> bool:
+    """Compare input_source against candidate contacts (mobile / email)."""
+    if not input_source:
+        return False
+    src = input_source.strip()
+    if not src:
+        return False
+
+    # Try MSISDN normalization first
+    src_msisdn = _normalize_msisdn(src)
+    src_email = _normalize_email(src) if "@" in src else None
+
+    for c in contacts:
+        ctype = c.get("type")
+        value = c.get("value")
+        if not value:
+            continue
+        if ctype == "mobile":
+            contact_msisdn = _normalize_msisdn(value)
+            if src_msisdn and contact_msisdn and src_msisdn == contact_msisdn:
+                return True
+        elif ctype == "email" and src_email and _normalize_email(value) == src_email:
+            return True
+    return False
+
+
+def _credited_factors_from_identification(
+    method: str,
+    value: str,
+    contacts: list[dict[str, str]],
+    input_source: str,
+) -> set[str]:
+    """Compute which factors are automatically satisfied at the start of auth.
+
+    - factor 1 (trusted_source): always re-evaluated against input_source vs contacts.
+    - factor 3 (kod_adresata): satisfied if the identification was kod_zakaznika with
+      a billing-account-shaped value (last digit 1-9, i.e. NOT customer id).
+    - factor 4 (rc_last4): satisfied if the identification was rodne_cislo (caller proved
+      knowledge of the full RČ, last 4 trivially covered).
+    """
+    credited: set[str] = set()
+
+    if _check_trusted_source(input_source, contacts):
+        credited.add(_FACTOR_TRUSTED_SOURCE)
+
+    if method == "kod_zakaznika":
+        v = (value or "").strip()
+        if v and v[-1] != "0":
+            credited.add(_FACTOR_KOD_ADRESATA)
+        # ending in 0 → customer id, not kod_adresata; do NOT credit
+
+    if method == "rodne_cislo":
+        credited.add(_FACTOR_RC_LAST4)
+
+    return credited
+
+
+def _next_factor(blocked: set[str]) -> str | None:
+    """Return the next factor (in fixed order 1→2→3→4) not in ``blocked``.
+
+    ``blocked`` is the union of factors that are satisfied, failed, or skipped —
+    anything we won't ask the customer about again.
+    """
+    for f in _FACTOR_ORDER:
+        if f not in blocked:
+            return f
+    return None
+
+
+def _required_factors(auth_type: str) -> int:
+    return 3 if auth_type == _AUTH_TYPE_SENSITIVE else 2
+
+
+def _suggested_response_for_factor(factor: str) -> str:
+    return {
+        _FACTOR_NAME: "Pre overenie totožnosti mi, prosím, povedzte vaše meno a priezvisko.",
+        _FACTOR_KOD_ADRESATA: "Povedzte mi, prosím, kód adresáta — nájdete ho na vašej faktúre.",
+        _FACTOR_RC_LAST4: "Povedzte mi, prosím, posledné 4 cifry vášho rodného čísla.",
+        _FACTOR_TRUSTED_SOURCE: "Pre overenie totožnosti mi povedzte ďalšiu informáciu.",
+    }.get(factor, "Potrebujem ďalší overovací údaj.")
+
+
+def _instruction_for_factor(factor: str) -> str:
+    param = {
+        _FACTOR_NAME: "meno_priezvisko",
+        _FACTOR_KOD_ADRESATA: "kod_adresata",
+        _FACTOR_RC_LAST4: "rc_last4",
+    }.get(factor)
+    if param:
+        return (
+            f"Počkaj na odpoveď zákazníka a zavolaj autentifikacia s parametrom {param}=<odpoveď>. "
+            f"Ak zákazník daný údaj nemá, zavolaj autentifikacia(skip_current_factor=True)."
+        )
+    return "Zavolaj autentifikacia bez parametrov pre opätovné vyhodnotenie."
+
+
+def _persist_auth_state(conv: str, state: dict[str, Any]) -> None:
+    """Serialise sets to lists before storing in TTLStore (so retrieval is sane)."""
+    serialised = dict(state)
+    for key in ("factors_satisfied", "factors_failed", "factors_skipped"):
+        if isinstance(serialised.get(key), set):
+            serialised[key] = sorted(serialised[key])
+    _AUTH_STATE.set(conv, serialised)
 
 
 def register(
@@ -899,3 +1088,331 @@ def register(
                 ),
             }
         )
+
+    @mcp_tool(name="autentifikacia", description=_AUTH_TOOL_DESCRIPTION, registry=registry)
+    async def autentifikacia(
+        meno_priezvisko: Annotated[
+            str | None,
+            Field(
+                description="Meno a priezvisko zákazníka (faktor 2). Neposielaj naraz s inými faktormi."
+            ),
+        ] = None,
+        kod_adresata: Annotated[
+            str | None,
+            Field(description="Kód adresáta = kód fakturačného účtu z faktúry (faktor 3)."),
+        ] = None,
+        rc_last4: Annotated[
+            str | None,
+            Field(description="Posledné 4 cifry rodného čísla (faktor 4)."),
+        ] = None,
+        skip_current_factor: Annotated[  # noqa: FBT002
+            bool,
+            Field(
+                description="True ak zákazník nemá údaj na aktuálne pýtaný faktor — preskočiť na ďalší."
+            ),
+        ] = False,
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        conv = (_meta or {}).get("conversation_id", "")
+        if not conv:
+            return _json(
+                {
+                    "authenticated": False,
+                    "error": "missing_conversation_id",
+                    "message": "Vyskytol sa technický problém. Prepojím vás na operátora.",
+                }
+            )
+
+        # Step 1: identification must exist
+        identity = _IDENTITY_STATE.get(conv)
+        if not identity:
+            return _json(
+                {
+                    "authenticated": False,
+                    "error": "identification_required",
+                    "suggested_response": (
+                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                        "kód zákazníka alebo telefónne číslo?"
+                    ),
+                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                }
+            )
+
+        candidates = identity.get("candidates") or []
+        if not candidates:
+            return _json(
+                {
+                    "authenticated": False,
+                    "error": "identification_required",
+                    "suggested_response": (
+                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                        "kód zákazníka alebo telefónne číslo?"
+                    ),
+                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                }
+            )
+
+        # If multi-match identification, can't authenticate against ambiguous candidate
+        if len(candidates) > 1:
+            return _json(
+                {
+                    "authenticated": False,
+                    "error": "ambiguous_identification",
+                    "suggested_response": (
+                        "Z identifikácie máme viacero záznamov, potrebujeme jednoznačnú identifikáciu pred overením."
+                    ),
+                    "instruction": "Zaveď zákazníka cez presnejší identifikačný údaj.",
+                }
+            )
+
+        candidate = candidates[0]
+        identification_method = identity.get("identification_method") or ""
+        identification_value = identity.get("identification_value") or ""
+
+        # Step 2: load or init auth state
+        state = _AUTH_STATE.get(conv) or {
+            "factors_satisfied": set(),
+            "factors_failed": set(),
+            "factors_skipped": set(),
+            "factors_attempts": {},
+            "authenticated_standard": False,
+            "authenticated_sensitive": False,
+        }
+        # Convert lists from cached dict back to sets (TTLStore stores whatever we put in)
+        for key in ("factors_satisfied", "factors_failed", "factors_skipped"):
+            if isinstance(state.get(key), list):
+                state[key] = set(state[key])
+
+        # Step 3: read NLP mirror
+        nlp = _nlp_get_named_entities(conv)
+        input_source = nlp.get("input_source", "")
+        auth_type = nlp.get("authentication_type") or _AUTH_TYPE_STANDARD
+        if auth_type not in (_AUTH_TYPE_STANDARD, _AUTH_TYPE_SENSITIVE):
+            auth_type = _AUTH_TYPE_STANDARD
+
+        # Step 4: auto-credit factors (recompute every call — input_source may arrive late)
+        credited = _credited_factors_from_identification(
+            identification_method,
+            identification_value,
+            candidate.get("contacts") or [],
+            input_source,
+        )
+        state["factors_satisfied"] |= credited
+
+        blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+
+        # Auto-skip trusted_source if input_source is missing (nothing the caller can do).
+        # This must happen before out-of-order checks so that factor 2 is the first "expected".
+        if (
+            _FACTOR_TRUSTED_SOURCE not in state["factors_satisfied"]
+            and _FACTOR_TRUSTED_SOURCE not in blocked
+            and not input_source
+        ):
+            state["factors_skipped"].add(_FACTOR_TRUSTED_SOURCE)
+            blocked = (
+                state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            )
+
+        expected = _next_factor(blocked)
+
+        # Step 5: process user-provided input (one factor per call)
+        provided: list[tuple[str, str]] = []
+        if meno_priezvisko is not None:
+            provided.append((_FACTOR_NAME, meno_priezvisko))
+        if kod_adresata is not None:
+            provided.append((_FACTOR_KOD_ADRESATA, kod_adresata))
+        if rc_last4 is not None:
+            provided.append((_FACTOR_RC_LAST4, rc_last4))
+
+        if len(provided) > 1:
+            return _json(
+                {
+                    "authenticated": False,
+                    "error": "multiple_factors_in_call",
+                    "suggested_response": "Vyskytol sa technický problém. Prepojím vás na operátora.",
+                    "instruction": "Pošli vždy len jeden faktor naraz.",
+                }
+            )
+
+        if provided:
+            factor, value = provided[0]
+            if expected != factor:
+                return _json(
+                    {
+                        "authenticated": False,
+                        "error": "out_of_order",
+                        "expected_factor": expected,
+                        "suggested_response": _suggested_response_for_factor(expected)
+                        if expected
+                        else "Pre opätovné vyhodnotenie zavolaj autentifikacia.",
+                        "instruction": _instruction_for_factor(expected)
+                        if expected
+                        else "Zavolaj autentifikacia bez parametrov.",
+                    }
+                )
+            # Verify
+            ok = False
+            if factor == _FACTOR_NAME:
+                ok = _check_name(value, candidate.get("name"))
+            elif factor == _FACTOR_KOD_ADRESATA:
+                ok = _check_kod_adresata(value, candidate.get("billing_account_ids") or [])
+            elif factor == _FACTOR_RC_LAST4:
+                rc4 = candidate.get("auth_rc_last4")
+                if rc4 is None:
+                    # Lazy-fetch Party to get RČ last4 (identified via customer-only path)
+                    party_id = candidate.get("party_id")
+                    if isinstance(party_id, str) and party_id:
+                        try:
+                            party = await client.get_party_by_id(party_id)
+                        except DPSError as exc:
+                            _log.warning("autentifikacia: party fetch failed for rc check: %s", exc)
+                            return _json(_dps_error_payload(exc))
+                        if party is not None:
+                            rc4 = _extract_rc_last4_from_party(party)
+                            if rc4:
+                                candidate["auth_rc_last4"] = rc4
+                                # Write back the enriched candidate to identity cache
+                                _IDENTITY_STATE.set(conv, identity)
+                ok = _check_rc_last4(value, rc4)
+
+            attempts_map = state["factors_attempts"]
+            if ok:
+                state["factors_satisfied"].add(factor)
+                attempts_map.pop(factor, None)
+            else:
+                attempts_map[factor] = attempts_map.get(factor, 0) + 1
+                if attempts_map[factor] >= _MAX_AUTH_ATTEMPTS_PER_FACTOR:
+                    state["factors_failed"].add(factor)
+                    _persist_auth_state(conv, state)
+                    _log.warning(
+                        "auth factor=%s failed after %d attempts conv=%s",
+                        factor,
+                        attempts_map[factor],
+                        conv,
+                    )
+                    # Fall through to recompute next step
+                else:
+                    remaining = _MAX_AUTH_ATTEMPTS_PER_FACTOR - attempts_map[factor]
+                    _persist_auth_state(conv, state)
+                    return _json(
+                        {
+                            "authenticated": False,
+                            "factor_failed": factor,
+                            "attempts_remaining": remaining,
+                            "suggested_response": (
+                                f"Tento údaj sa nezhoduje. Skúste, prosím, znova. "
+                                f"Zostáva vám {'ešte jeden pokus' if remaining == 1 else f'{remaining} pokusy'}."
+                            ),
+                            "instruction": _instruction_for_factor(factor),
+                        }
+                    )
+
+        # Step 6: skip current factor if requested
+        if skip_current_factor and expected and expected != _FACTOR_TRUSTED_SOURCE:
+            state["factors_skipped"].add(expected)
+
+        blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+
+        # Step 7: check if we have enough
+        required = _required_factors(auth_type)
+        satisfied_count = len(state["factors_satisfied"])
+
+        if satisfied_count >= required:
+            state["authenticated_standard"] = True
+            if satisfied_count >= 3 or auth_type == _AUTH_TYPE_SENSITIVE:
+                state["authenticated_sensitive"] = satisfied_count >= 3
+            _persist_auth_state(conv, state)
+            level = (
+                _AUTH_TYPE_SENSITIVE if state["authenticated_sensitive"] else _AUTH_TYPE_STANDARD
+            )
+            _nlp_set_state(
+                conv,
+                {
+                    "authenticated_standard": "true",
+                    "authenticated_sensitive": "true"
+                    if state["authenticated_sensitive"]
+                    else "false",
+                    "authentication_level": level,
+                },
+            )
+            return _json(
+                {
+                    "authenticated": True,
+                    "level": level,
+                    "factors_satisfied": sorted(state["factors_satisfied"]),
+                    "suggested_response": "Ďakujem, overenie prebehlo úspešne. S čím vám môžem pomôcť?",
+                }
+            )
+
+        # Step 8: find next factor
+        next_f = _next_factor(blocked)
+        _persist_auth_state(conv, state)
+
+        if next_f is None:
+            return _json(
+                {
+                    "authenticated": False,
+                    "error": "cannot_authenticate",
+                    "factors_satisfied": sorted(state["factors_satisfied"]),
+                    "factors_failed": sorted(state["factors_failed"]),
+                    "factors_skipped": sorted(state["factors_skipped"]),
+                    "suggested_response": "Overenie sa nepodarilo. Prepájam vás na operátora.",
+                    "instruction": "Eskaluj na ľudského operátora.",
+                }
+            )
+
+        if next_f == _FACTOR_TRUSTED_SOURCE:
+            # Trusted source is automatic — nothing the caller can do.
+            # Mark it as skipped (input_source missing or didn't match) and re-eval.
+            state["factors_skipped"].add(_FACTOR_TRUSTED_SOURCE)
+            _persist_auth_state(conv, state)
+            next_f = _next_factor(
+                state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            )
+            if next_f is None:
+                return _json(
+                    {
+                        "authenticated": False,
+                        "error": "cannot_authenticate",
+                        "suggested_response": "Overenie sa nepodarilo. Prepájam vás na operátora.",
+                        "instruction": "Eskaluj na ľudského operátora.",
+                    }
+                )
+
+        return _json(
+            {
+                "authenticated": False,
+                "level_required": auth_type,
+                "factors_satisfied": sorted(state["factors_satisfied"]),
+                "factors_remaining": required - satisfied_count,
+                "next_factor": next_f,
+                "suggested_response": _suggested_response_for_factor(next_f),
+                "instruction": _instruction_for_factor(next_f),
+            }
+        )
+
+    @mcp_tool(name="nastav_test_kontext", description=_TEST_KONTEXT_DESCRIPTION, registry=registry)
+    async def nastav_test_kontext(
+        input_source: Annotated[
+            str | None,
+            Field(
+                description="Telefónne číslo alebo email volajúceho — simuluje caller-ID / from-header z NLP."
+            ),
+        ] = None,
+        authentication_type: Annotated[
+            str | None,
+            Field(description="'standard' alebo 'sensitive' — simuluje typ transakcie z NLP."),
+        ] = None,
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        conv = (_meta or {}).get("conversation_id", "")
+        if not conv:
+            return _json({"ok": False, "error": "missing_conversation_id"})
+
+        current = _NLP_MIRROR_STATE.get(conv) or {}
+        if input_source is not None:
+            current["input_source"] = input_source
+        if authentication_type is not None:
+            current["authentication_type"] = authentication_type
+        _NLP_MIRROR_STATE.set(conv, current)
+        return _json({"ok": True, "named_entities": dict(current)})

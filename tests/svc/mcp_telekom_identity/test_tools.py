@@ -161,6 +161,9 @@ def _reset_identity_state_and_silence_nlp(monkeypatch):
     identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
+    identity_tools._AUTH_STATE = type(identity_tools._AUTH_STATE)(
+        ttl_seconds=identity_tools._AUTH_TTL_SECONDS,
+    )
 
     # Silence + capture NLP pushes for assertions
     calls: list[tuple[str, dict]] = []
@@ -1573,3 +1576,267 @@ def test_nlp_get_named_entities_returns_empty_for_unknown_conv() -> None:
     from svc.mcp_telekom_identity.tools import _nlp_get_named_entities
 
     assert _nlp_get_named_entities("nonexistent-conv") == {}
+
+
+# ---- autentifikacia ----
+
+
+@pytest.fixture
+def make_auth_tool():
+    def _factory(**kwargs):
+        stub = _StubClient(
+            parties=kwargs.pop("parties", None),
+            customers_by_party=kwargs.pop("customers_by_party", None),
+            customer_by_id_map=kwargs.pop("customer_by_id_map", None),
+            billing_account_by_id_map=kwargs.pop("billing_account_by_id_map", None),
+            products_by_public_identifier_map=kwargs.pop("products_by_public_identifier_map", None),
+            products_by_serial_number_map=kwargs.pop("products_by_serial_number_map", None),
+            party_by_id_map=kwargs.pop("party_by_id_map", None),
+        )
+        max_candidates = kwargs.pop("max_candidates", 10)
+        fake = _FakeMCP()
+        registry = ToolRegistry(fake)  # type: ignore[arg-type]
+        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        return {
+            "autentifikacia": fake.registered["autentifikacia"],
+            "nastav_test_kontext": fake.registered["nastav_test_kontext"],
+            "identifikacia_rodne_cislo": fake.registered["identifikacia_rodne_cislo"],
+            "identifikacia_kod_zakaznika": fake.registered["identifikacia_kod_zakaznika"],
+            "identifikacia_telefon": fake.registered["identifikacia_telefon"],
+        }, stub
+
+    return _factory
+
+
+@pytest.mark.unit
+async def test_auth_requires_identification_first(make_auth_tool, conv) -> None:  # noqa: ARG001
+    tools, _ = make_auth_tool()
+    result = await _call(tools["autentifikacia"])
+    assert result["error"] == "identification_required"
+    assert not result["authenticated"]
+
+
+@pytest.mark.unit
+async def test_auth_after_rodne_cislo_credits_factor_4(make_auth_tool, conv) -> None:  # noqa: ARG001
+    tools, _ = make_auth_tool(
+        parties=[_full_party()],
+        customers_by_party={"PARTY_4482259100": [_customer()]},
+    )
+    # Identify via RČ first
+    await _call(tools["identifikacia_rodne_cislo"], rodne_cislo="8753189467")
+    # First auth call with no args: factor 4 auto-credited (and factor 1 either way),
+    # standard needs 2 → next factor is name.
+    result = await _call(tools["autentifikacia"])
+    assert not result["authenticated"]
+    assert result["next_factor"] == "name"
+    # Provide name (lenient match — strip diacritics, case-insensitive, both orders)
+    result = await _call(tools["autentifikacia"], meno_priezvisko="at nechytat tester")
+    assert result["authenticated"] is True
+    assert result["level"] == "standard"
+
+
+@pytest.mark.unit
+async def test_auth_sensitive_needs_three_factors(make_auth_tool, conv) -> None:  # noqa: ARG001
+    tools, _ = make_auth_tool(
+        parties=[_full_party()],
+        customers_by_party={"PARTY_4482259100": [_customer()]},
+    )
+    await _call(tools["identifikacia_rodne_cislo"], rodne_cislo="8753189467")
+    await _call(tools["nastav_test_kontext"], authentication_type="sensitive")
+    # factor 4 credited (RČ identification) + factor 2 (name) = 2 → need 3 for sensitive
+    result = await _call(tools["autentifikacia"], meno_priezvisko="Tester AT NECHYTAT")
+    assert not result["authenticated"]
+    assert result["next_factor"] == "kod_adresata"
+
+
+@pytest.mark.unit
+async def test_auth_kod_zakaznika_billing_credits_factor_3(make_auth_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204"],
+    )
+    tools, _ = make_auth_tool(
+        billing_account_by_id_map={
+            "1002203204": {"id": "1002203204", "customer": {"id": "1002203200"}}
+        },
+        customer_by_id_map={"1002203200": cust},
+    )
+    # Identify via billing account (ends in 4 → kod_adresata credit)
+    await _call(tools["identifikacia_kod_zakaznika"], kod_zakaznika="1002203204")
+    # Standard needs 2 → factor 3 already credited, so next is name
+    result = await _call(tools["autentifikacia"], meno_priezvisko="Stano Muziková")
+    assert result["authenticated"] is True
+    assert "kod_adresata" in result["factors_satisfied"]
+    assert "name" in result["factors_satisfied"]
+
+
+@pytest.mark.unit
+async def test_auth_kod_zakaznika_customer_id_does_not_credit_factor_3(
+    make_auth_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204"],
+    )
+    tools, _ = make_auth_tool(customer_by_id_map={"1002203200": cust})
+    # Identify by customer id (ends in 0 → NO factor 3 credit)
+    await _call(tools["identifikacia_kod_zakaznika"], kod_zakaznika="1002203200")
+    # Standard needs 2 — factor 1 (input_source missing → skipped), no other credits
+    # So we need name + one of (kod_adresata, rc_last4)
+    result = await _call(tools["autentifikacia"], meno_priezvisko="Stano Muziková")
+    assert not result["authenticated"]
+    # Next factor should be kod_adresata
+    assert result["next_factor"] == "kod_adresata"
+
+
+@pytest.mark.unit
+async def test_auth_trusted_source_via_party_contacts(make_auth_tool, conv) -> None:  # noqa: ARG001
+    # _full_party() has Party.contacts including {type: mobile, medium.number: "0902555002"}
+    tools, _ = make_auth_tool(
+        parties=[_full_party()],
+        customers_by_party={"PARTY_4482259100": [_customer()]},
+    )
+    await _call(tools["identifikacia_rodne_cislo"], rodne_cislo="8753189467")
+    # Caller from the same mobile — factor 1 should auto-credit
+    await _call(tools["nastav_test_kontext"], input_source="0902555002")
+    result = await _call(tools["autentifikacia"])
+    # factor 1 credited + factor 4 (RČ identification) = 2 → standard authenticated immediately
+    assert result["authenticated"] is True
+    assert result["level"] == "standard"
+    assert "trusted_source" in result["factors_satisfied"]
+
+
+@pytest.mark.unit
+async def test_auth_name_lenient_match(make_auth_tool, conv) -> None:  # noqa: ARG001
+    tools, _ = make_auth_tool(
+        parties=[_full_party()],
+        customers_by_party={"PARTY_4482259100": [_customer()]},
+    )
+    await _call(tools["identifikacia_rodne_cislo"], rodne_cislo="8753189467")
+    # Reverse order + lowercase + no diacritics (Party name is "Tester AT NECHYTAT")
+    result = await _call(tools["autentifikacia"], meno_priezvisko="at nechytat tester")
+    assert result["authenticated"] is True
+
+
+@pytest.mark.unit
+async def test_auth_out_of_order_rejected(make_auth_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204"],
+    )
+    tools, _ = make_auth_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tools["identifikacia_kod_zakaznika"], kod_zakaznika="1002203200")
+    # Tool expects name next; sending kod_adresata directly is out_of_order
+    result = await _call(tools["autentifikacia"], kod_adresata="1002203204")
+    assert result["error"] == "out_of_order"
+    assert result["expected_factor"] == "name"
+
+
+@pytest.mark.unit
+async def test_auth_max_attempts_marks_factor_failed(make_auth_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204"],
+    )
+    tools, _ = make_auth_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tools["identifikacia_kod_zakaznika"], kod_zakaznika="1002203200")
+    # 3 bad attempts on name
+    r1 = await _call(tools["autentifikacia"], meno_priezvisko="zly meno 1")
+    assert r1["factor_failed"] == "name"
+    assert r1["attempts_remaining"] == 2
+    r2 = await _call(tools["autentifikacia"], meno_priezvisko="zly meno 2")
+    assert r2["attempts_remaining"] == 1
+    r3 = await _call(tools["autentifikacia"], meno_priezvisko="zly meno 3")
+    # After 3rd failure, name moves to factors_failed and tool advances to next factor
+    assert r3["next_factor"] == "kod_adresata"
+
+
+@pytest.mark.unit
+async def test_auth_skip_current_factor_advances(make_auth_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204"],
+    )
+    tools, _ = make_auth_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tools["identifikacia_kod_zakaznika"], kod_zakaznika="1002203200")
+    # Skip name → next should be kod_adresata
+    result = await _call(tools["autentifikacia"], skip_current_factor=True)
+    assert result["next_factor"] == "kod_adresata"
+
+
+@pytest.mark.unit
+async def test_auth_cannot_authenticate_when_all_factors_blocked(make_auth_tool, conv) -> None:  # noqa: ARG001
+    cust = _b2c_customer("1002203200", "Muziková,Stano")  # no billing accounts, no contacts
+    tools, _ = make_auth_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tools["identifikacia_kod_zakaznika"], kod_zakaznika="1002203200")
+    # Skip all factors
+    await _call(tools["autentifikacia"], skip_current_factor=True)  # skip name
+    await _call(tools["autentifikacia"], skip_current_factor=True)  # skip kod_adresata
+    result = await _call(tools["autentifikacia"], skip_current_factor=True)  # skip rc_last4
+    assert result["error"] == "cannot_authenticate"
+
+
+@pytest.mark.unit
+async def test_auth_lazy_fetches_party_for_rc_when_customer_only_identification(
+    make_auth_tool,
+    conv,  # noqa: ARG001
+) -> None:
+    # identifikacia_telefon → customer-only path → candidate.auth_rc_last4 is None
+    cust = _b2c_customer(
+        "1002203200",
+        "Muziková,Stano",
+        billing_account_ids=["1002203204"],
+    )
+    party_record = {
+        "id": "PARTY_1002203200",
+        "type": "individual",
+        "individual": {
+            "givenName": "Stano",
+            "familyName": "Muziková",
+            "individualIdentifications": [
+                {"type": "socialSecurityNumber", "identificationId": "7304292105"},
+            ],
+        },
+        "contacts": [],
+    }
+    tools, stub = make_auth_tool(
+        products_by_public_identifier_map={
+            "421902804660": [
+                {"id": "P1", "publicIdentifier": "421902804660", "customer": {"id": "1002203200"}}
+            ]
+        },
+        customer_by_id_map={"1002203200": cust},
+        party_by_id_map={"PARTY_1002203200": party_record},
+    )
+    await _call(tools["identifikacia_telefon"], telefon="0902804660")
+    await _call(tools["nastav_test_kontext"], authentication_type="sensitive")
+    # Name (factor 2) + kod_adresata (factor 3)
+    await _call(tools["autentifikacia"], meno_priezvisko="Stano Muziková")
+    await _call(tools["autentifikacia"], kod_adresata="1002203204")
+    # Now factor 4 — tool must lazy-fetch the Party to read RČ
+    result = await _call(tools["autentifikacia"], rc_last4="2105")
+    assert result["authenticated"] is True
+    assert result["level"] == "sensitive"
+    assert "PARTY_1002203200" in stub.party_by_id_calls
+
+
+@pytest.mark.unit
+async def test_nastav_test_kontext_writes_to_mirror(make_auth_tool, conv) -> None:  # noqa: ARG001
+    from svc.mcp_telekom_identity.tools import _NLP_MIRROR_STATE
+
+    tools, _ = make_auth_tool()
+    result = await _call(
+        tools["nastav_test_kontext"],
+        input_source="0902555002",
+        authentication_type="sensitive",
+    )
+    assert result["ok"] is True
+    mirror = _NLP_MIRROR_STATE.get("conv-test")
+    assert mirror["input_source"] == "0902555002"
+    assert mirror["authentication_type"] == "sensitive"
