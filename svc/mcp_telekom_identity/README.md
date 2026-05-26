@@ -3,6 +3,35 @@
 MCP server for identifying (and later authenticating) Slovak Telekom customers
 against the DPS API (party-management + customer-management).
 
+## Cache & NLP state
+
+After every **successful** identification, the tool:
+
+1. Caches the result in a 30-minute TTL store keyed by `X-Conversation-Id`:
+
+   ```json
+   {
+     "identification_method": "kod_zakaznika",
+     "identification_value": "1002203204",
+     "rc_last4": "3204",
+     "candidates": [...]
+   }
+   ```
+
+2. Fires a fire-and-forget PUT to the NLP engine (`APP_GOODBOT_URL`) with a
+   `named_entities` state update:
+
+   - **Non-PII methods** (`ico`, `kod_zakaznika`, `telefon`, `seriove_cislo`):
+     `{"identification_method": "telefon", "identification": "421902804660"}`
+   - **PII methods** (`rodne_cislo`, `op`, `pas`):
+     `{"identification_method": "rodne_cislo", "identification": "last4=9467"}` —
+     only the last 4 characters are sent so the LLM/NLP layer knows
+     identification happened without seeing the raw value.
+
+Validation failures and `not_found` do **not** push to NLP. The push runs on a
+daemon thread with a 1-second timeout; a slow or down NLP engine never affects
+tool response latency.
+
 ## Tools
 
 All identification tools share the same response shape:
@@ -97,6 +126,7 @@ of the tool.
 | `APP_DPS_TIMEOUT_SECONDS` | `10` | Per-request timeout |
 | `APP_DPS_VERIFY_TLS` | `false` | Set `true` once a proper CA chain is wired |
 | `APP_DPS_MAX_CANDIDATES` | `10` | Cap on Party records before customer fanout |
+| `APP_GOODBOT_URL` | `http://goodbot.internal-test.svc.cluster.local:8121` | NLP engine base URL for state updates |
 
 ## Run locally
 

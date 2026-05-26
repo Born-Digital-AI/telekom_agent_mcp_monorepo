@@ -140,12 +140,21 @@ def make_tool():
 
 
 @pytest.fixture(autouse=True)
-def _reset_identity_state():
+def _reset_identity_state_and_silence_nlp(monkeypatch):
     from svc.mcp_telekom_identity import tools as identity_tools
 
+    # Reset cache between tests
     identity_tools._IDENTITY_STATE = type(identity_tools._IDENTITY_STATE)(
         ttl_seconds=identity_tools._IDENTITY_TTL_SECONDS,
     )
+    # Silence + capture NLP pushes for assertions
+    calls: list[tuple[str, dict]] = []
+
+    def _capture(conversation_id, named_entities):
+        calls.append((conversation_id, named_entities))
+
+    monkeypatch.setattr(identity_tools, "_nlp_set_state", _capture)
+    return calls  # tests that need the list can use the `_reset_identity_state_and_silence_nlp` fixture
 
 
 @pytest.fixture
@@ -509,6 +518,8 @@ async def test_successful_identification_caches_full_candidates(make_tool, conv)
     cached = _IDENTITY_STATE.get("conv-test")
     assert cached is not None
     assert cached["rc_last4"] == "9467"
+    assert cached["identification_method"] == "rodne_cislo"
+    assert cached["identification_value"] == "8753189467"
     [cached_candidate] = cached["candidates"]
     assert cached_candidate["party_id"] == "PARTY_4482259100"
     assert cached_candidate["customer_id"] == "4482259100"
@@ -1015,6 +1026,9 @@ async def test_kod_caches_candidate(make_kod_tool, conv) -> None:  # noqa: ARG00
     await _call(tool, kod_zakaznika="1002203200")
     cached = _IDENTITY_STATE.get("conv-test")
     assert cached is not None
+    assert cached["identification_method"] == "kod_zakaznika"
+    assert cached["identification_value"] == "1002203200"
+    assert cached["rc_last4"] == "3200"
     [cand] = cached["candidates"]
     assert cand["customer_id"] == "1002203200"
     assert cand["party_id"] == "PARTY_1002203200"
@@ -1300,3 +1314,158 @@ async def test_serial_upstream_error_uses_unified_message(make_serial_tool, conv
     result = await _call(tool, seriove_cislo="M91450EB0603")
     assert result["error"] == "auth_failed"
     assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+
+# ---- NLP push on success ----
+
+
+@pytest.mark.unit
+async def test_kod_pushes_full_value_to_nlp(
+    make_kod_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_kod_tool(customer_by_id_map={"1002203200": cust})
+    await _call(tool, kod_zakaznika="1002203200")
+    nlp_calls = _reset_identity_state_and_silence_nlp
+    assert len(nlp_calls) == 1
+    conv_id, named_entities = nlp_calls[0]
+    assert conv_id == "conv-test"
+    assert named_entities == {
+        "identification_method": "kod_zakaznika",
+        "identification": "1002203200",
+    }
+
+
+@pytest.mark.unit
+async def test_telefon_pushes_normalized_intl_to_nlp(
+    make_tel_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    product = {"id": "P1", "publicIdentifier": "421902804660", "customer": {"id": "1002203200"}}
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_tel_tool(
+        products_by_public_identifier_map={"421902804660": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    await _call(tool, telefon="0902804660")  # local format
+    nlp_calls = _reset_identity_state_and_silence_nlp
+    assert len(nlp_calls) == 1
+    _, named_entities = nlp_calls[0]
+    assert named_entities["identification_method"] == "telefon"
+    assert named_entities["identification"] == "421902804660"  # normalized intl form
+
+
+@pytest.mark.unit
+async def test_serial_pushes_normalized_value_to_nlp(
+    make_serial_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    product = {"id": "P1", "productSerialNumber": "M91450EB0603", "customer": {"id": "1002203200"}}
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_serial_tool(
+        products_by_serial_number_map={"M91450EB0603": [product]},
+        customer_by_id_map={"1002203200": cust},
+    )
+    await _call(tool, seriove_cislo="m9145-0eb-0603")  # lowercase + hyphens
+    nlp_calls = _reset_identity_state_and_silence_nlp
+    assert len(nlp_calls) == 1
+    _, named_entities = nlp_calls[0]
+    assert named_entities["identification_method"] == "seriove_cislo"
+    assert named_entities["identification"] == "M91450EB0603"  # normalized
+
+
+@pytest.mark.unit
+async def test_rodne_cislo_pushes_only_last4_to_nlp(
+    make_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    await _call(tool, rodne_cislo="8753189467")
+    nlp_calls = _reset_identity_state_and_silence_nlp
+    assert len(nlp_calls) == 1
+    _, named_entities = nlp_calls[0]
+    assert named_entities == {
+        "identification_method": "rodne_cislo",
+        "identification": "last4=9467",
+    }
+
+
+@pytest.mark.unit
+async def test_op_pushes_only_last4_to_nlp(
+    make_op_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    party = _full_party()
+    customer = _customer()
+    tool, _ = make_op_tool(
+        parties=[party],
+        customers_by_party={"PARTY_4482259100": [customer]},
+    )
+    await _call(tool, cislo_op="MM852148")
+    nlp_calls = _reset_identity_state_and_silence_nlp
+    _, named_entities = nlp_calls[0]
+    assert named_entities == {
+        "identification_method": "op",
+        "identification": "last4=2148",
+    }
+
+
+@pytest.mark.unit
+async def test_ico_pushes_full_value_to_nlp(
+    make_ico_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    party = _full_org_party("PARTY_2648241400", "Rmc S.R.O.")
+    tool, _ = make_ico_tool(parties=[party], customers_by_party={"PARTY_2648241400": []})
+    await _call(tool, ico="86316923")
+    nlp_calls = _reset_identity_state_and_silence_nlp
+    _, named_entities = nlp_calls[0]
+    assert named_entities == {
+        "identification_method": "ico",
+        "identification": "86316923",
+    }
+
+
+@pytest.mark.unit
+async def test_not_found_does_not_push_to_nlp(
+    make_kod_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    tool, _ = make_kod_tool(customer_by_id_map={"4432948400": None})
+    await _call(tool, kod_zakaznika="4432948400")
+    assert _reset_identity_state_and_silence_nlp == []  # no push on not_found
+
+
+@pytest.mark.unit
+async def test_invalid_input_does_not_push_to_nlp(
+    make_kod_tool,
+    conv,  # noqa: ARG001
+    _reset_identity_state_and_silence_nlp,
+) -> None:
+    tool, _ = make_kod_tool()
+    await _call(tool, kod_zakaznika="abc")
+    assert _reset_identity_state_and_silence_nlp == []
+
+
+@pytest.mark.unit
+async def test_no_conversation_id_does_not_push_to_nlp(
+    make_kod_tool, _reset_identity_state_and_silence_nlp
+) -> None:
+    cust = _b2c_customer("1002203200", "Muziková,Stano")
+    tool, _ = make_kod_tool(customer_by_id_map={"1002203200": cust})
+    # NOTE: no `conv` fixture used — ContextVars default to empty
+    await _call(tool, kod_zakaznika="1002203200")
+    assert _reset_identity_state_and_silence_nlp == []

@@ -31,6 +31,8 @@ class MCPTelekomIdentityConfig(MCPServiceConfig):
     dps_verify_tls: bool = False
     dps_max_candidates: int = 10
 
+    goodbot_url: str = "http://goodbot.internal-test.svc.cluster.local:8121"
+
 
 class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
     """Customer identification via DPS party-management + customer-management."""

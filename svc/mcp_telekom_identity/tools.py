@@ -18,7 +18,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import threading
+import urllib.error
+import urllib.request
 from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
@@ -125,6 +129,40 @@ _ICO_TOOL_DESCRIPTION = (
 
 _log = logging.getLogger(__name__)
 
+_NLP_BASE_URL = os.environ.get("APP_GOODBOT_URL") or os.environ.get(
+    "GOODBOT_URL", "http://goodbot.internal-test.svc.cluster.local:8121"
+)
+_NLP_TIMEOUT_SECONDS = 1.0
+
+
+def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
+    """Fire-and-forget PUT to the NLP engine's conversation-state endpoint.
+
+    Daemon thread + 1-second timeout. Errors logged at WARNING, never raised
+    — a slow or down NLP engine must not impact the tool's response latency.
+    """
+    if not conversation_id:
+        return
+    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
+    payload = {"named_entities": named_entities}
+    body = json.dumps(payload, ensure_ascii=False).encode()
+
+    def _do() -> None:
+        req = urllib.request.Request(
+            url, data=body, method="PUT", headers={"Content-Type": "application/json"}
+        )
+        _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
+        try:
+            with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
+                _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
+        except urllib.error.HTTPError as exc:
+            _log.warning("NLP state PUT %s -> HTTP %s", url, exc.code)
+        except Exception as exc:
+            _log.warning("NLP state PUT %s -> error: %s", url, exc)
+
+    threading.Thread(target=_do, daemon=True, name="nlp-state-put-identity").start()
+
+
 # "Kód zákazníka" or "Kód účtu" — numeric code 8-12 digits, no separators.
 # Ends in 0  → Customer ID
 # Ends in 1-9 → Billing Account ID (resolves to Customer via billingAccount.customer.id)
@@ -170,6 +208,48 @@ _IDENTITY_TTL_SECONDS = 30 * 60
 _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_SECONDS)
 
 _UPSTREAM_ERROR_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+# Tools whose input is PII (sent to NLP only as last4=XXXX marker).
+_PII_METHODS = frozenset({"rodne_cislo", "op", "pas"})
+
+
+def _persist_identification(
+    *,
+    conversation_id: str,
+    method: str,
+    value: str,
+    candidates: list[dict[str, Any]],
+) -> None:
+    """Cache identification result + push named_entities update to the NLP engine.
+
+    PII methods (rodne_cislo, op, pas) push only ``last4=XXXX`` to NLP.
+    Non-PII methods (ico, kod_zakaznika, telefon, seriove_cislo) push the
+    full normalized value. The cache itself always holds the full value
+    (process-local, 30 min TTL).
+    """
+    if not conversation_id:
+        _log.warning("identifikacia_%s: no conversation_id — cache and NLP skipped", method)
+        return
+
+    _IDENTITY_STATE.set(
+        conversation_id,
+        {
+            "rc_last4": value[-4:],
+            "identification_method": method,
+            "identification_value": value,
+            "candidates": candidates,
+        },
+    )
+
+    nlp_value = f"last4={value[-4:]}" if method in _PII_METHODS else value
+
+    _nlp_set_state(
+        conversation_id,
+        {
+            "identification_method": method,
+            "identification": nlp_value,
+        },
+    )
 
 
 def _json(obj: Any) -> str:
@@ -356,6 +436,7 @@ def register(
         not_found_message: str,
         conversation_id: str,
         log_id_tag: str,
+        method: str,
     ) -> str:
         """Shared identification flow used by all identification tools.
 
@@ -421,21 +502,13 @@ def register(
         # Count unique party_ids to determine single vs. multi-match.
         unique_party_ids = {c["party_id"] for c in candidates}
 
-        # Cache full candidates for downstream tools.
-        # rc_last4 key name is kept stable across both tools for schema consistency.
-        if conversation_id:
-            _IDENTITY_STATE.set(
-                conversation_id,
-                {
-                    "rc_last4": identification_id[-4:],
-                    "candidates": candidates,
-                },
-            )
-        else:
-            _log.warning(
-                "identification (%s): no conversation_id in _meta — cache skipped",
-                identification_type,
-            )
+        # Cache full candidates for downstream tools and push NLP state update.
+        _persist_identification(
+            conversation_id=conversation_id,
+            method=method,
+            value=identification_id,
+            candidates=candidates,
+        )
 
         if len(unique_party_ids) == 1:
             # Single match — return just the name.
@@ -471,6 +544,7 @@ def register(
             not_found_message=_RC_NOT_FOUND_MESSAGE,
             conversation_id=conv,
             log_id_tag="rc_last4",
+            method="rodne_cislo",
         )
 
     @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=registry)
@@ -493,6 +567,7 @@ def register(
             not_found_message=_OP_NOT_FOUND_MESSAGE,
             conversation_id=conv,
             log_id_tag="op_last4",
+            method="op",
         )
 
     @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=registry)
@@ -515,6 +590,7 @@ def register(
             not_found_message=_PAS_NOT_FOUND_MESSAGE,
             conversation_id=conv,
             log_id_tag="pas_last4",
+            method="pas",
         )
 
     @mcp_tool(name="identifikacia_ico", description=_ICO_TOOL_DESCRIPTION, registry=registry)
@@ -537,6 +613,7 @@ def register(
             not_found_message=_ICO_NOT_FOUND_MESSAGE,
             conversation_id=conv,
             log_id_tag="ico_last4",
+            method="ico",
         )
 
     @mcp_tool(
@@ -588,13 +665,12 @@ def register(
             # Defensive: the Customer record exists but has no usable name field
             return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
 
-        if conv:
-            _IDENTITY_STATE.set(
-                conv,
-                {"rc_last4": value[-4:], "candidates": [candidate]},
-            )
-        else:
-            _log.warning("identifikacia_kod_zakaznika: no conversation_id — cache skipped")
+        _persist_identification(
+            conversation_id=conv,
+            method="kod_zakaznika",
+            value=value,
+            candidates=[candidate],
+        )
 
         return _json({"found": True, "name": candidate["name"]})
 
@@ -655,13 +731,12 @@ def register(
         if not candidates:
             return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
 
-        if conv:
-            _IDENTITY_STATE.set(
-                conv,
-                {"rc_last4": normalized[-4:], "candidates": candidates},
-            )
-        else:
-            _log.warning("identifikacia_telefon: no conversation_id — cache skipped")
+        _persist_identification(
+            conversation_id=conv,
+            method="telefon",
+            value=normalized,
+            candidates=candidates,
+        )
 
         if len(candidates) == 1:
             return _json({"found": True, "name": candidates[0]["name"]})
@@ -751,13 +826,12 @@ def register(
                 {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
             )
 
-        if conv:
-            _IDENTITY_STATE.set(
-                conv,
-                {"rc_last4": normalized[-4:], "candidates": candidates},
-            )
-        else:
-            _log.warning("identifikacia_seriove_cislo: no conversation_id — cache skipped")
+        _persist_identification(
+            conversation_id=conv,
+            method="seriove_cislo",
+            value=normalized,
+            candidates=candidates,
+        )
 
         if len(candidates) == 1:
             return _json({"found": True, "name": candidates[0]["name"]})

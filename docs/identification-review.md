@@ -249,19 +249,31 @@ caller input
 [Tool-specific validation + normalization]
     │
     ▼
-[DPS API call(s) over the same gateway, same bearer token]
+[DPS API call(s)]
     │
     ▼
 [Filter / dedup / merge into "candidate" record]
     │
     ├──▶ Response to LLM:  {found: true, name: "..."}            ← minimal
     │
-    └──▶ TTL cache (process-local, 30 min):
-              key   = X-Conversation-Id (MCP header)
-              value = {rc_last4: "...", candidates: [<full record>]}
-                       └─ party_id, customer_id, contacts, identifications,
-                          status, market_segment, customer_segment,
-                          treatment_package, valid_for, …
+    ├──▶ TTL cache (process-local, 30 min):
+    │         key   = X-Conversation-Id
+    │         value = {
+    │           identification_method:  "rodne_cislo" | "op" | ...
+    │           identification_value:   "<full normalized input>"
+    │           rc_last4:               "XXXX"
+    │           candidates:             [<full record>]
+    │         }
+    │
+    └──▶ Fire-and-forget PUT to NLP engine (`APP_GOODBOT_URL`):
+              /conversations/<X-Conversation-Id>/states
+              body = {
+                named_entities: {
+                  identification_method:  "<method>",
+                  identification:         <full value | "last4=XXXX">,
+                }
+              }
+              (1 s timeout, daemon thread; never blocks the tool response)
 ```
 
 Subsequent tools (account lookup, bill resend, etc., to be added) read from
@@ -359,6 +371,27 @@ the same line in every case.
   `upstream_timeout`, …) in logs even though the customer-facing message is
   unified. Lets ops triage upstream issues quickly.
 
+### 6.5 PII gradient on the NLP-engine push
+
+The cache holds the full identification value (process-local, 30 min TTL).
+The NLP-engine PUT is selective:
+
+| Method                                       | NLP `identification` value |
+| -------------------------------------------- | -------------------------- |
+| `ico` (organization registry number)         | full value, e.g. `86316923`            |
+| `kod_zakaznika` (customer ID / billing ref)  | full value, e.g. `1002203204`          |
+| `telefon` (MSISDN, intl form)                | full value, e.g. `421902804660`        |
+| `seriove_cislo` (device serial)              | full value, e.g. `M91450EB0603`        |
+| `rodne_cislo`                                | marker only: `last4=9467`              |
+| `op` (občiansky preukaz)                     | marker only: `last4=2148`              |
+| `pas` (passport)                             | marker only: `last4=4151`              |
+
+PII identifiers (RČ, OP, passport) never leave the identity service in plain
+text via the NLP channel. The downstream NLP/agent layer learns *that*
+identification happened (and the method) but not the raw value — it still has
+access to `name` via the MCP response, which is the only PII surfaced to the
+LLM by design.
+
 ---
 
 ## 7. Configuration
@@ -372,6 +405,7 @@ Required env vars (all prefixed `APP_`; secrets carry `pydantic.Field(exclude=Tr
 | `APP_DPS_TIMEOUT_SECONDS` | `10`                                          | Per-request HTTP timeout.                                   |
 | `APP_DPS_VERIFY_TLS`      | `false`                                       | Test env has self-signed cert. **Flip for production.**     |
 | `APP_DPS_MAX_CANDIDATES`  | `10`                                          | Cap on Party records before the customer-management fanout. |
+| `APP_GOODBOT_URL`         | `http://goodbot.internal-test.svc.cluster.local:8121` | NLP engine base URL for state updates. |
 
 ---
 
