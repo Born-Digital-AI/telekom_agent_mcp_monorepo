@@ -1,0 +1,548 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "Telekom DPS APIs",
+    "description": "DPS HAL APIs used by `svc/mcp_telekom_identity/dps_get_client.py` — party-management 3.54.0, customer-management 4.67.0, product-inventory 4.64.\n\n**Setup:**\n1. Import the matching environment file (`telekom-dps-test.postman_environment.json`) and select it in the top-right Environment dropdown.\n2. Fill in `bearer_token` in the environment.\n3. **VPN required** for `teai.st.sk:8243`.\n\n**Auto-headers:** Every request auto-generates fresh UUIDs for `X-Request-Id`, `X-Request-Tracking-Id`, `X-Request-Session-Id` via collection-level pre-request script. Override per-request if you want to trace something specific.\n\nGroups:\n- **Party Management** — identify a party by RČ/OP/pas/IČO, fetch single party\n- **Customer Management** — fetch customer, billing account, related sub-resources\n- **Product Inventory** — MSISDN lookup, product details, per-customer counts\n- **End-to-end flows** — composed requests that mirror the live `identifikacia_*` tools",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{bearer_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Auto-generate the three required tracing UUIDs.",
+          "// Override these on the request level if you want a specific value.",
+          "pm.request.headers.upsert({ key: 'X-Request-Id',           value: pm.variables.replaceIn('{{$guid}}') });",
+          "pm.request.headers.upsert({ key: 'X-Request-Tracking-Id',  value: pm.variables.replaceIn('{{$guid}}') });",
+          "pm.request.headers.upsert({ key: 'X-Request-Session-Id',   value: pm.variables.replaceIn('{{$guid}}') });"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Generic assertions that fit every endpoint.",
+          "pm.test('content-type is JSON when body present', function () {",
+          "    if (pm.response.code === 204 || pm.response.code === 404) return;",
+          "    pm.expect(pm.response.headers.get('Content-Type') || '').to.match(/application\\/json/i);",
+          "});",
+          "pm.test('not 401/403 (token still valid)', function () {",
+          "    pm.expect([401, 403]).to.not.include(pm.response.code);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://teai.st.sk:8243/omni/test1",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Party Management 3.54.0",
+      "description": "`/party-management/3.54.0/v2/parties` — where rodné číslo / OP / pas / IČO live as `Identification` records under a Party. See [`dps-party-mgmt-api`](file:///Users/michaljurco/.claude/skills/dps-party-mgmt-api/SKILL.md) skill.",
+      "item": [
+        {
+          "name": "Search by rodné číslo (socialSecurityNumber)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{rodne_cislo}}&identificationType=socialSecurityNumber&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties"],
+              "query": [
+                { "key": "identificationId", "value": "{{rodne_cislo}}" },
+                { "key": "identificationType", "value": "socialSecurityNumber" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Returns `Party[]` — empty array means not found (HTTP 200 []).\n\nMapping for the Slovak market:\n- `rodne_cislo` (RČ, 9–10 digits) → `identificationType=socialSecurityNumber`"
+          }
+        },
+        {
+          "name": "Search by OP (nationalIdentityCard)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{op}}&identificationType=nationalIdentityCard&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties"],
+              "query": [
+                { "key": "identificationId", "value": "{{op}}" },
+                { "key": "identificationType", "value": "nationalIdentityCard" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "OP format: 2 uppercase letters + 6 digits (e.g. `AB123456`)."
+          }
+        },
+        {
+          "name": "Search by passport",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{pas}}&identificationType=passport&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties"],
+              "query": [
+                { "key": "identificationId", "value": "{{pas}}" },
+                { "key": "identificationType", "value": "passport" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Passport format: 1–2 uppercase letters + 6–8 digits (e.g. `BR154151`)."
+          }
+        },
+        {
+          "name": "Search by IČO (subjectRegistrationId)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{ico}}&identificationType=subjectRegistrationId&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties"],
+              "query": [
+                { "key": "identificationId", "value": "{{ico}}" },
+                { "key": "identificationType", "value": "subjectRegistrationId" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "IČO format: exactly 8 digits. Lives on `Party.organization.organizationIdentifications[]`."
+          }
+        },
+        {
+          "name": "Get party by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties/{{party_id}}?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties", "{{party_id}}"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Single Party record by ID (e.g. `PARTY_1002203200`)."
+          }
+        },
+        {
+          "name": "Get party with matching probability (dedup)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties/{{party_id}}?fields=*&hasMatchingSources=true",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties", "{{party_id}}"],
+              "query": [
+                { "key": "fields", "value": "*" },
+                { "key": "hasMatchingSources", "value": "true" }
+              ]
+            },
+            "description": "Adds duplicate-detection probabilities into `relatedParties[].characteristics[]`. Useful when investigating multi-match scenarios (e.g. the polluted test environment returns ~450 parties for some RČ values)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Customer Management 4.67.0",
+      "description": "`/customer-management/4.67.0/...` — Customer + CustomerAccount + BillingAccount hierarchy. See [`dps-customer-mgmt-api`](file:///Users/michaljurco/.claude/skills/dps-customer-mgmt-api/SKILL.md) skill.",
+      "item": [
+        {
+          "name": "Get customer by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/customers/{{customer_id}}?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "customers", "{{customer_id}}"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Single Customer. Customer IDs end in `0` per DPS convention (e.g. `1002203200`)."
+          }
+        },
+        {
+          "name": "Search customers by engagedParty.id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/customers?engagedParty.id={{party_id}}&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "customers"],
+              "query": [
+                { "key": "engagedParty.id", "value": "{{party_id}}" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Resolve Party → Customer(s). The standard pivot from party-management into customer-management."
+          }
+        },
+        {
+          "name": "Search customers by relatedParty role",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/customers?relatedParties.id={{party_id}}&relatedParties.role=Primary Sales Person&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "customers"],
+              "query": [
+                { "key": "relatedParties.id", "value": "{{party_id}}" },
+                { "key": "relatedParties.role", "value": "Primary Sales Person" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "List all customers where a given party plays a specific role (Sales Person, Account Manager, etc). Useful for portfolio views in B2B context."
+          }
+        },
+        {
+          "name": "Get customer history",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/customers/{{customer_id}}/history?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "customers", "{{customer_id}}", "history"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "All historical versions of the customer. Useful for change-investigation."
+          }
+        },
+        {
+          "name": "Get billing account by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/billingAccounts/{{billing_account_id}}?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "billingAccounts", "{{billing_account_id}}"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Single BillingAccount. IDs end in `1-9` (vs `0` for Customer IDs)."
+          }
+        },
+        {
+          "name": "Search billing accounts by customer",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/billingAccounts?relatedParty.id={{party_id}}&relatedParty.entityReferredType=Party&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "billingAccounts"],
+              "query": [
+                { "key": "relatedParty.id", "value": "{{party_id}}" },
+                { "key": "relatedParty.entityReferredType", "value": "Party" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Note: `customer.id` query param is DEPRECATED — use the `relatedParty.id` + `relatedParty.entityReferredType` polymorphic pair. entityReferredType ∈ `ContactParty | Party | Profile | Customer`."
+          }
+        },
+        {
+          "name": "Get billing account transactions",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/billingAccounts/{{billing_account_id}}/transactions?fields=*&size=20",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "billingAccounts", "{{billing_account_id}}", "transactions"],
+              "query": [
+                { "key": "fields", "value": "*" },
+                { "key": "size", "value": "20" }
+              ]
+            },
+            "description": "Invoice receivable history — `BillingAccountTransaction[]` with `receiptDate`, `bookingDate`, `taxIncludedAmount`."
+          }
+        },
+        {
+          "name": "Get billing account balances",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/billingAccounts/{{billing_account_id}}/accountBalances?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "billingAccounts", "{{billing_account_id}}", "accountBalances"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Returns `FinancialAccountBalance[]` — deposit / disputed / loyalty / receivable balances."
+          }
+        },
+        {
+          "name": "Get billing account instalment plans",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/customer-management/4.67.0/billingAccounts/{{billing_account_id}}/instalmentPlans?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["customer-management", "4.67.0", "billingAccounts", "{{billing_account_id}}", "instalmentPlans"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "All instalment plans on the billing account. `instalmentClassification` ∈ `settleDebt | purchase`."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Product Inventory 4.64",
+      "description": "`/product-inventory/4.64/products` — only API on this gateway that supports MSISDN lookup. See [`dps-product-inventory-api`](file:///Users/michaljurco/.claude/skills/dps-product-inventory-api/SKILL.md) skill.",
+      "item": [
+        {
+          "name": "Search products by MSISDN (publicIdentifier)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/product-inventory/4.64/products?query=publicIdentifier=={{msisdn}}&fields=*&size=20",
+              "host": ["{{base_url}}"],
+              "path": ["product-inventory", "4.64", "products"],
+              "query": [
+                { "key": "query", "value": "publicIdentifier=={{msisdn}}" },
+                { "key": "fields", "value": "*" },
+                { "key": "size", "value": "20" }
+              ]
+            },
+            "description": "The MSISDN-lookup query. Returns up to 20 products; pick the one with `accounts[].accountType=customer` to pivot into customer-management."
+          }
+        },
+        {
+          "name": "Search products by customer",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/product-inventory/4.64/products?customer={{customer_id}}&fields=*&size=50",
+              "host": ["{{base_url}}"],
+              "path": ["product-inventory", "4.64", "products"],
+              "query": [
+                { "key": "customer", "value": "{{customer_id}}" },
+                { "key": "fields", "value": "*" },
+                { "key": "size", "value": "50" }
+              ]
+            },
+            "description": "All products owned by a customer. Filter client-side by `group` (`tariff`, `addon`, `device`, `SIM`, ...) for relevant subsets."
+          }
+        },
+        {
+          "name": "Search active tariffs only",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/product-inventory/4.64/products?customer={{customer_id}}&group=tariff&status=Active&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["product-inventory", "4.64", "products"],
+              "query": [
+                { "key": "customer", "value": "{{customer_id}}" },
+                { "key": "group", "value": "tariff" },
+                { "key": "status", "value": "Active" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Active mobile/fixed tariffs only. `status` is **CapitalCase** (`Active`, not `active`) — quirk of product-inventory."
+          }
+        },
+        {
+          "name": "Get product by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/product-inventory/4.64/products/{{product_id}}?fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["product-inventory", "4.64", "products", "{{product_id}}"],
+              "query": [
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Single product detail — fill `product_id` from the search response."
+          }
+        },
+        {
+          "name": "Product counts per customer (lightweight)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/product-inventory/4.64/product-counts?customerId={{customer_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["product-inventory", "4.64", "product-counts"],
+              "query": [
+                { "key": "customerId", "value": "{{customer_id}}" }
+              ]
+            },
+            "description": "Per-category counts for a customer — much cheaper than a full `/products?customer=` for dashboard tiles."
+          }
+        }
+      ]
+    },
+    {
+      "name": "End-to-end flows",
+      "description": "Composed multi-request flows that mirror the live `identifikacia_*` tools.",
+      "item": [
+        {
+          "name": "1. RČ → Party → Customer",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{rodne_cislo}}&identificationType=socialSecurityNumber&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["party-management", "3.54.0", "v2", "parties"],
+              "query": [
+                { "key": "identificationId", "value": "{{rodne_cislo}}" },
+                { "key": "identificationType", "value": "socialSecurityNumber" },
+                { "key": "fields", "value": "*" }
+              ]
+            },
+            "description": "Step 1 of the RČ→Customer flow. Captures the first PARTY_id into `{{party_id}}` for the next step.\n\nSet the next request to **Search customers by engagedParty.id** to complete the chain."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Capture the first party_id into the environment for the next request.",
+                  "pm.test('returned at least one party', function () {",
+                  "    pm.expect(pm.response.code).to.eql(200);",
+                  "    const arr = pm.response.json();",
+                  "    pm.expect(arr).to.be.an('array').that.is.not.empty;",
+                  "    pm.environment.set('party_id', arr[0].id);",
+                  "    console.log('captured party_id =', arr[0].id);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. MSISDN → Product → Customer.id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/product-inventory/4.64/products?query=publicIdentifier=={{msisdn}}&fields=*&size=20",
+              "host": ["{{base_url}}"],
+              "path": ["product-inventory", "4.64", "products"],
+              "query": [
+                { "key": "query", "value": "publicIdentifier=={{msisdn}}" },
+                { "key": "fields", "value": "*" },
+                { "key": "size", "value": "20" }
+              ]
+            },
+            "description": "Step 1 of the MSISDN→Customer flow. Captures the first `accounts[type=customer].id` into `{{customer_id}}` for the next step.\n\nSet the next request to **Get customer by id** to complete the chain."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Capture the first customer account id into the environment.",
+                  "pm.test('returned at least one product with a customer account', function () {",
+                  "    pm.expect(pm.response.code).to.eql(200);",
+                  "    const products = pm.response.json();",
+                  "    pm.expect(products).to.be.an('array').that.is.not.empty;",
+                  "    for (const p of products) {",
+                  "        for (const a of (p.accounts || [])) {",
+                  "            if (a.accountType === 'customer' && a.id) {",
+                  "                pm.environment.set('customer_id', a.id);",
+                  "                console.log('captured customer_id =', a.id);",
+                  "                return;",
+                  "            }",
+                  "        }",
+                  "    }",
+                  "    pm.expect.fail('no customer-typed account on any product');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
