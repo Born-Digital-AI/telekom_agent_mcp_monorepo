@@ -165,7 +165,7 @@ Empty cell = that customer has no value of that kind in DPS.
 | Creditinfo Slovakia, S.R.O. _(B2B)_ | — | — | — | — | `2300000400` | `2300000404`, `2300000401`, `2300000405`, `2300000406` | — | — |
 | J A L & Š, S. R. O. _(B2B)_ | — | — | — | — | `4108064300` | `4108064301`, `4108064302` | — | — |
 
-Notes:
+Notes:V
 
 - `kod_zakaznika` ending in **`0`** is the Customer ID; ending in **`1–9`** is a Billing Account ID (also the value to use as `kod_adresata` in `autentifikacia`).
 - "Tester AT NECHYTAT" RČ and OP return **multi-match** because the DPS test environment contains ~450 duplicate records under that identifier.
