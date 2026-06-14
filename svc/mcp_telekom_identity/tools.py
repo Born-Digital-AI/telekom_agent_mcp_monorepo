@@ -21,9 +21,12 @@ import logging
 import os
 import re
 import threading
+import time
 import unicodedata
 import urllib.error
 import urllib.request
+
+import httpx
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -138,37 +141,13 @@ _NLP_TIMEOUT_SECONDS = 1.0
 
 
 def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
-    """Mirror locally + fire-and-forget PUT to the NLP engine state endpoint.
-
-    Daemon thread + 1-second timeout. Errors logged at WARNING, never raised.
-    """
+    """Mirror named_entities locally. Call _nlp_flush() to push to NLP engine."""
     if not conversation_id:
         return
-
-    # Mirror locally so we can read these entries back without a real NLP GET.
     current = _NLP_MIRROR_STATE.get(conversation_id) or {}
-    # Coerce to str for downstream consumers; named_entities only carries scalars.
+    # Coerce to str; named_entities only carries scalars.
     current.update({k: str(v) for k, v in named_entities.items()})
     _NLP_MIRROR_STATE.set(conversation_id, current)
-
-    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
-    payload = {"named_entities": named_entities}
-    body = json.dumps(payload, ensure_ascii=False).encode()
-
-    def _do() -> None:
-        req = urllib.request.Request(
-            url, data=body, method="PUT", headers={"Content-Type": "application/json"}
-        )
-        _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
-        try:
-            with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
-                _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
-        except urllib.error.HTTPError as exc:
-            _log.warning("NLP state PUT %s -> HTTP %s", url, exc.code)
-        except Exception as exc:
-            _log.warning("NLP state PUT %s -> error: %s", url, exc)
-
-    threading.Thread(target=_do, daemon=True, name="nlp-state-put-identity").start()
 
 
 def _nlp_get_named_entities(conversation_id: str) -> dict[str, str]:
@@ -176,6 +155,85 @@ def _nlp_get_named_entities(conversation_id: str) -> dict[str, str]:
     if not conversation_id:
         return {}
     return _NLP_MIRROR_STATE.get(conversation_id) or {}
+
+
+async def _nlp_load(conversation_id: str) -> None:
+    """Populate local mirror from NLP engine if not already cached.
+
+    Falls back gracefully — 400/404 (no session) and network errors are logged
+    at DEBUG/WARNING and do not raise. Empty mirror after both sources is fine.
+    """
+    if not conversation_id:
+        return
+    if _NLP_MIRROR_STATE.get(conversation_id):
+        return  # already warm
+
+    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/named_entities"
+    try:
+        async with httpx.AsyncClient(timeout=_NLP_TIMEOUT_SECONDS) as http:
+            resp = await http.get(url)
+        if resp.status_code == 200:
+            entities = {
+                k: str(v)
+                for k, v in (resp.json().get("named_entities") or {}).items()
+            }
+            if entities:
+                _NLP_MIRROR_STATE.set(conversation_id, entities)
+                _log.info("NLP GET named_entities %s -> loaded %d entities", url, len(entities))
+        elif resp.status_code in (400, 404):
+            _log.debug("NLP GET named_entities %s -> %s (no session)", url, resp.status_code)
+        else:
+            _log.warning("NLP GET named_entities %s -> %s", url, resp.status_code)
+    except Exception as exc:
+        _log.warning("NLP GET named_entities %s -> error: %s", url, exc)
+
+
+def _nlp_flush(conversation_id: str) -> None:
+    """Fire-and-forget PUT of current mirror state to NLP engine.
+
+    Retries up to 3 times on 429, honouring the Retry-After header.
+    Errors are logged at WARNING and never raised.
+    """
+    if not conversation_id:
+        return
+    entities = _NLP_MIRROR_STATE.get(conversation_id)
+    if not entities:
+        return
+
+    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
+    payload = {"named_entities": entities}
+    body = json.dumps(payload, ensure_ascii=False).encode()
+
+    def _do() -> None:
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            req = urllib.request.Request(
+                url, data=body, method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
+            try:
+                with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
+                    _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
+                    return
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < max_retries:
+                    retry_after = float(
+                        exc.headers.get("Retry-After") or exc.headers.get("retry-after") or "1"
+                    )
+                    _log.warning(
+                        "NLP state PUT %s -> 429, retry in %.1fs (%d/%d)",
+                        url, retry_after, attempt, max_retries,
+                    )
+                    time.sleep(retry_after)
+                else:
+                    _log.warning("NLP state PUT %s -> HTTP %s", url, exc.code)
+                    return
+            except Exception as exc:
+                _log.warning("NLP state PUT %s -> error: %s", url, exc)
+                return
+
+    threading.Thread(target=_do, daemon=True, name="nlp-state-put-identity").start()
 
 
 # "Kód zákazníka" or "Kód účtu" — numeric code 8-12 digits, no separators.
@@ -938,6 +996,7 @@ def register(
             }
         )
 
+    @mcp_tool(name="identifikacia_rodne_cislo", description=_RC_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_rodne_cislo(
         rodne_cislo: Annotated[
             str,
@@ -945,19 +1004,24 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        value = (rodne_cislo or "").strip()
-        if not _RC_PATTERN.fullmatch(value):
-            return _json({"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE})
         conv = (_meta or {}).get("conversation_id", "")
-        return await _identify_and_respond(
-            identification_id=value,
-            identification_type="socialSecurityNumber",
-            not_found_message=_RC_NOT_FOUND_MESSAGE,
-            conversation_id=conv,
-            log_id_tag="rc_last4",
-            method="rodne_cislo",
-        )
+        await _nlp_load(conv)
+        try:
+            value = (rodne_cislo or "").strip()
+            if not _RC_PATTERN.fullmatch(value):
+                return _json({"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE})
+            return await _identify_and_respond(
+                identification_id=value,
+                identification_type="socialSecurityNumber",
+                not_found_message=_RC_NOT_FOUND_MESSAGE,
+                conversation_id=conv,
+                log_id_tag="rc_last4",
+                method="rodne_cislo",
+            )
+        finally:
+            _nlp_flush(conv)
 
+    @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_op(
         cislo_op: Annotated[
             str,
@@ -967,19 +1031,24 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        value = _OP_NORMALIZE_RE.sub("", cislo_op or "").upper()
-        if not _OP_PATTERN.fullmatch(value):
-            return _json({"found": False, "error": "invalid_input", "message": _OP_INVALID_MESSAGE})
         conv = (_meta or {}).get("conversation_id", "")
-        return await _identify_and_respond(
-            identification_id=value,
-            identification_type="nationalIdentityCard",
-            not_found_message=_OP_NOT_FOUND_MESSAGE,
-            conversation_id=conv,
-            log_id_tag="op_last4",
-            method="op",
-        )
+        await _nlp_load(conv)
+        try:
+            value = _OP_NORMALIZE_RE.sub("", cislo_op or "").upper()
+            if not _OP_PATTERN.fullmatch(value):
+                return _json({"found": False, "error": "invalid_input", "message": _OP_INVALID_MESSAGE})
+            return await _identify_and_respond(
+                identification_id=value,
+                identification_type="nationalIdentityCard",
+                not_found_message=_OP_NOT_FOUND_MESSAGE,
+                conversation_id=conv,
+                log_id_tag="op_last4",
+                method="op",
+            )
+        finally:
+            _nlp_flush(conv)
 
+    @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_pas(
         cislo_pasu: Annotated[
             str,
@@ -987,20 +1056,24 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        value = (cislo_pasu or "").strip().upper()
-        if not _PAS_PATTERN.fullmatch(value):
-            return _json(
-                {"found": False, "error": "invalid_input", "message": _PAS_INVALID_MESSAGE}
-            )
         conv = (_meta or {}).get("conversation_id", "")
-        return await _identify_and_respond(
-            identification_id=value,
-            identification_type="passport",
-            not_found_message=_PAS_NOT_FOUND_MESSAGE,
-            conversation_id=conv,
-            log_id_tag="pas_last4",
-            method="pas",
-        )
+        await _nlp_load(conv)
+        try:
+            value = (cislo_pasu or "").strip().upper()
+            if not _PAS_PATTERN.fullmatch(value):
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _PAS_INVALID_MESSAGE}
+                )
+            return await _identify_and_respond(
+                identification_id=value,
+                identification_type="passport",
+                not_found_message=_PAS_NOT_FOUND_MESSAGE,
+                conversation_id=conv,
+                log_id_tag="pas_last4",
+                method="pas",
+            )
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(name="identifikacia_ico", description=_ICO_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_ico(
@@ -1010,20 +1083,24 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        value = (ico or "").strip()
-        if not _ICO_PATTERN.fullmatch(value):
-            return _json(
-                {"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE}
-            )
         conv = (_meta or {}).get("conversation_id", "")
-        return await _identify_and_respond(
-            identification_id=value,
-            identification_type="subjectRegistrationId",
-            not_found_message=_ICO_NOT_FOUND_MESSAGE,
-            conversation_id=conv,
-            log_id_tag="ico_last4",
-            method="ico",
-        )
+        await _nlp_load(conv)
+        try:
+            value = (ico or "").strip()
+            if not _ICO_PATTERN.fullmatch(value):
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE}
+                )
+            return await _identify_and_respond(
+                identification_id=value,
+                identification_type="subjectRegistrationId",
+                not_found_message=_ICO_NOT_FOUND_MESSAGE,
+                conversation_id=conv,
+                log_id_tag="ico_last4",
+                method="ico",
+            )
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(
         name="identifikacia_kod_zakaznika", description=_KOD_TOOL_DESCRIPTION, registry=registry
@@ -1037,51 +1114,55 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        value = (kod_zakaznika or "").strip()
-        if not _KOD_PATTERN.fullmatch(value):
-            return _json(
-                {"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE}
-            )
-
         conv = (_meta or {}).get("conversation_id", "")
-        _log.info("identifikacia_kod_zakaznika called code_suffix=%s conv=%s", value[-1], conv)
-
+        await _nlp_load(conv)
         try:
-            if value.endswith("0"):
-                customer = await client.get_customer_by_id(value)
-            else:
-                ba = await client.get_billing_account_by_id(value)
-                if ba is None:
-                    customer = None
+            value = (kod_zakaznika or "").strip()
+            if not _KOD_PATTERN.fullmatch(value):
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE}
+                )
+
+            _log.info("identifikacia_kod_zakaznika called code_suffix=%s conv=%s", value[-1], conv)
+
+            try:
+                if value.endswith("0"):
+                    customer = await client.get_customer_by_id(value)
                 else:
-                    cust_id = (ba.get("customer") or {}).get("id")
-                    if not isinstance(cust_id, str):
-                        _log.warning(
-                            "billing account %s has no customer.id — treating as not_found", value
-                        )
+                    ba = await client.get_billing_account_by_id(value)
+                    if ba is None:
                         customer = None
                     else:
-                        customer = await client.get_customer_by_id(cust_id)
-        except DPSError as exc:
-            _log.warning("identifikacia_kod_zakaznika failed: %s", exc)
-            return _json(_dps_error_payload(exc))
+                        cust_id = (ba.get("customer") or {}).get("id")
+                        if not isinstance(cust_id, str):
+                            _log.warning(
+                                "billing account %s has no customer.id — treating as not_found", value
+                            )
+                            customer = None
+                        else:
+                            customer = await client.get_customer_by_id(cust_id)
+            except DPSError as exc:
+                _log.warning("identifikacia_kod_zakaznika failed: %s", exc)
+                return _json(_dps_error_payload(exc))
 
-        if customer is None:
-            return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
+            if customer is None:
+                return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
 
-        candidate = _candidate_from_customer(customer)
-        if not candidate.get("name"):
-            # Defensive: the Customer record exists but has no usable name field
-            return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
+            candidate = _candidate_from_customer(customer)
+            if not candidate.get("name"):
+                # Defensive: the Customer record exists but has no usable name field
+                return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
 
-        _persist_identification(
-            conversation_id=conv,
-            method="kod_zakaznika",
-            value=value,
-            candidates=[candidate],
-        )
+            _persist_identification(
+                conversation_id=conv,
+                method="kod_zakaznika",
+                value=value,
+                candidates=[candidate],
+            )
 
-        return _json({"found": True, "name": candidate["name"]})
+            return _json({"found": True, "name": candidate["name"]})
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(name="identifikacia_telefon", description=_TEL_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_telefon(
@@ -1091,91 +1172,95 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        normalized = _normalize_msisdn(telefon or "")
-        if not normalized:
-            return _json(
-                {"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE}
-            )
-
         conv = (_meta or {}).get("conversation_id", "")
-        _log.info("identifikacia_telefon called msisdn_last4=%s conv=%s", normalized[-4:], conv)
-
+        await _nlp_load(conv)
         try:
-            products = await client.get_products_by_public_identifier(normalized)
-        except DPSError as exc:
-            _log.warning("identifikacia_telefon product lookup failed: %s", exc)
-            return _json(_dps_error_payload(exc))
+            normalized = _normalize_msisdn(telefon or "")
+            if not normalized:
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE}
+                )
 
-        if not products:
-            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+            _log.info("identifikacia_telefon called msisdn_last4=%s conv=%s", normalized[-4:], conv)
 
-        # Extract unique customer ids from returned products
-        customer_ids: list[str] = []
-        seen: set[str] = set()
-        for p in products:
-            cid = (p.get("customer") or {}).get("id")
-            if isinstance(cid, str) and cid not in seen:
-                seen.add(cid)
-                customer_ids.append(cid)
+            try:
+                products = await client.get_products_by_public_identifier(normalized)
+            except DPSError as exc:
+                _log.warning("identifikacia_telefon product lookup failed: %s", exc)
+                return _json(_dps_error_payload(exc))
 
-        if not customer_ids:
-            _log.warning("identifikacia_telefon: products returned but no customer.id linkage")
-            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+            if not products:
+                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
 
-        # Fetch each unique customer
-        try:
-            customers_raw = await asyncio.gather(
-                *(client.get_customer_by_id(cid) for cid in customer_ids)
+            # Extract unique customer ids from returned products
+            customer_ids: list[str] = []
+            seen: set[str] = set()
+            for p in products:
+                cid = (p.get("customer") or {}).get("id")
+                if isinstance(cid, str) and cid not in seen:
+                    seen.add(cid)
+                    customer_ids.append(cid)
+
+            if not customer_ids:
+                _log.warning("identifikacia_telefon: products returned but no customer.id linkage")
+                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+            # Fetch each unique customer
+            try:
+                customers_raw = await asyncio.gather(
+                    *(client.get_customer_by_id(cid) for cid in customer_ids)
+                )
+            except DPSError as exc:
+                _log.warning("identifikacia_telefon customer fanout failed: %s", exc)
+                return _json(_dps_error_payload(exc))
+
+            customers = [c for c in customers_raw if c is not None]
+            if not customers:
+                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+            candidates = [_candidate_from_customer(c) for c in customers]
+            candidates = [c for c in candidates if c.get("name")]
+            if not candidates:
+                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+            # The queried MSISDN matched the customer's Product.publicIdentifier — that is a
+            # verified mobile contact for this customer. Inject it into candidate.contacts so
+            # the auth tool's `trusted_source` factor can match against it without an extra
+            # Party fetch.
+            for cand in candidates:
+                existing = list(cand.get("contacts") or [])
+                if not any(
+                    ct.get("type") == "mobile"
+                    and _normalize_msisdn(ct.get("value") or "") == normalized
+                    for ct in existing
+                ):
+                    existing.append({"type": "mobile", "value": normalized})
+                    cand["contacts"] = existing
+
+            _persist_identification(
+                conversation_id=conv,
+                method="telefon",
+                value=normalized,
+                candidates=candidates,
             )
-        except DPSError as exc:
-            _log.warning("identifikacia_telefon customer fanout failed: %s", exc)
-            return _json(_dps_error_payload(exc))
 
-        customers = [c for c in customers_raw if c is not None]
-        if not customers:
-            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+            if len(candidates) == 1:
+                return _json({"found": True, "name": candidates[0]["name"]})
 
-        candidates = [_candidate_from_customer(c) for c in customers]
-        candidates = [c for c in candidates if c.get("name")]
-        if not candidates:
-            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
-
-        # The queried MSISDN matched the customer's Product.publicIdentifier — that is a
-        # verified mobile contact for this customer. Inject it into candidate.contacts so
-        # the auth tool's `trusted_source` factor can match against it without an extra
-        # Party fetch.
-        for cand in candidates:
-            existing = list(cand.get("contacts") or [])
-            if not any(
-                ct.get("type") == "mobile"
-                and _normalize_msisdn(ct.get("value") or "") == normalized
-                for ct in existing
-            ):
-                existing.append({"type": "mobile", "value": normalized})
-                cand["contacts"] = existing
-
-        _persist_identification(
-            conversation_id=conv,
-            method="telefon",
-            value=normalized,
-            candidates=candidates,
-        )
-
-        if len(candidates) == 1:
-            return _json({"found": True, "name": candidates[0]["name"]})
-
-        names = sorted({c["name"] for c in candidates if c["name"]})
-        return _json(
-            {
-                "found": True,
-                "multiple_matches": True,
-                "names": names,
-                "message": (
-                    "Pre toto telefónne číslo som našla viacero záznamov. "
-                    "Bude potrebné si vyžiadať dodatočné údaje."
-                ),
-            }
-        )
+            names = sorted({c["name"] for c in candidates if c["name"]})
+            return _json(
+                {
+                    "found": True,
+                    "multiple_matches": True,
+                    "names": names,
+                    "message": (
+                        "Pre toto telefónne číslo som našla viacero záznamov. "
+                        "Bude potrebné si vyžiadať dodatočné údaje."
+                    ),
+                }
+            )
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(
         name="identifikacia_seriove_cislo", description=_SERIAL_TOOL_DESCRIPTION, registry=registry
@@ -1189,88 +1274,92 @@ def register(
         ],
         _meta: dict[str, Any] | None = None,
     ) -> str:
-        normalized = _normalize_serial(seriove_cislo or "")
-        if not normalized:
-            return _json(
-                {"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE}
-            )
-
         conv = (_meta or {}).get("conversation_id", "")
-        _log.info(
-            "identifikacia_seriove_cislo called serial_last4=%s conv=%s", normalized[-4:], conv
-        )
-
+        await _nlp_load(conv)
         try:
-            products = await client.get_products_by_serial_number(normalized)
-        except DPSError as exc:
-            _log.warning("identifikacia_seriove_cislo product lookup failed: %s", exc)
-            return _json(_dps_error_payload(exc))
+            normalized = _normalize_serial(seriove_cislo or "")
+            if not normalized:
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE}
+                )
 
-        if not products:
+            _log.info(
+                "identifikacia_seriove_cislo called serial_last4=%s conv=%s", normalized[-4:], conv
+            )
+
+            try:
+                products = await client.get_products_by_serial_number(normalized)
+            except DPSError as exc:
+                _log.warning("identifikacia_seriove_cislo product lookup failed: %s", exc)
+                return _json(_dps_error_payload(exc))
+
+            if not products:
+                return _json(
+                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+                )
+
+            # Extract unique customer ids
+            customer_ids: list[str] = []
+            seen: set[str] = set()
+            for p in products:
+                cid = (p.get("customer") or {}).get("id")
+                if isinstance(cid, str) and cid not in seen:
+                    seen.add(cid)
+                    customer_ids.append(cid)
+
+            if not customer_ids:
+                _log.warning(
+                    "identifikacia_seriove_cislo: products returned but no customer.id linkage"
+                )
+                return _json(
+                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+                )
+
+            try:
+                customers_raw = await asyncio.gather(
+                    *(client.get_customer_by_id(cid) for cid in customer_ids)
+                )
+            except DPSError as exc:
+                _log.warning("identifikacia_seriove_cislo customer fanout failed: %s", exc)
+                return _json(_dps_error_payload(exc))
+
+            customers = [c for c in customers_raw if c is not None]
+            if not customers:
+                return _json(
+                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+                )
+
+            candidates = [_candidate_from_customer(c) for c in customers]
+            candidates = [c for c in candidates if c.get("name")]
+            if not candidates:
+                return _json(
+                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+                )
+
+            _persist_identification(
+                conversation_id=conv,
+                method="seriove_cislo",
+                value=normalized,
+                candidates=candidates,
+            )
+
+            if len(candidates) == 1:
+                return _json({"found": True, "name": candidates[0]["name"]})
+
+            names = sorted({c["name"] for c in candidates if c["name"]})
             return _json(
-                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+                {
+                    "found": True,
+                    "multiple_matches": True,
+                    "names": names,
+                    "message": (
+                        "Pre toto sériové číslo som našla viacero záznamov. "
+                        "Bude potrebné si vyžiadať dodatočné údaje."
+                    ),
+                }
             )
-
-        # Extract unique customer ids
-        customer_ids: list[str] = []
-        seen: set[str] = set()
-        for p in products:
-            cid = (p.get("customer") or {}).get("id")
-            if isinstance(cid, str) and cid not in seen:
-                seen.add(cid)
-                customer_ids.append(cid)
-
-        if not customer_ids:
-            _log.warning(
-                "identifikacia_seriove_cislo: products returned but no customer.id linkage"
-            )
-            return _json(
-                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-            )
-
-        try:
-            customers_raw = await asyncio.gather(
-                *(client.get_customer_by_id(cid) for cid in customer_ids)
-            )
-        except DPSError as exc:
-            _log.warning("identifikacia_seriove_cislo customer fanout failed: %s", exc)
-            return _json(_dps_error_payload(exc))
-
-        customers = [c for c in customers_raw if c is not None]
-        if not customers:
-            return _json(
-                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-            )
-
-        candidates = [_candidate_from_customer(c) for c in customers]
-        candidates = [c for c in candidates if c.get("name")]
-        if not candidates:
-            return _json(
-                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-            )
-
-        _persist_identification(
-            conversation_id=conv,
-            method="seriove_cislo",
-            value=normalized,
-            candidates=candidates,
-        )
-
-        if len(candidates) == 1:
-            return _json({"found": True, "name": candidates[0]["name"]})
-
-        names = sorted({c["name"] for c in candidates if c["name"]})
-        return _json(
-            {
-                "found": True,
-                "multiple_matches": True,
-                "names": names,
-                "message": (
-                    "Pre toto sériové číslo som našla viacero záznamov. "
-                    "Bude potrebné si vyžiadať dodatočné údaje."
-                ),
-            }
-        )
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(name="autentifikacia", description=_AUTH_TOOL_DESCRIPTION, registry=registry)
     async def autentifikacia(
@@ -1306,273 +1395,277 @@ def register(
                 }
             )
 
-        # Step 1: identification must exist
-        identity = _IDENTITY_STATE.get(conv)
-        if not identity:
-            return _json(
-                {
-                    "authenticated": False,
-                    "error": "identification_required",
-                    "suggested_response": (
-                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
-                        "kód zákazníka alebo telefónne číslo?"
-                    ),
-                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
-                }
-            )
-
-        candidates = identity.get("candidates") or []
-        if not candidates:
-            return _json(
-                {
-                    "authenticated": False,
-                    "error": "identification_required",
-                    "suggested_response": (
-                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
-                        "kód zákazníka alebo telefónne číslo?"
-                    ),
-                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
-                }
-            )
-
-        # If multi-match identification, can't authenticate against ambiguous candidate
-        if len(candidates) > 1:
-            return _json(
-                {
-                    "authenticated": False,
-                    "error": "ambiguous_identification",
-                    "suggested_response": (
-                        "Z identifikácie máme viacero záznamov, potrebujeme jednoznačnú identifikáciu pred overením."
-                    ),
-                    "instruction": "Zaveď zákazníka cez presnejší identifikačný údaj.",
-                }
-            )
-
-        candidate = candidates[0]
-        identification_method = identity.get("identification_method") or ""
-        identification_value = identity.get("identification_value") or ""
-
-        # Step 2: load or init auth state
-        state = _AUTH_STATE.get(conv) or {
-            "factors_satisfied": set(),
-            "factors_failed": set(),
-            "factors_skipped": set(),
-            "factors_attempts": {},
-            "authenticated_standard": False,
-            "authenticated_sensitive": False,
-        }
-        # Convert lists from cached dict back to sets (TTLStore stores whatever we put in)
-        for key in ("factors_satisfied", "factors_failed", "factors_skipped"):
-            if isinstance(state.get(key), list):
-                state[key] = set(state[key])
-
-        # Step 3: read NLP mirror
-        nlp = _nlp_get_named_entities(conv)
-        input_source = nlp.get("input_source", "")
-        auth_type = nlp.get("authentication_type") or _AUTH_TYPE_STANDARD
-        if auth_type not in (_AUTH_TYPE_STANDARD, _AUTH_TYPE_SENSITIVE):
-            auth_type = _AUTH_TYPE_STANDARD
-
-        # Step 4: auto-credit factors (recompute every call — input_source may arrive late)
-        credited = _credited_factors_from_identification(
-            identification_method,
-            identification_value,
-            candidate.get("contacts") or [],
-            input_source,
-        )
-        state["factors_satisfied"] |= credited
-
-        blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
-
-        # Auto-skip trusted_source if input_source is missing (nothing the caller can do).
-        # This must happen before out-of-order checks so that factor 2 is the first "expected".
-        if (
-            _FACTOR_TRUSTED_SOURCE not in state["factors_satisfied"]
-            and _FACTOR_TRUSTED_SOURCE not in blocked
-            and not input_source
-        ):
-            state["factors_skipped"].add(_FACTOR_TRUSTED_SOURCE)
-            blocked = (
-                state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
-            )
-
-        expected = _next_factor(blocked)
-
-        # Step 5: process user-provided input (one factor per call)
-        provided: list[tuple[str, str]] = []
-        if meno_priezvisko is not None:
-            provided.append((_FACTOR_NAME, meno_priezvisko))
-        if kod_adresata is not None:
-            provided.append((_FACTOR_KOD_ADRESATA, kod_adresata))
-        if rc_last4 is not None:
-            provided.append((_FACTOR_RC_LAST4, rc_last4))
-
-        if len(provided) > 1:
-            return _json(
-                {
-                    "authenticated": False,
-                    "error": "multiple_factors_in_call",
-                    "suggested_response": "Vyskytol sa technický problém. Prepojím vás na operátora.",
-                    "instruction": "Pošli vždy len jeden faktor naraz.",
-                }
-            )
-
-        if provided:
-            factor, value = provided[0]
-            if expected != factor:
+        await _nlp_load(conv)
+        try:
+            # Step 1: identification must exist
+            identity = _IDENTITY_STATE.get(conv)
+            if not identity:
                 return _json(
                     {
                         "authenticated": False,
-                        "error": "out_of_order",
-                        "expected_factor": expected,
-                        "suggested_response": _suggested_response_for_factor(expected)
-                        if expected
-                        else "Pre opätovné vyhodnotenie zavolaj autentifikacia.",
-                        "instruction": _instruction_for_factor(expected)
-                        if expected
-                        else "Zavolaj autentifikacia bez parametrov.",
+                        "error": "identification_required",
+                        "suggested_response": (
+                            "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                            "kód zákazníka alebo telefónne číslo?"
+                        ),
+                        "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
                     }
                 )
-            # Verify
-            ok = False
-            if factor == _FACTOR_NAME:
-                ok = _check_name(value, candidate.get("name"))
-            elif factor == _FACTOR_KOD_ADRESATA:
-                ok = _check_kod_adresata(value, candidate.get("billing_account_ids") or [])
-            elif factor == _FACTOR_RC_LAST4:
-                rc4 = candidate.get("auth_rc_last4")
-                if rc4 is None:
-                    # Lazy-fetch Party to get RČ last4 (identified via customer-only path)
-                    party_id = candidate.get("party_id")
-                    if isinstance(party_id, str) and party_id:
-                        try:
-                            party = await client.get_party_by_id(party_id)
-                        except DPSError as exc:
-                            _log.warning("autentifikacia: party fetch failed for rc check: %s", exc)
-                            return _json(_dps_error_payload(exc))
-                        if party is not None:
-                            rc4 = _extract_rc_last4_from_party(party)
-                            if rc4:
-                                candidate["auth_rc_last4"] = rc4
-                                # Write back the enriched candidate to identity cache
-                                _IDENTITY_STATE.set(conv, identity)
-                ok = _check_rc_last4(value, rc4)
 
-            attempts_map = state["factors_attempts"]
-            if ok:
-                state["factors_satisfied"].add(factor)
-                attempts_map.pop(factor, None)
-            else:
-                attempts_map[factor] = attempts_map.get(factor, 0) + 1
-                if attempts_map[factor] >= _MAX_AUTH_ATTEMPTS_PER_FACTOR:
-                    state["factors_failed"].add(factor)
-                    _persist_auth_state(conv, state)
-                    _log.warning(
-                        "auth factor=%s failed after %d attempts conv=%s",
-                        factor,
-                        attempts_map[factor],
-                        conv,
-                    )
-                    # Fall through to recompute next step
-                else:
-                    remaining = _MAX_AUTH_ATTEMPTS_PER_FACTOR - attempts_map[factor]
-                    _persist_auth_state(conv, state)
+            candidates = identity.get("candidates") or []
+            if not candidates:
+                return _json(
+                    {
+                        "authenticated": False,
+                        "error": "identification_required",
+                        "suggested_response": (
+                            "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                            "kód zákazníka alebo telefónne číslo?"
+                        ),
+                        "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                    }
+                )
+
+            # If multi-match identification, can't authenticate against ambiguous candidate
+            if len(candidates) > 1:
+                return _json(
+                    {
+                        "authenticated": False,
+                        "error": "ambiguous_identification",
+                        "suggested_response": (
+                            "Z identifikácie máme viacero záznamov, potrebujeme jednoznačnú identifikáciu pred overením."
+                        ),
+                        "instruction": "Zaveď zákazníka cez presnejší identifikačný údaj.",
+                    }
+                )
+
+            candidate = candidates[0]
+            identification_method = identity.get("identification_method") or ""
+            identification_value = identity.get("identification_value") or ""
+
+            # Step 2: load or init auth state
+            state = _AUTH_STATE.get(conv) or {
+                "factors_satisfied": set(),
+                "factors_failed": set(),
+                "factors_skipped": set(),
+                "factors_attempts": {},
+                "authenticated_standard": False,
+                "authenticated_sensitive": False,
+            }
+            # Convert lists from cached dict back to sets (TTLStore stores whatever we put in)
+            for key in ("factors_satisfied", "factors_failed", "factors_skipped"):
+                if isinstance(state.get(key), list):
+                    state[key] = set(state[key])
+
+            # Step 3: read NLP mirror
+            nlp = _nlp_get_named_entities(conv)
+            input_source = nlp.get("input_source", "")
+            auth_type = nlp.get("authentication_type") or _AUTH_TYPE_STANDARD
+            if auth_type not in (_AUTH_TYPE_STANDARD, _AUTH_TYPE_SENSITIVE):
+                auth_type = _AUTH_TYPE_STANDARD
+
+            # Step 4: auto-credit factors (recompute every call — input_source may arrive late)
+            credited = _credited_factors_from_identification(
+                identification_method,
+                identification_value,
+                candidate.get("contacts") or [],
+                input_source,
+            )
+            state["factors_satisfied"] |= credited
+
+            blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+
+            # Auto-skip trusted_source if input_source is missing (nothing the caller can do).
+            # This must happen before out-of-order checks so that factor 2 is the first "expected".
+            if (
+                _FACTOR_TRUSTED_SOURCE not in state["factors_satisfied"]
+                and _FACTOR_TRUSTED_SOURCE not in blocked
+                and not input_source
+            ):
+                state["factors_skipped"].add(_FACTOR_TRUSTED_SOURCE)
+                blocked = (
+                    state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+                )
+
+            expected = _next_factor(blocked)
+
+            # Step 5: process user-provided input (one factor per call)
+            provided: list[tuple[str, str]] = []
+            if meno_priezvisko is not None:
+                provided.append((_FACTOR_NAME, meno_priezvisko))
+            if kod_adresata is not None:
+                provided.append((_FACTOR_KOD_ADRESATA, kod_adresata))
+            if rc_last4 is not None:
+                provided.append((_FACTOR_RC_LAST4, rc_last4))
+
+            if len(provided) > 1:
+                return _json(
+                    {
+                        "authenticated": False,
+                        "error": "multiple_factors_in_call",
+                        "suggested_response": "Vyskytol sa technický problém. Prepojím vás na operátora.",
+                        "instruction": "Pošli vždy len jeden faktor naraz.",
+                    }
+                )
+
+            if provided:
+                factor, value = provided[0]
+                if expected != factor:
                     return _json(
                         {
                             "authenticated": False,
-                            "factor_failed": factor,
-                            "attempts_remaining": remaining,
-                            "suggested_response": (
-                                f"Tento údaj sa nezhoduje. Skúste, prosím, znova. "
-                                f"Zostáva vám {'ešte jeden pokus' if remaining == 1 else f'{remaining} pokusy'}."
-                            ),
-                            "instruction": _instruction_for_factor(factor),
+                            "error": "out_of_order",
+                            "expected_factor": expected,
+                            "suggested_response": _suggested_response_for_factor(expected)
+                            if expected
+                            else "Pre opätovné vyhodnotenie zavolaj autentifikacia.",
+                            "instruction": _instruction_for_factor(expected)
+                            if expected
+                            else "Zavolaj autentifikacia bez parametrov.",
                         }
                     )
+                # Verify
+                ok = False
+                if factor == _FACTOR_NAME:
+                    ok = _check_name(value, candidate.get("name"))
+                elif factor == _FACTOR_KOD_ADRESATA:
+                    ok = _check_kod_adresata(value, candidate.get("billing_account_ids") or [])
+                elif factor == _FACTOR_RC_LAST4:
+                    rc4 = candidate.get("auth_rc_last4")
+                    if rc4 is None:
+                        # Lazy-fetch Party to get RČ last4 (identified via customer-only path)
+                        party_id = candidate.get("party_id")
+                        if isinstance(party_id, str) and party_id:
+                            try:
+                                party = await client.get_party_by_id(party_id)
+                            except DPSError as exc:
+                                _log.warning("autentifikacia: party fetch failed for rc check: %s", exc)
+                                return _json(_dps_error_payload(exc))
+                            if party is not None:
+                                rc4 = _extract_rc_last4_from_party(party)
+                                if rc4:
+                                    candidate["auth_rc_last4"] = rc4
+                                    # Write back the enriched candidate to identity cache
+                                    _IDENTITY_STATE.set(conv, identity)
+                    ok = _check_rc_last4(value, rc4)
 
-        # Step 6: skip current factor if requested
-        if skip_current_factor and expected and expected != _FACTOR_TRUSTED_SOURCE:
-            state["factors_skipped"].add(expected)
+                attempts_map = state["factors_attempts"]
+                if ok:
+                    state["factors_satisfied"].add(factor)
+                    attempts_map.pop(factor, None)
+                else:
+                    attempts_map[factor] = attempts_map.get(factor, 0) + 1
+                    if attempts_map[factor] >= _MAX_AUTH_ATTEMPTS_PER_FACTOR:
+                        state["factors_failed"].add(factor)
+                        _persist_auth_state(conv, state)
+                        _log.warning(
+                            "auth factor=%s failed after %d attempts conv=%s",
+                            factor,
+                            attempts_map[factor],
+                            conv,
+                        )
+                        # Fall through to recompute next step
+                    else:
+                        remaining = _MAX_AUTH_ATTEMPTS_PER_FACTOR - attempts_map[factor]
+                        _persist_auth_state(conv, state)
+                        return _json(
+                            {
+                                "authenticated": False,
+                                "factor_failed": factor,
+                                "attempts_remaining": remaining,
+                                "suggested_response": (
+                                    f"Tento údaj sa nezhoduje. Skúste, prosím, znova. "
+                                    f"Zostáva vám {'ešte jeden pokus' if remaining == 1 else f'{remaining} pokusy'}."
+                                ),
+                                "instruction": _instruction_for_factor(factor),
+                            }
+                        )
 
-        blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            # Step 6: skip current factor if requested
+            if skip_current_factor and expected and expected != _FACTOR_TRUSTED_SOURCE:
+                state["factors_skipped"].add(expected)
 
-        # Step 7: check if we have enough
-        required = _required_factors(auth_type)
-        satisfied_count = len(state["factors_satisfied"])
+            blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
 
-        if satisfied_count >= required:
-            state["authenticated_standard"] = True
-            if satisfied_count >= 3 or auth_type == _AUTH_TYPE_SENSITIVE:
-                state["authenticated_sensitive"] = satisfied_count >= 3
+            # Step 7: check if we have enough
+            required = _required_factors(auth_type)
+            satisfied_count = len(state["factors_satisfied"])
+
+            if satisfied_count >= required:
+                state["authenticated_standard"] = True
+                if satisfied_count >= 3 or auth_type == _AUTH_TYPE_SENSITIVE:
+                    state["authenticated_sensitive"] = satisfied_count >= 3
+                _persist_auth_state(conv, state)
+                level = (
+                    _AUTH_TYPE_SENSITIVE if state["authenticated_sensitive"] else _AUTH_TYPE_STANDARD
+                )
+                _nlp_set_state(
+                    conv,
+                    {
+                        "authenticated_standard": "true",
+                        "authenticated_sensitive": "true"
+                        if state["authenticated_sensitive"]
+                        else "false",
+                        "authentication_level": level,
+                    },
+                )
+                return _json(
+                    {
+                        "authenticated": True,
+                        "level": level,
+                        "factors_satisfied": sorted(state["factors_satisfied"]),
+                        "suggested_response": "Ďakujem, overenie prebehlo úspešne. S čím vám môžem pomôcť?",
+                    }
+                )
+
+            # Step 8: find next factor
+            next_f = _next_factor(blocked)
             _persist_auth_state(conv, state)
-            level = (
-                _AUTH_TYPE_SENSITIVE if state["authenticated_sensitive"] else _AUTH_TYPE_STANDARD
-            )
-            _nlp_set_state(
-                conv,
-                {
-                    "authenticated_standard": "true",
-                    "authenticated_sensitive": "true"
-                    if state["authenticated_sensitive"]
-                    else "false",
-                    "authentication_level": level,
-                },
-            )
-            return _json(
-                {
-                    "authenticated": True,
-                    "level": level,
-                    "factors_satisfied": sorted(state["factors_satisfied"]),
-                    "suggested_response": "Ďakujem, overenie prebehlo úspešne. S čím vám môžem pomôcť?",
-                }
-            )
 
-        # Step 8: find next factor
-        next_f = _next_factor(blocked)
-        _persist_auth_state(conv, state)
-
-        if next_f is None:
-            return _json(
-                {
-                    "authenticated": False,
-                    "error": "cannot_authenticate",
-                    "factors_satisfied": sorted(state["factors_satisfied"]),
-                    "factors_failed": sorted(state["factors_failed"]),
-                    "factors_skipped": sorted(state["factors_skipped"]),
-                    "suggested_response": "Overenie sa nepodarilo. Prepájam vás na operátora.",
-                    "instruction": "Eskaluj na ľudského operátora.",
-                }
-            )
-
-        if next_f == _FACTOR_TRUSTED_SOURCE:
-            # Trusted source is automatic — nothing the caller can do.
-            # Mark it as skipped (input_source missing or didn't match) and re-eval.
-            state["factors_skipped"].add(_FACTOR_TRUSTED_SOURCE)
-            _persist_auth_state(conv, state)
-            next_f = _next_factor(
-                state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
-            )
             if next_f is None:
                 return _json(
                     {
                         "authenticated": False,
                         "error": "cannot_authenticate",
+                        "factors_satisfied": sorted(state["factors_satisfied"]),
+                        "factors_failed": sorted(state["factors_failed"]),
+                        "factors_skipped": sorted(state["factors_skipped"]),
                         "suggested_response": "Overenie sa nepodarilo. Prepájam vás na operátora.",
                         "instruction": "Eskaluj na ľudského operátora.",
                     }
                 )
 
-        return _json(
-            {
-                "authenticated": False,
-                "level_required": auth_type,
-                "factors_satisfied": sorted(state["factors_satisfied"]),
-                "factors_remaining": required - satisfied_count,
-                "next_factor": next_f,
-                "suggested_response": _suggested_response_for_factor(next_f),
-                "instruction": _instruction_for_factor(next_f),
-            }
-        )
+            if next_f == _FACTOR_TRUSTED_SOURCE:
+                # Trusted source is automatic — nothing the caller can do.
+                # Mark it as skipped (input_source missing or didn't match) and re-eval.
+                state["factors_skipped"].add(_FACTOR_TRUSTED_SOURCE)
+                _persist_auth_state(conv, state)
+                next_f = _next_factor(
+                    state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+                )
+                if next_f is None:
+                    return _json(
+                        {
+                            "authenticated": False,
+                            "error": "cannot_authenticate",
+                            "suggested_response": "Overenie sa nepodarilo. Prepájam vás na operátora.",
+                            "instruction": "Eskaluj na ľudského operátora.",
+                        }
+                    )
+
+            return _json(
+                {
+                    "authenticated": False,
+                    "level_required": auth_type,
+                    "factors_satisfied": sorted(state["factors_satisfied"]),
+                    "factors_remaining": required - satisfied_count,
+                    "next_factor": next_f,
+                    "suggested_response": _suggested_response_for_factor(next_f),
+                    "instruction": _instruction_for_factor(next_f),
+                }
+            )
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(name="nastav_test_kontext", description=_TEST_KONTEXT_DESCRIPTION, registry=registry)
     async def nastav_test_kontext(
@@ -1592,13 +1685,19 @@ def register(
         if not conv:
             return _json({"ok": False, "error": "missing_conversation_id"})
 
-        current = _NLP_MIRROR_STATE.get(conv) or {}
-        if input_source is not None:
-            current["input_source"] = input_source
-        if authentication_type is not None:
-            current["authentication_type"] = authentication_type
-        _NLP_MIRROR_STATE.set(conv, current)
-        return _json({"ok": True, "named_entities": dict(current)})
+        await _nlp_load(conv)
+        try:
+            entities: dict[str, str] = {}
+            if input_source is not None:
+                entities["input_source"] = input_source
+            if authentication_type is not None:
+                entities["authentication_type"] = authentication_type
+            if entities:
+                _nlp_set_state(conv, entities)
+            current = _NLP_MIRROR_STATE.get(conv) or {}
+            return _json({"ok": True, "named_entities": dict(current)})
+        finally:
+            _nlp_flush(conv)
 
     @mcp_tool(name="over_viazanost", description=_VIAZANOST_TOOL_DESCRIPTION, registry=registry)
     async def over_viazanost(_meta: dict[str, Any] | None = None) -> str:
@@ -1610,107 +1709,112 @@ def register(
                 "message": _UPSTREAM_ERROR_MESSAGE,
             })
 
-        # Require standard authentication before returning contract data.
-        auth_state = _AUTH_STATE.get(conv)
-        if not auth_state or not auth_state.get("authenticated_standard"):
-            return _json({
-                "found": False,
-                "error": "authentication_required",
-                "suggested_response": (
-                    "Na zobrazenie informácií o viazanosti musím najprv overiť vašu totožnosť."
-                ),
-                "instruction": "Zavolaj autentifikacia tool a až potom over_viazanost.",
-            })
-
-        identity = _IDENTITY_STATE.get(conv)
-        if not identity:
-            return _json({
-                "found": False,
-                "error": "identification_required",
-                "suggested_response": (
-                    "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
-                    "kód zákazníka alebo telefónne číslo?"
-                ),
-                "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
-            })
-
-        candidates = identity.get("candidates") or []
-        if not candidates:
-            return _json({
-                "found": False,
-                "error": "identification_required",
-                "suggested_response": (
-                    "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
-                    "kód zákazníka alebo telefónne číslo?"
-                ),
-                "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
-            })
-
-        candidate = candidates[0]
-        customer_id: str | None = candidate.get("customer_id") or None
-        identification_method = identity.get("identification_method") or ""
-        identification_value = identity.get("identification_value") or ""
-        # Prefer customer_id (covers all products); fall back to MSISDN only when
-        # identification was by phone and no customer_id linkage exists.
-        msisdn: str | None = (
-            identification_value if (not customer_id and identification_method == "telefon") else None
-        )
-
-        _log.info(
-            "over_viazanost: conv=%s customer_id_last4=%s method=%s",
-            conv,
-            (customer_id or "")[-4:] or "none",
-            identification_method,
-        )
-
+        await _nlp_load(conv)
         try:
-            products_raw = await client.get_products_for_agreements(
-                customer_id=customer_id,
-                msisdn=msisdn,
+            # Require standard authentication before returning contract data.
+            auth_state = _AUTH_STATE.get(conv)
+            if not auth_state or not auth_state.get("authenticated_standard"):
+                return _json({
+                    "found": False,
+                    "error": "authentication_required",
+                    "suggested_response": (
+                        "Na zobrazenie informácií o viazanosti musím najprv overiť vašu totožnosť."
+                    ),
+                    "instruction": "Zavolaj autentifikacia tool a až potom over_viazanost.",
+                })
+
+            identity = _IDENTITY_STATE.get(conv)
+            if not identity:
+                return _json({
+                    "found": False,
+                    "error": "identification_required",
+                    "suggested_response": (
+                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                        "kód zákazníka alebo telefónne číslo?"
+                    ),
+                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                })
+
+            candidates = identity.get("candidates") or []
+            if not candidates:
+                return _json({
+                    "found": False,
+                    "error": "identification_required",
+                    "suggested_response": (
+                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                        "kód zákazníka alebo telefónne číslo?"
+                    ),
+                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                })
+
+            candidate = candidates[0]
+            customer_id: str | None = candidate.get("customer_id") or None
+            identification_method = identity.get("identification_method") or ""
+            identification_value = identity.get("identification_value") or ""
+            # Prefer customer_id (covers all products); fall back to MSISDN only when
+            # identification was by phone and no customer_id linkage exists.
+            msisdn: str | None = (
+                identification_value if (not customer_id and identification_method == "telefon") else None
             )
-        except DPSError as exc:
-            _log.warning("over_viazanost: PI fetch failed: %s", exc)
-            return _json(_dps_error_payload(exc))
 
-        today = date.today()
-        active_products = _parse_products_with_active_agreements(products_raw, today)
-        viazanost_typ, suggested_response, latest_date = _classify_viazanost(active_products, today)
+            _log.info(
+                "over_viazanost: conv=%s customer_id_last4=%s method=%s",
+                conv,
+                (customer_id or "")[-4:] or "none",
+                identification_method,
+            )
 
-        _log.info(
-            "over_viazanost: conv=%s fetched=%d active=%d typ=%s",
-            conv,
-            len(products_raw),
-            len(active_products),
-            viazanost_typ,
-        )
+            try:
+                products_raw = await client.get_products_for_agreements(
+                    customer_id=customer_id,
+                    msisdn=msisdn,
+                )
+            except DPSError as exc:
+                _log.warning("over_viazanost: PI fetch failed: %s", exc)
+                return _json(_dps_error_payload(exc))
 
-        # Sort ascending by viazanost_do (soonest commitment ends first)
-        active_products.sort(key=lambda p: p.get("viazanost_do") or "")
+            today = date.today()
+            active_products = _parse_products_with_active_agreements(products_raw, today)
+            viazanost_typ, suggested_response, latest_date = _classify_viazanost(active_products, today)
 
-        # Per-product typ classification
-        def _product_typ(viazanost_do_str: str | None) -> str:
-            d = _parse_agreement_date(viazanost_do_str or "")
-            if d is None:
-                return "Chyba"
-            days = (d - today).days
-            if days < 90:
-                return "Prolongacne_okno"
-            if days < 365:
-                return "Viazanost_do_roka"
-            return "Viazanost_viac_ako_rok"
+            _log.info(
+                "over_viazanost: conv=%s fetched=%d active=%d typ=%s",
+                conv,
+                len(products_raw),
+                len(active_products),
+                viazanost_typ,
+            )
 
-        # Group by typ, preserve _VIAZANOST_TYP_ORDER
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for p in active_products:
-            typ = _product_typ(p.get("viazanost_do"))
-            grouped.setdefault(typ, []).append(p)
-        services_grouped = {k: grouped[k] for k in _VIAZANOST_TYP_ORDER if k in grouped}
+            # Sort ascending by viazanost_do (soonest commitment ends first)
+            active_products.sort(key=lambda p: p.get("viazanost_do") or "")
 
-        return _json({
-            "found": True,
-            "viazanost_typ": viazanost_typ,
-            "viazanost_do": str(latest_date) if latest_date else None,
-            "services": services_grouped,
-            "count": len(active_products),
-            "suggested_response": suggested_response,
-        })
+            # Per-product typ classification
+            def _product_typ(viazanost_do_str: str | None) -> str:
+                d = _parse_agreement_date(viazanost_do_str or "")
+                if d is None:
+                    return "Chyba"
+                days = (d - today).days
+                if days < 90:
+                    return "Prolongacne_okno"
+                if days < 365:
+                    return "Viazanost_do_roka"
+                return "Viazanost_viac_ako_rok"
+
+            # Group by typ, preserve _VIAZANOST_TYP_ORDER
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for p in active_products:
+                typ = _product_typ(p.get("viazanost_do"))
+                grouped.setdefault(typ, []).append(p)
+            services_grouped = {k: grouped[k] for k in _VIAZANOST_TYP_ORDER if k in grouped}
+
+            _nlp_set_state(conv, {"over_viazanost_result": viazanost_typ})
+            return _json({
+                "found": True,
+                "viazanost_typ": viazanost_typ,
+                "viazanost_do": str(latest_date) if latest_date else None,
+                "services": services_grouped,
+                "count": len(active_products),
+                "suggested_response": suggested_response,
+            })
+        finally:
+            _nlp_flush(conv)
