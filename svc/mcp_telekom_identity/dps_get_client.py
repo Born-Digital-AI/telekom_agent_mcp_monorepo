@@ -215,6 +215,41 @@ class DPSGetClient:
             raise DPSInvalidResponseError(msg)
         return result
 
+    async def get_products_for_agreements(
+        self,
+        *,
+        msisdn: str | None = None,
+        customer_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """GET /product-inventory/4.64/products — fetch products for agreement lookup.
+
+        Uses RQL function syntax from the NLP agreements extractor:
+          msisdn      → query=eq(name,421XXXXXXXXX)
+          customer_id → query=eq(customer.id,1002203200)
+        size=200, page=0 (single page, same as NLP extractor).
+        """
+        if msisdn:
+            rql = f"eq(name,{msisdn})"
+        elif customer_id:
+            rql = f"eq(customer.id,{customer_id})"
+        else:
+            msg = "get_products_for_agreements requires msisdn or customer_id"
+            raise ValueError(msg)
+
+        result = await self._get(
+            "/product-inventory/4.64/products",
+            {
+                "query": rql,
+                "fields": "*",
+                "size": "200",
+                "page": "0",
+            },
+        )
+        if not isinstance(result, list):
+            msg = "product-inventory expected JSON array"
+            raise DPSInvalidResponseError(msg)
+        return result
+
     async def get_party_by_id(self, party_id: str) -> dict[str, Any] | None:
         """GET /party-management/3.54.0/v2/parties/{id} — single Party or None on 404."""
         try:

@@ -164,13 +164,28 @@ Empty cell = that customer has no value of that kind in DPS.
 | A.B.Zrtv _(B2B)_ | — | — | — | — | `4059299000` | `4059299001` | — | — |
 | Creditinfo Slovakia, S.R.O. _(B2B)_ | — | — | — | — | `2300000400` | `2300000404`, `2300000401`, `2300000405`, `2300000406` | — | — |
 | J A L & Š, S. R. O. _(B2B)_ | — | — | — | — | `4108064300` | `4108064301`, `4108064302` | — | — |
+| Stano Majchrak | — | — | — | — | `4002141300` | `4002141301`, `4002141304` | `0928101901`† | — |
+| Stano Rehák | — | — | — | — | `2315054900` | `2315054901` | `0975277031`† | — |
+| Vitaliy Turzová | — | — | — | — | `2315057500` | `2315057501` | `0905555711`† | — |
+| `Vrbova,Konštantín,Ing.` _(multi-comma)_ | — | — | — | — | `2315059400` | `2315059402`, `2315059403`, `2315059404`, `2315059405`, `2315059406`, `2315059408` | `0908554490`† | — |
+| Jindrich Piacek | — | — | — | — | `2315055000` | `2315055002`, `2315055003` | `0948346170`† | — |
+| Jarolím Záhorská | — | — | — | — | `2315053900` | `2315053902` | `0951101462`† | — |
+| `Biely,Lubomir,Ing.` _(multi-comma)_ | — | — | — | — | `4002130900` | `4002130901`, `4002130903`, `4002130904` | `0948192661`† | — |
+| Valent Turčanová | — | — | — | — | `4002152400` | `4002152401`, `4002152402` | `0968333256`† | — |
+| Justina Fridrichova | — | — | — | — | `4002187300` | `4002187301`, `4002187302` | `0937888267`† | — |
+| Julian Nedelka | — | — | — | — | `2315075000` | `2315075001`, `2315075003`, `2315075004` | `0913092013`† | — |
+| Dusan Nad | — | — | — | — | `2315419800` | `2315419801` | `0957643790`† | — |
+| Pool Controls Slovakia, Spol. S _(B2B)_ | — | — | — | — | `3107175000` | `3107175004` | `0978153667`† | — |
+| Grade/Tbwa, S.R.O. _(B2B)_ | — | — | — | — | `4002814700` | `4002814701` | `0973600491`† | — |
 
-Notes:V
+Notes:
 
 - `kod_zakaznika` ending in **`0`** is the Customer ID; ending in **`1–9`** is a Billing Account ID (also the value to use as `kod_adresata` in `autentifikacia`).
 - "Tester AT NECHYTAT" RČ and OP return **multi-match** because the DPS test environment contains ~450 duplicate records under that identifier.
 - All `telefon` values can be entered in SK local form (`0902…`), with `+` (`+421…`), or without (`421…`); the tool normalizes.
 - All `seriove_cislo` values are case-insensitive and ignore spaces / dashes / dots / slashes.
+- †  Phone from billing SMS notification — **not verified** as a Product Inventory MSISDN; `identifikacia_telefon` may not find these customers.
+- _(multi-comma)_ DPS name has >1 comma (e.g. `Vrbova,Konštantín,Ing.`). The tool reverses B2C names only when there is exactly 1 comma — these are returned raw. Tool output will show the literal DPS string.
 
 ## Tools
 
@@ -381,6 +396,19 @@ These inputs map to known parties in the DPS staging environment. Use them via t
 | `4432948400` | Customer ID (404)          | `{found: false, error: "not_found"}`                |
 | `9999999999` | Billing Account (404)      | `{found: false, error: "not_found"}`                |
 | `abc`, `12345` | —                        | `{found: false, error: "invalid_input"}`            |
+| `4002141300` | Customer ID (B2C)          | `{found, name: "Stano Majchrak"}`                             |
+| `2315054900` | Customer ID (B2C)          | `{found, name: "Stano Rehák"}`                                |
+| `2315057500` | Customer ID (B2C)          | `{found, name: "Vitaliy Turzová"}`                            |
+| `2315059400` | Customer ID (B2C, multi-comma) | `{found, name: "Vrbova,Konštantín,Ing."}`                 |
+| `2315055000` | Customer ID (B2C)          | `{found, name: "Jindrich Piacek"}`                            |
+| `2315053900` | Customer ID (B2C)          | `{found, name: "Jarolím Záhorská"}`                           |
+| `4002130900` | Customer ID (B2C, multi-comma) | `{found, name: "Biely,Lubomir,Ing."}`                     |
+| `4002152400` | Customer ID (B2C)          | `{found, name: "Valent Turčanová"}`                           |
+| `4002187300` | Customer ID (B2C)          | `{found, name: "Justina Fridrichova"}`                        |
+| `2315075000` | Customer ID (B2C)          | `{found, name: "Julian Nedelka"}`                             |
+| `2315419800` | Customer ID (B2C)          | `{found, name: "Dusan Nad"}`                                  |
+| `3107175000` | Customer ID (B2B)          | `{found, name: "Pool Controls Slovakia, Spol. S "}`           |
+| `4002814700` | Customer ID (B2B)          | `{found, name: "Grade/Tbwa, S.R.O."}`                         |
 
 ### `identifikacia_telefon`
 

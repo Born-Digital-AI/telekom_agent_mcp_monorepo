@@ -24,6 +24,7 @@ import threading
 import unicodedata
 import urllib.error
 import urllib.request
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
@@ -269,6 +270,36 @@ _TEST_KONTEXT_DESCRIPTION = (
 )
 
 _UPSTREAM_ERROR_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
+
+# Agreement statuses considered "active" — mirrors NLP extractor get_agreements.py.
+# terminated/cancelled/expired are intentionally excluded: a contract may still have
+# an agreementPeriod.endDateTime in the future even after early termination.
+_ACTIVE_AGREEMENT_STATUSES = frozenset({
+    "active",
+    "inProtectionPeriod",
+    "validated",
+    "signed",
+    "approved",
+    "inProcess",
+    "inCorrection",
+    "initialized",
+    "approvalPending",
+})
+
+_VIAZANOST_TYP_ORDER = (
+    "Prolongacne_okno",
+    "Viazanost_do_roka",
+    "Viazanost_viac_ako_rok",
+    "Chyba",
+)
+
+_VIAZANOST_TOOL_DESCRIPTION = (
+    "Overí aktívne zmluvy (viazanosti) identifikovaného a autentifikovaného zákazníka "
+    "z Product Inventory DPS. Vyžaduje predchádzajúcu identifikáciu (identifikacia_*) "
+    "a štandardnú autentifikáciu (autentifikacia). Vráti klasifikáciu viazanosti "
+    "(Nema_viazanost / Prolongacne_okno / Viazanost_do_roka / Viazanost_viac_ako_rok), "
+    "surové dáta zmlúv a odporúčanú odpoveď pre zákazníka."
+)
 
 # Tools whose input is PII (sent to NLP only as last4=XXXX marker).
 _PII_METHODS = frozenset({"rodne_cislo", "op", "pas"})
@@ -662,6 +693,147 @@ def _persist_auth_state(conv: str, state: dict[str, Any]) -> None:
     _AUTH_STATE.set(conv, serialised)
 
 
+def _parse_agreement_date(value: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).date()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _filter_active_agreements(
+    agreements: list[Any], today: date
+) -> list[dict[str, str]]:
+    active: list[dict[str, str]] = []
+    for agr in agreements:
+        status = (agr.get("status") or "").lower()
+        if status and status not in _ACTIVE_AGREEMENT_STATUSES:
+            continue
+        period = agr.get("agreementPeriod") or {}
+        agr_from = _parse_agreement_date(period.get("startDateTime", ""))
+        agr_to = _parse_agreement_date(period.get("endDateTime", ""))
+        if agr_from is None or agr_to is None:
+            continue
+        if agr_from <= today <= agr_to:
+            active.append({"from": str(agr_from), "to": str(agr_to)})
+    return active
+
+
+def _product_display_name(product: dict[str, Any]) -> tuple[str, str]:
+    """Return (display_name, identifier) for a product.
+
+    display_name  — customer-facing label, e.g. "Magio TV XL (1E104IBSH)"
+    identifier    — publicIdentifier or productSerialNumber (raw, no label)
+    """
+    group = product.get("group") or ""
+    product_name = product.get("name") or ""
+    label = product.get("label") or ""
+
+    # service_name: label is the customer-visible name; device fallback when label absent
+    if label:
+        service_name = label
+    elif group == "device":
+        service_name = f"Zariadenie: {product_name}" if product_name else "Zariadenie"
+    else:
+        service_name = product_name
+
+    identifier = (
+        product.get("publicIdentifier")
+        or product.get("productSerialNumber")
+        or ""
+    )
+
+    if identifier and identifier != service_name:
+        display_name = f"{service_name} ({identifier})"
+    else:
+        display_name = service_name
+
+    return display_name, identifier
+
+
+def _parse_products_with_active_agreements(
+    data: list[Any], today: date
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for product in data:
+        if not isinstance(product, dict):
+            continue
+        raw_agreements = product.get("agreements") or []
+        if not isinstance(raw_agreements, list):
+            raw_agreements = []
+        active = _filter_active_agreements(raw_agreements, today)
+        if not active:
+            continue
+
+        display_name, identifier = _product_display_name(product)
+
+        latest_to: date | None = None
+        for agr in active:
+            agr_to = _parse_agreement_date(agr.get("to", ""))
+            if agr_to is not None and (latest_to is None or agr_to > latest_to):
+                latest_to = agr_to
+
+        result.append({
+            "display_name": display_name,
+            "group": product.get("group") or "",
+            "identifier": identifier,
+            "viazanost_do": str(latest_to) if latest_to else None,
+        })
+    return result
+
+
+def _classify_viazanost(
+    active_products: list[dict[str, Any]], today: date
+) -> tuple[str, str, date | None]:
+    """Return (viazanost_typ, suggested_response, latest_end_date).
+
+    Classification mirrors MSG_LAC_SC_VIAZANOST in LAC Selfcare.yaml:
+      Nema_viazanost         — no active agreements
+      Prolongacne_okno       — latest end < 90 days away
+      Viazanost_do_roka      — latest end 90–365 days away
+      Viazanost_viac_ako_rok — latest end ≥ 365 days away
+    Uses the LATEST end date across all products for the most conservative estimate.
+    Builds a per-service breakdown in suggested_response when multiple services exist.
+    """
+    if not active_products:
+        return (
+            "Nema_viazanost",
+            "Na Vami zadanom čísle aktuálne neevidujeme viazanosť.",
+            None,
+        )
+
+    latest_to: date | None = None
+    for product in active_products:
+        agr_to = _parse_agreement_date(product.get("viazanost_do") or "")
+        if agr_to is not None and (latest_to is None or agr_to > latest_to):
+            latest_to = agr_to
+
+    if latest_to is None:
+        return "Chyba", "Mrzí ma to, nepodarilo sa mi získať údaje o viazanosti.", None
+
+    days_left = (latest_to - today).days
+
+    # Build per-service lines for the suggested response
+    service_lines: list[str] = []
+    for p in active_products:
+        s_display = p.get("display_name") or "Neznáma služba"
+        s_date = _parse_agreement_date(p.get("viazanost_do") or "")
+        if s_date:
+            service_lines.append(f"{s_display}: do {s_date.strftime('%d. %m. %Y')}")
+
+    if len(active_products) == 1 or not service_lines:
+        suggested = f"Viazanosť na Vami zadanom čísle je do: {latest_to.strftime('%d. %m. %Y')}."
+    else:
+        suggested = "Vaše aktívne viazanosti:\n" + "\n".join(f"• {ln}" for ln in service_lines)
+
+    if days_left < 90:
+        return "Prolongacne_okno", suggested, latest_to
+    if days_left < 365:
+        return "Viazanost_do_roka", suggested, latest_to
+    return "Viazanost_viac_ako_rok", suggested, latest_to
+
+
 def register(
     registry: ToolRegistry,
     *,
@@ -766,7 +938,6 @@ def register(
             }
         )
 
-    @mcp_tool(name="identifikacia_rodne_cislo", description=_RC_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_rodne_cislo(
         rodne_cislo: Annotated[
             str,
@@ -787,7 +958,6 @@ def register(
             method="rodne_cislo",
         )
 
-    @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_op(
         cislo_op: Annotated[
             str,
@@ -810,7 +980,6 @@ def register(
             method="op",
         )
 
-    @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia_pas(
         cislo_pasu: Annotated[
             str,
@@ -1430,3 +1599,118 @@ def register(
             current["authentication_type"] = authentication_type
         _NLP_MIRROR_STATE.set(conv, current)
         return _json({"ok": True, "named_entities": dict(current)})
+
+    @mcp_tool(name="over_viazanost", description=_VIAZANOST_TOOL_DESCRIPTION, registry=registry)
+    async def over_viazanost(_meta: dict[str, Any] | None = None) -> str:
+        conv = (_meta or {}).get("conversation_id", "")
+        if not conv:
+            return _json({
+                "found": False,
+                "error": "missing_conversation_id",
+                "message": _UPSTREAM_ERROR_MESSAGE,
+            })
+
+        # Require standard authentication before returning contract data.
+        auth_state = _AUTH_STATE.get(conv)
+        if not auth_state or not auth_state.get("authenticated_standard"):
+            return _json({
+                "found": False,
+                "error": "authentication_required",
+                "suggested_response": (
+                    "Na zobrazenie informácií o viazanosti musím najprv overiť vašu totožnosť."
+                ),
+                "instruction": "Zavolaj autentifikacia tool a až potom over_viazanost.",
+            })
+
+        identity = _IDENTITY_STATE.get(conv)
+        if not identity:
+            return _json({
+                "found": False,
+                "error": "identification_required",
+                "suggested_response": (
+                    "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                    "kód zákazníka alebo telefónne číslo?"
+                ),
+                "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+            })
+
+        candidates = identity.get("candidates") or []
+        if not candidates:
+            return _json({
+                "found": False,
+                "error": "identification_required",
+                "suggested_response": (
+                    "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                    "kód zákazníka alebo telefónne číslo?"
+                ),
+                "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+            })
+
+        candidate = candidates[0]
+        customer_id: str | None = candidate.get("customer_id") or None
+        identification_method = identity.get("identification_method") or ""
+        identification_value = identity.get("identification_value") or ""
+        # Prefer customer_id (covers all products); fall back to MSISDN only when
+        # identification was by phone and no customer_id linkage exists.
+        msisdn: str | None = (
+            identification_value if (not customer_id and identification_method == "telefon") else None
+        )
+
+        _log.info(
+            "over_viazanost: conv=%s customer_id_last4=%s method=%s",
+            conv,
+            (customer_id or "")[-4:] or "none",
+            identification_method,
+        )
+
+        try:
+            products_raw = await client.get_products_for_agreements(
+                customer_id=customer_id,
+                msisdn=msisdn,
+            )
+        except DPSError as exc:
+            _log.warning("over_viazanost: PI fetch failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        today = date.today()
+        active_products = _parse_products_with_active_agreements(products_raw, today)
+        viazanost_typ, suggested_response, latest_date = _classify_viazanost(active_products, today)
+
+        _log.info(
+            "over_viazanost: conv=%s fetched=%d active=%d typ=%s",
+            conv,
+            len(products_raw),
+            len(active_products),
+            viazanost_typ,
+        )
+
+        # Sort ascending by viazanost_do (soonest commitment ends first)
+        active_products.sort(key=lambda p: p.get("viazanost_do") or "")
+
+        # Per-product typ classification
+        def _product_typ(viazanost_do_str: str | None) -> str:
+            d = _parse_agreement_date(viazanost_do_str or "")
+            if d is None:
+                return "Chyba"
+            days = (d - today).days
+            if days < 90:
+                return "Prolongacne_okno"
+            if days < 365:
+                return "Viazanost_do_roka"
+            return "Viazanost_viac_ako_rok"
+
+        # Group by typ, preserve _VIAZANOST_TYP_ORDER
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for p in active_products:
+            typ = _product_typ(p.get("viazanost_do"))
+            grouped.setdefault(typ, []).append(p)
+        services_grouped = {k: grouped[k] for k in _VIAZANOST_TYP_ORDER if k in grouped}
+
+        return _json({
+            "found": True,
+            "viazanost_typ": viazanost_typ,
+            "viazanost_do": str(latest_date) if latest_date else None,
+            "services": services_grouped,
+            "count": len(active_products),
+            "suggested_response": suggested_response,
+        })
