@@ -71,11 +71,6 @@ def register(
     """
     read_only = ToolAnnotations(readOnlyHint=True, idempotentHint=True)
 
-    _index_ids_hint = (
-        f"Available index IDs: {index_ids}. "
-        "When omitted, all indexes are queried and results are merged."
-    )
-
     @mcp.tool(annotations=read_only)
     async def list_documents(
         page: Annotated[int, pydantic.Field(ge=1, description="Page number (1-based)")] = 1,
@@ -100,7 +95,12 @@ def register(
         ] = "desc",
         index_id: Annotated[
             int | None,
-            pydantic.Field(description=f"Restrict to a specific index. {_index_ids_hint}"),
+            pydantic.Field(
+                description=(
+                    "Restrict to a specific index ID. When omitted, all configured indexes "
+                    "are queried and results are merged."
+                )
+            ),
         ] = None,
     ) -> str:
         """List documents in the knowledge base with their labels and annotations."""
