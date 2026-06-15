@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import pydantic
+from pydantic_settings import NoDecode
 
 from lib.mcp_service import MCPService, MCPServiceConfig
 
@@ -21,7 +22,10 @@ class MCPTelekomThdSelfcareConfig(MCPServiceConfig):
     mcp_name: str = "mcp-telekom-thd-selfcare"
 
     indexer_url: str
-    indexer_index_ids: list[int]
+    # NoDecode disables pydantic-settings' default JSON decoding of the env value so a plain
+    # comma-separated string (e.g. "442,443") reaches the validator below instead of failing
+    # the JSON parse in EnvSettingsSource.
+    indexer_index_ids: Annotated[list[int], NoDecode]
     indexer_organization_id: str
     indexer_project_id: str
     indexer_timeout_seconds: float = 30.0
@@ -30,7 +34,7 @@ class MCPTelekomThdSelfcareConfig(MCPServiceConfig):
     @pydantic.field_validator("indexer_index_ids", mode="before")
     @classmethod
     def _parse_index_ids(cls, v: Any) -> Any:
-        """Accept comma-separated string (e.g. "101,102") in addition to JSON list."""
+        """Accept comma-separated string (e.g. "442,443") in addition to a JSON/list value."""
         if isinstance(v, str):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
         return v
