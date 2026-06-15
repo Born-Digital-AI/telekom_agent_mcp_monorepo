@@ -1,45 +1,43 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mcp-telekom-thd-selfcare
-  labels:
-    app: mcp-telekom-thd-selfcare
-    team: telekom
-  namespace: development
-spec:
-  # Service uses lib.mcp_service.state.TTLStore for per-conversation
-  # troubleshooting session state. State is process-local — DO NOT scale
-  # beyond 1 replica without switching to a shared store. See
-  # AGENTS.md > "State management".
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mcp-telekom-thd-selfcare
-  template:
-    metadata:
-      annotations:
+  annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/healthz/metrics"
+  labels:
+    app: mcp-telekom-thd-selfcare
+    team: mcp-servers
+  name: mcp-telekom-thd-selfcare
+  namespace: internal-test
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: mcp-telekom-thd-selfcare
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      creationTimestamp: null
       labels:
         app: mcp-telekom-thd-selfcare
-        team: telekom
+        team: mcp-servers
     spec:
       containers:
-        - name: mcp-telekom-thd-selfcare
-          image: borndigitalaibot/mcp-telekom-thd-selfcare:latest
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 8000
-            - containerPort: 8080
-          env:
+        - env:
             - name: APP_COLORIZE_LOGS
               value: 'False'
             - name: APP_JSON_FORMAT_LOGS
               value: 'True'
             - name: APP_GIT_COMMIT
               value: local
-
+            
             # Healthz / Prometheus
             - name: APP_HEALTHZ_PROTOCOL
               value: http://
@@ -64,19 +62,6 @@ spec:
             - name: APP_MCP_STATELESS_HTTP
               value: 'True'
 
-            # Auth — enable in any environment that has untrusted callers.
-            - name: APP_MCP_AUTH_ENABLED
-              value: 'False'
-            # - name: APP_MCP_AUTH_API_KEY
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: mcp-server-secret
-            #       key: mcp-auth-api-key
-
-            # Telekom-specific: NLP engine endpoint for state propagation
-            - name: GOODBOT_URL
-              value: 'http://goodbot.development.svc.cluster.local:8121'
-
             # Logstash → Kibana
             - name: APP_LOGSTASH_ENABLED
               value: 'True'
@@ -86,22 +71,48 @@ spec:
               value: '5959'
             - name: APP_LOGSTASH_DATABASE_PATH
               value: ''
-          livenessProbe:
-            httpGet:
-              path: /healthz/liveness
-              port: 8080
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /healthz/readiness
-              port: 8080
-            periodSeconds: 10
+            
+            - name: APP_INDEXER_URL
+              value: "http://indexer:8000/"
+            - name: APP_INDEXER_INDEX_ID
+              value: "442"
+            - name: APP_INDEXER_ORGANIZATION_ID
+              value: "697a36e43510b0d850bd19cc"
+            - name: APP_INDEXER_PROJECT_ID
+              value: "697a36f33510b0d850bd1a39"
+            - name: APP_INDEXER_TIMEOUT_SECONDS
+              value: "30"
+            - name: APP_INDEXER_LABELS_CACHE_TTL_SECONDS
+              value: "300"
+
+            # Auth — enable in any environment that has untrusted callers.
+            - name: APP_MCP_AUTH_ENABLED
+              value: 'False'
+            # Required even when auth is disabled: container runs with
+            # --ignore-defaults, which forces every non-Optional config field to
+            # be set via env. Unused at runtime when APP_MCP_AUTH_ENABLED=False.
+            - name: APP_MCP_AUTH_ISSUER_URL
+              value: 'http://localhost'
+
+          image: borndigitalaibot/mcp-telekom-thd-selfcare:latest
+          imagePullPolicy: IfNotPresent
+          name: mcp-telekom-thd-selfcare
+          ports:
+            - containerPort: 8000
+            - containerPort: 8080
           resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
             limits:
-              cpu: 1000m
-              memory: 512Mi
+              cpu: 200m
+              memory: 300Mi
+            requests:
+              cpu: 50m
+              memory: 150Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
       imagePullSecrets:
         - name: regcred
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

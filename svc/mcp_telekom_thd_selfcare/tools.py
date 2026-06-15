@@ -1,425 +1,365 @@
-"""Telekom THD Selfcare MCP tools.
+"""Telekom THD Selfcare MCP tools — RAG facade over a single indexer knowledge base.
 
-find_service_point(phone_number?, kod_adresata?)
-— Find customer's fixed internet service point.
-
-get_info_router()
-— Retrieve router model for the service point.
-
-get_troubleshooting_steps(channel, step_result?)
-— Two-phase: diagnose problem type, then step-by-step troubleshooting.
+Tools:
+  - list_documents: paginated catalog of documents in the index (with labels, annotations).
+  - search:        semantic / hybrid search; returns documents grouped with snippet text.
+  - get_document:  full document metadata + chunks (drill-down after search).
+  - list_labels:   distinct labels in the index (cached) for discovery / filter hints.
 """
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import json
-import logging
-import os
-import threading
-import urllib.error
-import urllib.request
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
-from lib.mcp_service.state import TTLStore
+import pydantic
+from mcp.types import ToolAnnotations
 
-from .customer_db import (
-    find_by_kod_adresata,
-    find_by_phone,
-    get_fixed_internet_service,
-)
-from .troubleshooting_data import (
-    DIAGNOSTIC_INSTRUCTION,
-    DIAGNOSTIC_OPTIONS,
-    DIAGNOSTIC_QUESTION,
-    STEPS_BY_PROBLEM,
-    get_step,
-    match_problem_type,
-)
+from .indexer_client import IndexerClient, IndexerError, LabelsCache
 
-_NLP_BASE_URL = os.environ.get("GOODBOT_URL", "http://goodbot.internal-test.svc.cluster.local:8121")
-_SESSION_TTL_SECONDS = 30 * 60  # Drop session state 30 minutes after last write.
-_log = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    import logging
+
+    from mcp.server.fastmcp import FastMCP
 
 
 def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
-_NLP_TIMEOUT_SECONDS = 1.0  # Hard cap so a slow NLP doesn't extend the tool's latency budget.
+def _error(message: str, exc: IndexerError | None = None) -> str:
+    payload: dict[str, Any] = {"error": message}
+    if exc is not None:
+        if exc.status_code is not None:
+            payload["status_code"] = exc.status_code
+        if exc.body:
+            payload["indexer_response"] = exc.body[:500]
+    return _json(payload)
 
 
-def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
-    """Fire-and-forget PUT to the NLP engine state endpoint.
+def _doc_summary(doc: dict[str, Any]) -> dict[str, Any]:
+    """Pick the fields useful to an LLM browsing the catalog. Drop noise like created_by."""
+    return {
+        "id": doc.get("id"),
+        "name": doc.get("name"),
+        "annotation": doc.get("annotation"),
+        "labels": doc.get("labels") or [],
+        "url": doc.get("url"),
+        "tokens_count": doc.get("tokens_count"),
+        "chunks_count": doc.get("chunks_count"),
+        "created_at": doc.get("created_at"),
+    }
 
-    Spawned in a daemon thread so the calling tool returns immediately. Errors
-    are logged at WARNING level. The HTTP timeout is intentionally aggressive
-    (``_NLP_TIMEOUT_SECONDS``) so a stalled NLP can't accumulate threads.
+
+def register(
+    *,
+    mcp: FastMCP,
+    client: IndexerClient,
+    labels_cache: LabelsCache,
+    index_ids: list[int],
+    organization_id: str,
+    project_id: str,
+    logger: logging.Logger,
+) -> None:
+    """Register the 4 RAG tools on the given FastMCP instance.
+
+    The indexer connection parameters are captured by closure — the LLM never sees them.
+    When multiple index_ids are provided, list_documents and search fan out to all of them
+    in parallel and merge the results. All indexes share the same organization and project.
     """
-    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
-    payload = {"named_entities": named_entities}
-    body = json.dumps(payload, ensure_ascii=False).encode()
+    read_only = ToolAnnotations(readOnlyHint=True, idempotentHint=True)
 
-    def _do() -> None:
-        req = urllib.request.Request(
-            url, data=body, method="PUT", headers={"Content-Type": "application/json"}
-        )
-        _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
-        try:
-            with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
-                resp_body = resp.read().decode("utf-8", errors="replace")
-                _log.info("NLP state PUT %s -> HTTP %s body=%s", url, resp.status, resp_body)
-        except urllib.error.HTTPError as exc:
-            resp_body = exc.read().decode("utf-8", errors="replace")
-            _log.warning("NLP state PUT %s -> HTTP %s body=%s", url, exc.code, resp_body)
-        except Exception as exc:
-            _log.warning("NLP state PUT %s -> error: %s", url, exc)
-
-    threading.Thread(target=_do, daemon=True, name="nlp-state-put").start()
-
-
-# Per-conversation session state. Process-local — NOT shared across replicas.
-# Run this service with replicas=1, or replace with Redis when scaling out.
-# See AGENTS.md > "State management".
-_SESSION_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_SESSION_TTL_SECONDS)
-
-
-def _get_state(conversation_id: str) -> dict[str, Any]:
-    state = _SESSION_STATE.get(conversation_id)
-    if state is None:
-        state = {
-            "customer_id": None,
-            "service_point": None,
-            "router_model": None,
-            "phone_number": None,
-            "channel": None,
-            "problem_type": None,
-            "current_step_index": 0,
-            "completed_steps": [],
-        }
-        _SESSION_STATE.set(conversation_id, state)
-    return state
-
-
-def register(registry: ToolRegistry) -> None:
-
-    @mcp_tool(
-        name="find_service_point",
-        description=(
-            "Find the customer's fixed internet service point by phone number or Kód adresáta. "
-            "phone_number comes from the SYSTEM (caller ID) — never ask the customer for it. "
-            "If phone_number is not found, ask the customer for their Kód adresáta from the invoice. "
-            "At least one of phone_number or kod_adresata must be provided. "
-            "Returns the service address — confirm with the customer that this is their address."
-        ),
-        registry=registry,
-    )
-    def find_service_point(
-        phone_number: str | None = None,
-        kod_adresata: str | None = None,
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conversation_id = (_meta or {}).get("conversation_id", "")
-
-        customer = None
-        if phone_number:
-            customer = find_by_phone(phone_number)
-        if not customer and kod_adresata:
-            customer = find_by_kod_adresata(kod_adresata)
-
-        if not customer:
-            if not phone_number and not kod_adresata:
-                return _json(
-                    {
-                        "status": "input_required",
-                        "suggested_response": "Môžete mi poskytnúť Kód adresáta z Vašej faktúry?",
-                        "instruction": "Počkaj na odpoveď zákazníka a zavolaj find_service_point znova s kod_adresata=<odpoveď zákazníka>.",
-                    }
+    @mcp.tool(annotations=read_only)
+    async def list_documents(
+        page: Annotated[int, pydantic.Field(ge=1, description="Page number (1-based)")] = 1,
+        limit: Annotated[
+            int, pydantic.Field(ge=1, le=100, description="Items per page (max 100)")
+        ] = 20,
+        search: Annotated[
+            str | None, pydantic.Field(description="Optional substring filter on document name")
+        ] = None,
+        labels: Annotated[
+            list[str] | None,
+            pydantic.Field(
+                description="Optional list of labels — documents must carry all of them"
+            ),
+        ] = None,
+        sort_column: Annotated[
+            Literal["id", "name", "created_at", "updated_at", "tokens_count"],
+            pydantic.Field(description="Column to sort by"),
+        ] = "created_at",
+        sort_direction: Annotated[
+            Literal["asc", "desc"], pydantic.Field(description="Sort direction")
+        ] = "desc",
+        index_id: Annotated[
+            int | None,
+            pydantic.Field(
+                description=(
+                    "Restrict to a specific index ID. When omitted, all configured indexes "
+                    "are queried and results are merged."
                 )
-            if phone_number and not kod_adresata:
-                return _json(
-                    {
-                        "found": False,
-                        "error": "not_found_by_phone",
-                        "suggested_response": "Váš účet som nenašla podľa telefónneho čísla. Môžete mi poskytnúť Kód adresáta z faktúry?",
-                        "instruction": "Počkaj na odpoveď a zavolaj find_service_point znova s kod_adresata=<odpoveď zákazníka>.",
-                    }
+            ),
+        ] = None,
+    ) -> str:
+        """List documents in the knowledge base with their labels and annotations."""
+        target_ids = [index_id] if index_id is not None else index_ids
+        logger.info(
+            "list_documents page=%s limit=%s search=%r labels=%s index_ids=%s",
+            page,
+            limit,
+            search,
+            labels,
+            target_ids,
+        )
+        raw_results = await asyncio.gather(
+            *[
+                client.list_documents(
+                    index_id=iid,
+                    page=page,
+                    limit=limit,
+                    search=search,
+                    labels=labels,
+                    sort_column=sort_column,
+                    sort_direction=sort_direction,
                 )
-            return _json(
-                {
-                    "found": False,
-                    "error": "not_found",
-                    "suggested_response": "Zadaný kód som nenašla. Môžete ho skúsiť zadať znova?",
-                    "instruction": (
-                        "Počkaj na odpoveď a zavolaj find_service_point znova. "
-                        "Ak ani druhý pokus neuspeje, odovzdaj zákazníka operátorovi."
-                    ),
-                }
-            )
-
-        fixed_svc = get_fixed_internet_service(customer)
-        if not fixed_svc:
-            return _json(
-                {
-                    "found": False,
-                    "error": "no_fixed_internet",
-                    "suggested_response": "Na Vašom účte neevidujem pevný internet. Prepájam Vás na operátora.",
-                    "suggested_action": "handover_to_human",
-                    "instruction": "Zavolaj handover_to_human so zhrnutím, skill='technical'.",
-                }
-            )
-
-        router_model = fixed_svc.get("router_model")
-
-        state = _get_state(conversation_id)
-        state["customer_id"] = customer["id"]
-        state["phone_number"] = phone_number
-        state["service_point"] = {
-            "address": fixed_svc["address"],
-            "service_point_id": fixed_svc["service_point_id"],
-        }
-        state["router_model"] = router_model
-
-        if conversation_id:
-            _nlp_set_state(
-                conversation_id,
-                {
-                    "service_point_id": fixed_svc["service_point_id"],
-                },
-            )
-
-        if not router_model:
-            return _json(
-                {
-                    "found": True,
-                    "address": fixed_svc["address"],
-                    "router_model": None,
-                    "error": "unknown_router",
-                    "suggested_response": f"Našla som Vašu adresu: {fixed_svc['address']}. Model Vášho routera však nemám v systéme evidovaný. Prepájam Vás na technickú podporu.",
-                    "suggested_action": "handover_to_human",
-                    "instruction": "Zavolaj handover_to_human so zhrnutím, skill='technical'.",
-                }
-            )
-
-        return _json(
-            {
-                "found": True,
-                "address": fixed_svc["address"],
-                "router_model": router_model,
-                "suggested_response": f"Našla som Vašu adresu: {fixed_svc['address']}. Je to správna adresa?",
-                "instruction": "Ak zákazník potvrdí adresu, zavolaj get_troubleshooting_steps().",
-            }
+                for iid in target_ids
+            ],
+            return_exceptions=True,
         )
 
-    @mcp_tool(
-        name="get_info_router",
-        description=(
-            "Retrieve the router model for the customer's service point. "
-            "Requires find_service_point() to have been called first. "
-            "Returns router model, which is needed before get_troubleshooting_steps()."
-        ),
-        registry=registry,
-    )
-    def get_info_router(
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conversation_id = (_meta or {}).get("conversation_id", "")
-        state = _get_state(conversation_id)
-
-        if not state.get("service_point"):
-            return _json(
-                {
-                    "success": False,
-                    "error": "no_service_point",
-                    "message": "Najprv zavolajte find_service_point().",
-                }
-            )
-
-        router_model = state.get("router_model")
-        if not router_model:
-            return _json(
-                {
-                    "success": False,
-                    "error": "unknown_router",
-                    "suggested_response": "Model Vášho routera nemám v systéme evidovaný. Prepájam Vás na technickú podporu.",
-                    "suggested_action": "handover_to_human",
-                    "instruction": "Zavolaj handover_to_human so zhrnutím, skill='technical'.",
-                }
-            )
-
-        return _json(
-            {
-                "success": True,
-                "router_model": router_model,
-            }
-        )
-
-    @mcp_tool(
-        name="get_troubleshooting_steps",
-        description=(
-            "Get WiFi/internet troubleshooting steps. Two phases:\n"
-            "Phase 1 (diagnosis): Returns a question to identify the problem type. "
-            "Call again with step_result containing the customer's answer.\n"
-            "Phase 2 (troubleshooting): Returns the next step. After the customer tries it, "
-            "call again with step_result='resolved', 'not_resolved', or 'skipped'.\n"
-            "channel: 'call' (voice — simple spoken instructions) or 'chat' (markdown with images). "
-            "Set channel on first call, tool remembers it.\n"
-            "step_result: customer's answer (phase 1) or step outcome (phase 2)."
-        ),
-        registry=registry,
-    )
-    def get_troubleshooting_steps(
-        channel: str,
-        step_result: str | None = None,
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conversation_id = (_meta or {}).get("conversation_id", "")
-        state = _get_state(conversation_id)
-        router_model = state.get("router_model")
-
-        if not router_model:
-            return _json(
-                {
-                    "success": False,
-                    "error": "no_router_info",
-                    "message": "Najprv zavolajte get_info_router().",
-                }
-            )
-
-        # Set channel on first call, remember for subsequent; default to chat
-        ch = channel.strip().lower() if channel else ""
-        if ch in ("call", "chat"):
-            state["channel"] = ch
-        elif state.get("channel"):
-            ch = state["channel"]
-        else:
-            ch = "chat"
-            state["channel"] = ch
-
-        # ── Phase 1: Diagnosis ──
-        if not state.get("problem_type"):
-            if step_result:
-                matched = match_problem_type(step_result)
-                if matched:
-                    state["problem_type"] = matched
-                    state["current_step_index"] = 0
-                    state["completed_steps"] = []
-                    # Fall through to Phase 2
-                else:
-                    return _json(
-                        {
-                            "phase": "diagnosis",
-                            "error": "unrecognized_answer",
-                            "question": DIAGNOSTIC_QUESTION,
-                            "options": DIAGNOSTIC_OPTIONS,
-                            "instruction": (
-                                "Odpoveď zákazníka nebola rozpoznaná. "
-                                "Skúste sa opýtať znova alebo vyberte z možností."
-                            ),
-                        }
-                    )
+        all_docs: list[dict[str, Any]] = []
+        total = 0
+        has_next = False
+        errors: list[dict[str, Any]] = []
+        for iid, result in zip(target_ids, raw_results):
+            if isinstance(result, IndexerError):
+                logger.warning("list_documents indexer error (index_id=%s): %s", iid, result)
+                errors.append({"index_id": iid, "error": str(result)})
+            elif isinstance(result, Exception):
+                logger.warning("list_documents unexpected error (index_id=%s): %s", iid, result)
+                errors.append({"index_id": iid, "error": str(result)})
             else:
-                return _json(
-                    {
-                        "phase": "diagnosis",
-                        "question": DIAGNOSTIC_QUESTION,
-                        "options": DIAGNOSTIC_OPTIONS,
-                        "instruction": DIAGNOSTIC_INSTRUCTION,
-                    }
-                )
+                all_docs.extend(_doc_summary(d) for d in result.get("data", []))
+                total += result.get("total", 0)
+                if result.get("has_next"):
+                    has_next = True
 
-        # ── Phase 2: Step-by-step troubleshooting ──
-        _VALID_STEP_RESULTS = {"resolved", "not_resolved", "skipped"}
-
-        problem_type = state["problem_type"]
-        step_ids = STEPS_BY_PROBLEM.get(problem_type, [])
-
-        # Process previous step result
-        if step_result and state["completed_steps"] is not None and state["current_step_index"] > 0:
-            result_lower = step_result.strip().lower()
-
-            if result_lower not in _VALID_STEP_RESULTS:
-                return _json(
-                    {
-                        "error": "invalid_step_result",
-                        "valid_values": sorted(_VALID_STEP_RESULTS),
-                        "instruction": (
-                            "Opýtaj sa zákazníka, či krok pomohol. "
-                            "Zavolaj tool znova s step_result='resolved', 'not_resolved' alebo 'skipped'."
-                        ),
-                    }
-                )
-
-            prev_idx = state["current_step_index"] - 1
-            if prev_idx < len(step_ids):
-                prev_step_id = step_ids[prev_idx]
-
-                if result_lower == "resolved":
-                    state["completed_steps"].append({"step_id": prev_step_id, "result": "resolved"})
-                    if conversation_id:
-                        _nlp_set_state(conversation_id, {"troubleshooting_result": "resolved"})
-                    return _json(
-                        {
-                            "phase": "resolved",
-                            "suggested_response": "Výborne! Teším sa, že sme to vyriešili. Ak by ste potrebovali ďalšiu pomoc, neváhajte zavolať.",
-                        }
-                    )
-                if result_lower == "skipped":
-                    state["completed_steps"].append({"step_id": prev_step_id, "result": "skipped"})
-                    if conversation_id:
-                        _nlp_set_state(
-                            conversation_id,
-                            {
-                                "troubleshooting_last_step": prev_step_id,
-                                "troubleshooting_last_result": "skipped",
-                            },
-                        )
-                else:
-                    state["completed_steps"].append(
-                        {"step_id": prev_step_id, "result": "not_resolved"}
-                    )
-                    if conversation_id:
-                        _nlp_set_state(
-                            conversation_id,
-                            {
-                                "troubleshooting_last_step": prev_step_id,
-                                "troubleshooting_last_result": "not_resolved",
-                            },
-                        )
-
-        # Get next step
-        idx = state["current_step_index"]
-        if idx >= len(step_ids):
-            return _json(
-                {
-                    "phase": "escalate",
-                    "suggested_response": "Vyskúšali sme všetky kroky, ale problém pretrváva. Prepájam Vás na technickú podporu.",
-                    "suggested_action": "handover_to_human",
-                    "instruction": "Zavolaj handover_to_human so zhrnutím vyskúšaných krokov, skill='technical'.",
-                }
-            )
-
-        current_step_id = step_ids[idx]
-        state["current_step_index"] = idx + 1
-
-        step_data = get_step(current_step_id, ch, router_model)
-        step_data["step_number"] = idx + 1
-        step_data["total_steps"] = len(step_ids)
-
-        response: dict[str, Any] = {
-            "phase": "troubleshooting",
-            "problem_type": problem_type,
-            "step": step_data,
+        payload: dict[str, Any] = {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_next": has_next,
+            "documents": all_docs,
         }
+        if errors:
+            payload["errors"] = errors
+        return _json(payload)
 
-        # Offer SMS for call channel on complex steps
-        if ch == "call" and current_step_id in ("channel_change", "check_service_mode"):
-            phone = state.get("phone_number")
-            response["sms_offer"] = {
-                "available": bool(phone),
-                "phone_number": phone,
-                "message": "Môžem vám zaslať SMS s odkazom na podrobný postup.",
-                "sms_link": "https://www.telekom.sk/wiki/internet/nefunguje-mi-wi-fi",
+    @mcp.tool(annotations=read_only)
+    async def search(
+        query: Annotated[
+            str, pydantic.Field(min_length=1, description="Natural-language question or keywords")
+        ],
+        top_k: Annotated[
+            int,
+            pydantic.Field(
+                ge=1,
+                le=100,
+                description="Number of result snippets to return per index.",
+            ),
+        ] = 5,
+        labels: Annotated[
+            list[str] | None,
+            pydantic.Field(
+                description=(
+                    "Optional labels filter — restrict search to documents carrying all listed "
+                    "labels. Use list_labels() to discover available labels."
+                )
+            ),
+        ] = None,
+        retrieval_mode: Annotated[
+            Literal["vector", "hybrid_bm25"],
+            pydantic.Field(
+                description=(
+                    "`vector` = dense semantic only (default). `hybrid_bm25` = blend dense + BM25 "
+                    "full-text; better for keyword-heavy queries (Milvus-only)."
+                )
+            ),
+        ] = "vector",
+        bm25_weight: Annotated[
+            float,
+            pydantic.Field(
+                ge=0.0,
+                le=1.0,
+                description=(
+                    "Weight of BM25 in the hybrid blend (0.0 = dense only, 1.0 = BM25 only). "
+                    "Ignored when retrieval_mode='vector'."
+                ),
+            ),
+        ] = 0.4,
+        amount_adjacent_snippets: Annotated[
+            int,
+            pydantic.Field(
+                ge=0,
+                le=5,
+                description=(
+                    "If > 0, also fetch N neighboring chunks for each hit (more context, more "
+                    "tokens). Milvus/BYO only."
+                ),
+            ),
+        ] = 0,
+    ) -> str:
+        """Search the knowledge base. Fans out to all indexes in parallel and merges results.
+
+        Returns documents with snippet text (no per-chunk scores). When multiple indexes are
+        configured, top_k applies per index so the total document count may exceed top_k.
+        """
+        logger.info(
+            "search query=%r top_k=%s labels=%s mode=%s adj=%s index_ids=%s",
+            query,
+            top_k,
+            labels,
+            retrieval_mode,
+            amount_adjacent_snippets,
+            index_ids,
+        )
+        raw_results = await asyncio.gather(
+            *[
+                client.search(
+                    query=query,
+                    index_id=iid,
+                    organization_id=organization_id,
+                    project_id=project_id,
+                    top_k=top_k,
+                    labels=labels,
+                    retrieval_mode=retrieval_mode,
+                    bm25_weight=bm25_weight,
+                    amount_adjacent_snippets=amount_adjacent_snippets,
+                )
+                for iid in index_ids
+            ],
+            return_exceptions=True,
+        )
+
+        seen_doc_ids: set[int] = set()
+        all_docs: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for iid, result in zip(index_ids, raw_results):
+            if isinstance(result, Exception):
+                logger.warning("search indexer error (index_id=%s): %s", iid, result)
+                errors.append({"index_id": iid, "error": str(result)})
+                continue
+            for d in result.get("documents", []):
+                doc_id = d.get("id")
+                if doc_id in seen_doc_ids:
+                    continue
+                seen_doc_ids.add(doc_id)
+                all_docs.append(
+                    {
+                        "id": doc_id,
+                        "name": d.get("name"),
+                        "url": d.get("url"),
+                        "annotation": d.get("annotation"),
+                        "labels": d.get("labels") or [],
+                        "chunks": d.get("chunks") or [],
+                    }
+                )
+
+        payload: dict[str, Any] = {"documents": all_docs}
+        if errors:
+            payload["errors"] = errors
+        return _json(payload)
+
+    @mcp.tool(annotations=read_only)
+    async def get_document(
+        document_id: Annotated[
+            int, pydantic.Field(ge=1, description="Document ID from search or list_documents")
+        ],
+        include_chunks: Annotated[  # noqa: FBT002 — MCP tools are keyword-called by the LLM
+            bool,
+            pydantic.Field(
+                description="If true, also fetch full chunk list for the document (BYO/Milvus only).",
+            ),
+        ] = True,
+    ) -> str:
+        """Return full metadata and (optionally) the chunks of a single document."""
+        logger.info("get_document document_id=%s include_chunks=%s", document_id, include_chunks)
+        try:
+            if include_chunks:
+                doc, chunks = await asyncio.gather(
+                    client.get_document(document_id),
+                    client.list_chunks(document_id),
+                )
+            else:
+                doc = await client.get_document(document_id)
+                chunks = None
+        except IndexerError as exc:
+            logger.warning("get_document indexer error: %s", exc)
+            return _error("indexer_request_failed", exc)
+
+        payload: dict[str, Any] = {
+            "id": doc.get("id"),
+            "name": doc.get("name"),
+            "annotation": doc.get("annotation"),
+            "labels": doc.get("labels") or [],
+            "url": doc.get("url"),
+            "tokens_count": doc.get("tokens_count"),
+            "created_at": doc.get("created_at"),
+            "updated_at": doc.get("updated_at"),
+        }
+        if chunks is not None:
+            payload["chunks"] = [
+                {
+                    "id": c.get("id"),
+                    "title": c.get("title"),
+                    "text": c.get("text"),
+                    "annotation": c.get("annotation"),
+                }
+                for c in chunks.get("chunks", [])
+            ]
+        return _json(payload)
+
+    @mcp.tool(annotations=read_only)
+    async def list_labels(
+        refresh: Annotated[  # noqa: FBT002 — MCP tools are keyword-called by the LLM
+            bool,
+            pydantic.Field(description="Bypass cache and recompute from the indexer."),
+        ] = False,
+    ) -> str:
+        """List the distinct labels present in the knowledge base (useful for filter discovery)."""
+        logger.info("list_labels refresh=%s", refresh)
+        if refresh:
+            await labels_cache.invalidate()
+
+        async def _compute() -> dict[str, Any]:
+            labels_seen: set[str] = set()
+            document_count = 0
+            page_size = 100
+            for iid in index_ids:
+                page = 1
+                while True:
+                    result = await client.list_documents(
+                        index_id=iid, page=page, limit=page_size
+                    )
+                    docs = result.get("data", [])
+                    document_count += len(docs)
+                    for d in docs:
+                        for label in d.get("labels") or []:
+                            labels_seen.add(label)
+                    if not result.get("has_next"):
+                        break
+                    page += 1
+            return {
+                "labels": sorted(labels_seen),
+                "document_count": document_count,
+                "cached_at": dt.datetime.now(dt.UTC).isoformat(),
             }
 
-        return _json(response)
+        try:
+            payload = await labels_cache.get_or_compute(_compute)
+        except IndexerError as exc:
+            logger.warning("list_labels indexer error: %s", exc)
+            return _error("indexer_request_failed", exc)
+        return _json(payload)
