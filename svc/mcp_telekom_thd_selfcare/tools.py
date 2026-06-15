@@ -58,7 +58,7 @@ def register(
     mcp: FastMCP,
     client: IndexerClient,
     labels_cache: LabelsCache,
-    index_id: int,
+    index_ids: list[int],
     organization_id: str,
     project_id: str,
     logger: logging.Logger,
@@ -66,8 +66,15 @@ def register(
     """Register the 4 RAG tools on the given FastMCP instance.
 
     The indexer connection parameters are captured by closure — the LLM never sees them.
+    When multiple index_ids are provided, list_documents and search fan out to all of them
+    in parallel and merge the results. All indexes share the same organization and project.
     """
     read_only = ToolAnnotations(readOnlyHint=True, idempotentHint=True)
+
+    _index_ids_hint = (
+        f"Available index IDs: {index_ids}. "
+        "When omitted, all indexes are queried and results are merged."
+    )
 
     @mcp.tool(annotations=read_only)
     async def list_documents(
@@ -91,34 +98,64 @@ def register(
         sort_direction: Annotated[
             Literal["asc", "desc"], pydantic.Field(description="Sort direction")
         ] = "desc",
+        index_id: Annotated[
+            int | None,
+            pydantic.Field(description=f"Restrict to a specific index. {_index_ids_hint}"),
+        ] = None,
     ) -> str:
         """List documents in the knowledge base with their labels and annotations."""
+        target_ids = [index_id] if index_id is not None else index_ids
         logger.info(
-            "list_documents page=%s limit=%s search=%r labels=%s", page, limit, search, labels
+            "list_documents page=%s limit=%s search=%r labels=%s index_ids=%s",
+            page,
+            limit,
+            search,
+            labels,
+            target_ids,
         )
-        try:
-            result = await client.list_documents(
-                index_id=index_id,
-                page=page,
-                limit=limit,
-                search=search,
-                labels=labels,
-                sort_column=sort_column,
-                sort_direction=sort_direction,
-            )
-        except IndexerError as exc:
-            logger.warning("list_documents indexer error: %s", exc)
-            return _error("indexer_request_failed", exc)
+        raw_results = await asyncio.gather(
+            *[
+                client.list_documents(
+                    index_id=iid,
+                    page=page,
+                    limit=limit,
+                    search=search,
+                    labels=labels,
+                    sort_column=sort_column,
+                    sort_direction=sort_direction,
+                )
+                for iid in target_ids
+            ],
+            return_exceptions=True,
+        )
 
-        return _json(
-            {
-                "page": result.get("page"),
-                "limit": result.get("limit"),
-                "total": result.get("total"),
-                "has_next": result.get("has_next"),
-                "documents": [_doc_summary(d) for d in result.get("data", [])],
-            }
-        )
+        all_docs: list[dict[str, Any]] = []
+        total = 0
+        has_next = False
+        errors: list[dict[str, Any]] = []
+        for iid, result in zip(target_ids, raw_results):
+            if isinstance(result, IndexerError):
+                logger.warning("list_documents indexer error (index_id=%s): %s", iid, result)
+                errors.append({"index_id": iid, "error": str(result)})
+            elif isinstance(result, Exception):
+                logger.warning("list_documents unexpected error (index_id=%s): %s", iid, result)
+                errors.append({"index_id": iid, "error": str(result)})
+            else:
+                all_docs.extend(_doc_summary(d) for d in result.get("data", []))
+                total += result.get("total", 0)
+                if result.get("has_next"):
+                    has_next = True
+
+        payload: dict[str, Any] = {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "has_next": has_next,
+            "documents": all_docs,
+        }
+        if errors:
+            payload["errors"] = errors
+        return _json(payload)
 
     @mcp.tool(annotations=read_only)
     async def search(
@@ -126,7 +163,12 @@ def register(
             str, pydantic.Field(min_length=1, description="Natural-language question or keywords")
         ],
         top_k: Annotated[
-            int, pydantic.Field(ge=1, le=100, description="Number of result snippets to return")
+            int,
+            pydantic.Field(
+                ge=1,
+                le=100,
+                description="Number of result snippets to return per index.",
+            ),
         ] = 5,
         labels: Annotated[
             list[str] | None,
@@ -169,43 +211,66 @@ def register(
             ),
         ] = 0,
     ) -> str:
-        """Search the knowledge base. Returns documents with snippet text (no per-chunk scores)."""
+        """Search the knowledge base. Fans out to all indexes in parallel and merges results.
+
+        Returns documents with snippet text (no per-chunk scores). When multiple indexes are
+        configured, top_k applies per index so the total document count may exceed top_k.
+        """
         logger.info(
-            "search query=%r top_k=%s labels=%s mode=%s adj=%s",
+            "search query=%r top_k=%s labels=%s mode=%s adj=%s index_ids=%s",
             query,
             top_k,
             labels,
             retrieval_mode,
             amount_adjacent_snippets,
+            index_ids,
         )
-        try:
-            result = await client.search(
-                query=query,
-                index_id=index_id,
-                organization_id=organization_id,
-                project_id=project_id,
-                top_k=top_k,
-                labels=labels,
-                retrieval_mode=retrieval_mode,
-                bm25_weight=bm25_weight,
-                amount_adjacent_snippets=amount_adjacent_snippets,
-            )
-        except IndexerError as exc:
-            logger.warning("search indexer error: %s", exc)
-            return _error("indexer_request_failed", exc)
+        raw_results = await asyncio.gather(
+            *[
+                client.search(
+                    query=query,
+                    index_id=iid,
+                    organization_id=organization_id,
+                    project_id=project_id,
+                    top_k=top_k,
+                    labels=labels,
+                    retrieval_mode=retrieval_mode,
+                    bm25_weight=bm25_weight,
+                    amount_adjacent_snippets=amount_adjacent_snippets,
+                )
+                for iid in index_ids
+            ],
+            return_exceptions=True,
+        )
 
-        documents = [
-            {
-                "id": d.get("id"),
-                "name": d.get("name"),
-                "url": d.get("url"),
-                "annotation": d.get("annotation"),
-                "labels": d.get("labels") or [],
-                "chunks": d.get("chunks") or [],
-            }
-            for d in result.get("documents", [])
-        ]
-        return _json({"documents": documents})
+        seen_doc_ids: set[int] = set()
+        all_docs: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for iid, result in zip(index_ids, raw_results):
+            if isinstance(result, Exception):
+                logger.warning("search indexer error (index_id=%s): %s", iid, result)
+                errors.append({"index_id": iid, "error": str(result)})
+                continue
+            for d in result.get("documents", []):
+                doc_id = d.get("id")
+                if doc_id in seen_doc_ids:
+                    continue
+                seen_doc_ids.add(doc_id)
+                all_docs.append(
+                    {
+                        "id": doc_id,
+                        "name": d.get("name"),
+                        "url": d.get("url"),
+                        "annotation": d.get("annotation"),
+                        "labels": d.get("labels") or [],
+                        "chunks": d.get("chunks") or [],
+                    }
+                )
+
+        payload: dict[str, Any] = {"documents": all_docs}
+        if errors:
+            payload["errors"] = errors
+        return _json(payload)
 
     @mcp.tool(annotations=read_only)
     async def get_document(
@@ -271,18 +336,21 @@ def register(
         async def _compute() -> dict[str, Any]:
             labels_seen: set[str] = set()
             document_count = 0
-            page = 1
             page_size = 100
-            while True:
-                result = await client.list_documents(index_id=index_id, page=page, limit=page_size)
-                docs = result.get("data", [])
-                document_count += len(docs)
-                for d in docs:
-                    for label in d.get("labels") or []:
-                        labels_seen.add(label)
-                if not result.get("has_next"):
-                    break
-                page += 1
+            for iid in index_ids:
+                page = 1
+                while True:
+                    result = await client.list_documents(
+                        index_id=iid, page=page, limit=page_size
+                    )
+                    docs = result.get("data", [])
+                    document_count += len(docs)
+                    for d in docs:
+                        for label in d.get("labels") or []:
+                            labels_seen.add(label)
+                    if not result.get("has_next"):
+                        break
+                    page += 1
             return {
                 "labels": sorted(labels_seen),
                 "document_count": document_count,

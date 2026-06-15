@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
+
+import pydantic
 
 from lib.mcp_service import MCPService, MCPServiceConfig
 
@@ -19,15 +21,23 @@ class MCPTelekomThdSelfcareConfig(MCPServiceConfig):
     mcp_name: str = "mcp-telekom-thd-selfcare"
 
     indexer_url: str
-    indexer_index_id: int
+    indexer_index_ids: list[int]
     indexer_organization_id: str
     indexer_project_id: str
     indexer_timeout_seconds: float = 30.0
     indexer_labels_cache_ttl_seconds: int = 300
 
+    @pydantic.field_validator("indexer_index_ids", mode="before")
+    @classmethod
+    def _parse_index_ids(cls, v: Any) -> Any:
+        """Accept comma-separated string (e.g. "101,102") in addition to JSON list."""
+        if isinstance(v, str):
+            return [int(x.strip()) for x in v.split(",") if x.strip()]
+        return v
+
 
 class MCPTelekomThdSelfcare(MCPService[MCPTelekomThdSelfcareConfig]):
-    """RAG facade over a single indexer knowledge base (Milvus/BYO)."""
+    """RAG facade over one or more indexer knowledge bases (Milvus/BYO)."""
 
     NAME = "mcp-telekom-thd-selfcare"
     TEAM = "telekom"
@@ -50,7 +60,7 @@ class MCPTelekomThdSelfcare(MCPService[MCPTelekomThdSelfcareConfig]):
             mcp=mcp,
             client=client,
             labels_cache=labels_cache,
-            index_id=config.indexer_index_id,
+            index_ids=config.indexer_index_ids,
             organization_id=config.indexer_organization_id,
             project_id=config.indexer_project_id,
             logger=self.logger,
