@@ -20,11 +20,7 @@ import json
 import logging
 import os
 import re
-import threading
-import time
 import unicodedata
-import urllib.error
-import urllib.request
 
 import httpx
 from datetime import date, datetime, timedelta
@@ -141,7 +137,7 @@ _NLP_TIMEOUT_SECONDS = 1.0
 
 
 def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
-    """Mirror named_entities locally. Call _nlp_flush() to push to NLP engine."""
+    """Store named_entities in the per-conversation session store (single source of truth)."""
     if not conversation_id:
         return
     current = _NLP_MIRROR_STATE.get(conversation_id) or {}
@@ -189,51 +185,16 @@ async def _nlp_load(conversation_id: str) -> None:
 
 
 def _nlp_flush(conversation_id: str) -> None:
-    """Fire-and-forget PUT of current mirror state to NLP engine.
+    """No-op: identity state is kept only in the session store (``_NLP_MIRROR_STATE``).
 
-    Retries up to 3 times on 429, honouring the Retry-After header.
-    Errors are logged at WARNING and never raised.
+    Previously this fire-and-forget PUT mirrored state to the NLP engine
+    (``PUT /conversations/{id}/states``). That external write has been removed —
+    everything written via :func:`_nlp_set_state` already lives in the per-
+    conversation session store, which is the single source of truth. The call
+    sites are retained as harmless checkpoints so the flow stays unchanged if a
+    push-back is ever reintroduced.
     """
-    if not conversation_id:
-        return
-    entities = _NLP_MIRROR_STATE.get(conversation_id)
-    if not entities:
-        return
-
-    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
-    payload = {"named_entities": entities}
-    body = json.dumps(payload, ensure_ascii=False).encode()
-
-    def _do() -> None:
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            req = urllib.request.Request(
-                url, data=body, method="PUT",
-                headers={"Content-Type": "application/json"},
-            )
-            _log.info("NLP state PUT %s body=%s", url, json.dumps(payload, ensure_ascii=False))
-            try:
-                with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
-                    _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
-                    return
-            except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < max_retries:
-                    retry_after = float(
-                        exc.headers.get("Retry-After") or exc.headers.get("retry-after") or "1"
-                    )
-                    _log.warning(
-                        "NLP state PUT %s -> 429, retry in %.1fs (%d/%d)",
-                        url, retry_after, attempt, max_retries,
-                    )
-                    time.sleep(retry_after)
-                else:
-                    _log.warning("NLP state PUT %s -> HTTP %s", url, exc.code)
-                    return
-            except Exception as exc:
-                _log.warning("NLP state PUT %s -> error: %s", url, exc)
-                return
-
-    threading.Thread(target=_do, daemon=True, name="nlp-state-put-identity").start()
+    return
 
 
 # "Kód zákazníka" or "Kód účtu" — numeric code 8-12 digits, no separators.
