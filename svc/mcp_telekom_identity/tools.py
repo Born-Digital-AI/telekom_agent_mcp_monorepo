@@ -20,7 +20,11 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import unicodedata
+import urllib.error
+import urllib.request
 
 import httpx
 from datetime import date, datetime, timedelta
@@ -185,16 +189,63 @@ async def _nlp_load(conversation_id: str) -> None:
 
 
 def _nlp_flush(conversation_id: str) -> None:
-    """No-op: identity state is kept only in the session store (``_NLP_MIRROR_STATE``).
+    """Fire-and-forget PUT of the *delta* of named_entities to the NLP engine.
 
-    Previously this fire-and-forget PUT mirrored state to the NLP engine
-    (``PUT /conversations/{id}/states``). That external write has been removed —
-    everything written via :func:`_nlp_set_state` already lives in the per-
-    conversation session store, which is the single source of truth. The call
-    sites are retained as harmless checkpoints so the flow stays unchanged if a
-    push-back is ever reintroduced.
+    The session store (:data:`_NLP_MIRROR_STATE`) holds the full cumulative state.
+    We only push entities that changed or were newly added since the last
+    acknowledged push (tracked in :data:`_NLP_FLUSHED_STATE`) — not the whole set.
+
+    On a successful PUT the current snapshot is recorded as acknowledged, so the
+    next flush diffs against it. On failure nothing is acknowledged, so the
+    pending entities are retried on the next flush. Retries up to 3 times on 429
+    honouring Retry-After. Errors are logged at WARNING and never raised.
     """
-    return
+    if not conversation_id:
+        return
+    current = dict(_NLP_MIRROR_STATE.get(conversation_id) or {})
+    if not current:
+        return
+    last = _NLP_FLUSHED_STATE.get(conversation_id) or {}
+    delta = {k: v for k, v in current.items() if last.get(k) != v}
+    if not delta:
+        return  # nothing changed since the last push
+
+    url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
+    payload = {"named_entities": delta}
+    body = json.dumps(payload, ensure_ascii=False).encode()
+
+    def _do() -> None:
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            req = urllib.request.Request(
+                url, data=body, method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            _log.info("NLP state PUT %s delta=%s", url, json.dumps(payload, ensure_ascii=False))
+            try:
+                with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
+                    _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
+                    # Acknowledge: NLP now holds everything in `current`.
+                    _NLP_FLUSHED_STATE.set(conversation_id, current)
+                    return
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < max_retries:
+                    retry_after = float(
+                        exc.headers.get("Retry-After") or exc.headers.get("retry-after") or "1"
+                    )
+                    _log.warning(
+                        "NLP state PUT %s -> 429, retry in %.1fs (%d/%d)",
+                        url, retry_after, attempt, max_retries,
+                    )
+                    time.sleep(retry_after)
+                else:
+                    _log.warning("NLP state PUT %s -> HTTP %s", url, exc.code)
+                    return
+            except Exception as exc:
+                _log.warning("NLP state PUT %s -> error: %s", url, exc)
+                return
+
+    threading.Thread(target=_do, daemon=True, name="nlp-state-put-identity").start()
 
 
 # "Kód zákazníka" or "Kód účtu" — numeric code 8-12 digits, no separators.
@@ -248,6 +299,11 @@ _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_S
 # `nastav_test_kontext` debug tool simulate that state without a real NLP.
 _NLP_MIRROR_TTL_SECONDS = 30 * 60
 _NLP_MIRROR_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
+
+# Last snapshot acknowledged by the NLP engine (HTTP 2xx on PUT /states). _nlp_flush
+# diffs the mirror against this to push only changed/new named_entities. Same TTL as
+# the mirror so both expire together for an idle conversation.
+_NLP_FLUSHED_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
 
 # Authentication
 _AUTH_TTL_SECONDS = 30 * 60

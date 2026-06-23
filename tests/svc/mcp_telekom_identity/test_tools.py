@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 from typing import Any
 
 import pytest
@@ -159,6 +160,9 @@ def _reset_identity_state_and_silence_nlp(monkeypatch):
         ttl_seconds=identity_tools._IDENTITY_TTL_SECONDS,
     )
     identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
+        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
+    )
+    identity_tools._NLP_FLUSHED_STATE = type(identity_tools._NLP_FLUSHED_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
     identity_tools._AUTH_STATE = type(identity_tools._AUTH_STATE)(
@@ -1596,6 +1600,98 @@ def test_nlp_get_named_entities_returns_empty_for_unknown_conv() -> None:
     from svc.mcp_telekom_identity.tools import _nlp_get_named_entities
 
     assert _nlp_get_named_entities("nonexistent-conv") == {}
+
+
+@pytest.mark.unit
+def test_nlp_flush_puts_only_delta(monkeypatch) -> None:
+    """_nlp_flush pushes only changed/new named_entities, not the full set."""
+    from svc.mcp_telekom_identity import tools as identity_tools
+
+    # Run the fire-and-forget PUT synchronously and capture request bodies.
+    sent: list[dict] = []
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+        sent.append(json.loads(req.data.decode()))
+        return _Resp()
+
+    class _SyncThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
+
+    conv = "conv-delta"
+    # First flush: everything is new → full set goes out.
+    identity_tools._NLP_MIRROR_STATE.set(conv, {"a": "1", "b": "2"})
+    identity_tools._nlp_flush(conv)
+    assert sent[-1] == {"named_entities": {"a": "1", "b": "2"}}
+
+    # Change `a`, add `c`, keep `b` → only the delta goes out.
+    identity_tools._NLP_MIRROR_STATE.set(conv, {"a": "9", "b": "2", "c": "3"})
+    identity_tools._nlp_flush(conv)
+    assert sent[-1] == {"named_entities": {"a": "9", "c": "3"}}
+
+    # No change since last acknowledged push → no PUT at all.
+    before = len(sent)
+    identity_tools._nlp_flush(conv)
+    assert len(sent) == before
+
+
+@pytest.mark.unit
+def test_nlp_flush_failure_keeps_entities_pending(monkeypatch) -> None:
+    """A failed PUT does not acknowledge, so the entities are retried on the next flush."""
+    from svc.mcp_telekom_identity import tools as identity_tools
+
+    sent: list[dict] = []
+    fail_next = {"value": True}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+        sent.append(json.loads(req.data.decode()))
+        if fail_next["value"]:
+            raise urllib.error.URLError("boom")
+        return _Resp()
+
+    class _SyncThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
+
+    conv = "conv-fail"
+    identity_tools._NLP_MIRROR_STATE.set(conv, {"a": "1"})
+    identity_tools._nlp_flush(conv)  # fails → not acknowledged
+    assert sent[-1] == {"named_entities": {"a": "1"}}
+
+    fail_next["value"] = False
+    identity_tools._nlp_flush(conv)  # retried, same entities resent, now succeeds
+    assert sent[-1] == {"named_entities": {"a": "1"}}
+    assert len(sent) == 2
 
 
 # ---- autentifikacia ----
