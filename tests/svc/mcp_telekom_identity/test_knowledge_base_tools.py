@@ -50,6 +50,8 @@ class _FakeClient:
         self.search_responses: list[dict[str, Any] | Exception] = []
         self.get_document_responses: list[dict[str, Any] | Exception] = []
         self.list_chunks_responses: list[dict[str, Any] | Exception] = []
+        # name -> index record (with "id"); used by get_index_by_name.
+        self.index_by_name: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     @staticmethod
@@ -74,6 +76,14 @@ class _FakeClient:
     async def list_chunks(self, document_id: int) -> dict[str, Any]:
         self.calls.append(("list_chunks", {"document_id": document_id}))
         return self._take(self.list_chunks_responses)
+
+    async def get_index_by_name(
+        self, name: str, *, organization_id: str, project_id: str
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("get_index_by_name", {"name": name, "org": organization_id, "proj": project_id})
+        )
+        return self.index_by_name[name]
 
 
 @pytest.fixture
@@ -262,6 +272,38 @@ async def test_list_labels_refresh_busts_cache(fixture) -> None:
 
     second = json.loads(await tools[LABELS_TOOL](refresh=True))
     assert second["labels"] == ["a", "b"]
+
+
+@pytest.mark.unit
+async def test_index_names_are_resolved_to_ids_and_cached() -> None:
+    """index_names → resolved to ids via get_index_by_name once, then reused (cached)."""
+    fake_mcp = _FakeMCP()
+    client = _FakeClient()
+    client.index_by_name = {"kb-faq": {"id": 442}, "kb-docs": {"id": 457}}
+    register_knowledge_base_tools(
+        mcp=fake_mcp,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        labels_cache=LabelsCache(ttl_seconds=60),
+        index_names=["kb-faq", "kb-docs"],
+        organization_id="org-1",
+        project_id="proj-1",
+        logger=logging.getLogger("test"),
+    )
+    tools = fake_mcp.registered
+
+    client.search_responses.extend([{"documents": []}, {"documents": []}])
+    await tools[SEARCH_TOOL](query="q")
+
+    # Both names resolved exactly once, then search fanned out to the resolved ids.
+    resolved_calls = [c for c in client.calls if c[0] == "get_index_by_name"]
+    assert {c[1]["name"] for c in resolved_calls} == {"kb-faq", "kb-docs"}
+    search_ids = sorted(c[1]["index_id"] for c in client.calls if c[0] == "search")
+    assert search_ids == [442, 457]
+
+    # Second call reuses the cached ids — no further resolution.
+    client.search_responses.extend([{"documents": []}, {"documents": []}])
+    await tools[SEARCH_TOOL](query="q2")
+    assert len([c for c in client.calls if c[0] == "get_index_by_name"]) == 2
 
 
 @pytest.mark.unit

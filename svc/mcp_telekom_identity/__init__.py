@@ -45,10 +45,14 @@ class MCPTelekomIdentityConfig(MCPServiceConfig):
     # service additionally exposes the znalostna_baza_* tools. Leave them unset to
     # run identity-only (the KB tools are simply not registered).
     indexer_url: str | None = None
+    # Address indexes either by numeric id (APP_INDEXER_INDEX_IDS) or by name
+    # (APP_INDEXER_INDEX_NAMES) — set exactly one. Names are resolved to ids at
+    # runtime via /indexes/by-name using organization_id + project_id.
     # NoDecode disables pydantic-settings' default JSON decoding of the env value so a plain
     # comma-separated string (e.g. "442,457,392") reaches the validator below instead of failing
     # the JSON parse in EnvSettingsSource.
     indexer_index_ids: Annotated[list[int], NoDecode] = []  # noqa: RUF012
+    indexer_index_names: Annotated[list[str], NoDecode] = []  # noqa: RUF012
     indexer_organization_id: str | None = None
     indexer_project_id: str | None = None
     indexer_timeout_seconds: float = 30.0
@@ -64,12 +68,22 @@ class MCPTelekomIdentityConfig(MCPServiceConfig):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
         return v
 
+    @pydantic.field_validator("indexer_index_names", mode="before")
+    @classmethod
+    def _parse_index_names(cls, v: Any) -> Any:
+        """Accept comma-separated string (e.g. "kb-faq,kb-docs") in addition to a JSON/list value."""
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v
+
     @property
     def knowledge_base_enabled(self) -> bool:
-        """True when every required indexer setting is present."""
+        """True when the indexer is reachable and at least one index (by id or name) is set."""
         return bool(
             self.indexer_url
-            and self.indexer_index_ids
+            and (self.indexer_index_ids or self.indexer_index_names)
             and self.indexer_organization_id
             and self.indexer_project_id
         )
@@ -135,13 +149,15 @@ class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
             client=client,
             labels_cache=labels_cache,
             index_ids=config.indexer_index_ids,
+            index_names=config.indexer_index_names,
             organization_id=config.indexer_organization_id,  # type: ignore[arg-type]
             project_id=config.indexer_project_id,  # type: ignore[arg-type]
             logger=_log,
         )
         _log.info(
-            "Knowledge-base tools enabled (indexes=%s, org=%s, project=%s).",
+            "Knowledge-base tools enabled (index_ids=%s, index_names=%s, org=%s, project=%s).",
             config.indexer_index_ids,
+            config.indexer_index_names,
             config.indexer_organization_id,
             config.indexer_project_id,
         )

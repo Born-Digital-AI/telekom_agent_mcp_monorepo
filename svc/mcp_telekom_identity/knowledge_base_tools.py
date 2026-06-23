@@ -67,7 +67,8 @@ def register_knowledge_base_tools(
     mcp: FastMCP,
     client: IndexerClient,
     labels_cache: LabelsCache,
-    index_ids: list[int],
+    index_ids: list[int] | None = None,
+    index_names: list[str] | None = None,
     organization_id: str,
     project_id: str,
     logger: logging.Logger,
@@ -75,10 +76,41 @@ def register_knowledge_base_tools(
     """Register the 4 knowledge-base tools on the given FastMCP instance.
 
     The indexer connection parameters are captured by closure — the LLM never sees them.
-    When multiple index_ids are provided, list_documents and search fan out to all of them
-    in parallel and merge the results. All indexes share the same organization and project.
+    Indexes are addressed either by numeric ``index_ids`` or by human ``index_names``
+    (resolved to ids on first use via /indexes/by-name and cached). When several indexes
+    are configured, list_documents and search fan out to all of them in parallel and merge
+    the results. All indexes share the same organization and project.
     """
     read_only = ToolAnnotations(readOnlyHint=True, idempotentHint=True)
+
+    configured_ids = list(index_ids or [])
+    configured_names = list(index_names or [])
+    # Lazily resolve index_names → ids the first time a tool runs (setup is sync; the
+    # by-name lookup is async). Cached afterwards; the lock prevents duplicate resolution
+    # under concurrent first calls.
+    _resolved_ids: list[int] = list(configured_ids)
+    _resolve_lock = asyncio.Lock()
+
+    async def _get_index_ids() -> list[int]:
+        nonlocal _resolved_ids
+        if _resolved_ids:
+            return _resolved_ids
+        async with _resolve_lock:
+            if _resolved_ids:
+                return _resolved_ids
+            resolved: list[int] = []
+            for name in configured_names:
+                info = await client.get_index_by_name(
+                    name, organization_id=organization_id, project_id=project_id
+                )
+                iid = info.get("id")
+                if iid is None:
+                    logger.warning("index name %r resolved to a record without an id", name)
+                    continue
+                resolved.append(int(iid))
+            _resolved_ids = resolved
+            logger.info("resolved index names %s → ids %s", configured_names, resolved)
+            return _resolved_ids
 
     @mcp.tool(name="znalostna_baza_zoznam_dokumentov", annotations=read_only)
     async def list_documents(
@@ -113,7 +145,7 @@ def register_knowledge_base_tools(
         ] = None,
     ) -> str:
         """Vypíš dokumenty v znalostnej báze aj s ich štítkami a anotáciami."""
-        target_ids = [index_id] if index_id is not None else index_ids
+        target_ids = [index_id] if index_id is not None else await _get_index_ids()
         logger.info(
             "znalostna_baza_zoznam_dokumentov page=%s limit=%s search=%r labels=%s index_ids=%s",
             page,
@@ -224,6 +256,7 @@ def register_knowledge_base_tools(
         Vracia dokumenty s úryvkami (bez per-chunk skóre). Pri viacerých indexoch sa top_k
         uplatní na každý index zvlášť, takže celkový počet dokumentov môže prekročiť top_k.
         """
+        target_ids = await _get_index_ids()
         logger.info(
             "znalostna_baza_vyhladaj query=%r top_k=%s labels=%s mode=%s adj=%s index_ids=%s",
             query,
@@ -231,7 +264,7 @@ def register_knowledge_base_tools(
             labels,
             retrieval_mode,
             amount_adjacent_snippets,
-            index_ids,
+            target_ids,
         )
         raw_results = await asyncio.gather(
             *[
@@ -246,7 +279,7 @@ def register_knowledge_base_tools(
                     bm25_weight=bm25_weight,
                     amount_adjacent_snippets=amount_adjacent_snippets,
                 )
-                for iid in index_ids
+                for iid in target_ids
             ],
             return_exceptions=True,
         )
@@ -254,7 +287,7 @@ def register_knowledge_base_tools(
         seen_doc_ids: set[int] = set()
         all_docs: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        for iid, result in zip(index_ids, raw_results):
+        for iid, result in zip(target_ids, raw_results):
             if isinstance(result, Exception):
                 logger.warning("znalostna_baza_vyhladaj error (index_id=%s): %s", iid, result)
                 errors.append({"index_id": iid, "error": str(result)})
@@ -349,7 +382,7 @@ def register_knowledge_base_tools(
             labels_seen: set[str] = set()
             document_count = 0
             page_size = 100
-            for iid in index_ids:
+            for iid in await _get_index_ids():
                 page = 1
                 while True:
                     result = await client.list_documents(

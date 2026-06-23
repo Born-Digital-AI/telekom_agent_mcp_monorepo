@@ -120,6 +120,16 @@ class IndexerClient:
             body["labels"] = labels
         return await self._request("POST", "/search/index", json=body)
 
+    async def get_index_by_name(
+        self, name: str, *, organization_id: str, project_id: str
+    ) -> dict[str, Any]:
+        """GET /indexes/by-name/{name}. Resolves a human index name to its record (incl. id)."""
+        return await self._request(
+            "GET",
+            f"/indexes/by-name/{name}",
+            params={"organization_id": organization_id, "project_id": project_id},
+        )
+
     async def get_document(self, document_id: int) -> dict[str, Any]:
         """GET /documents/{document_id}."""
         return await self._request("GET", f"/documents/{document_id}")
