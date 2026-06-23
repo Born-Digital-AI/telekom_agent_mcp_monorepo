@@ -1021,7 +1021,10 @@ def register(
         finally:
             _nlp_flush(conv)
 
-    @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=registry)
+    # SKRYTÉ z /mcp: registry=None → tool sa nezaregistruje do FastMCP, takže ho
+    # LLM/klient nevidí. Funkcia ostáva definovaná (interný flow ju vie použiť).
+    # Pre znovuzobrazenie zmeň registry=None späť na registry=registry.
+    @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=None)
     async def identifikacia_op(
         cislo_op: Annotated[
             str,
@@ -1048,7 +1051,9 @@ def register(
         finally:
             _nlp_flush(conv)
 
-    @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=registry)
+    # SKRYTÉ z /mcp: registry=None → tool sa nezaregistruje do FastMCP (viď komentár
+    # pri identifikacia_op). Pre znovuzobrazenie zmeň registry=None späť na registry=registry.
+    @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=None)
     async def identifikacia_pas(
         cislo_pasu: Annotated[
             str,
