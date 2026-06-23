@@ -897,8 +897,19 @@ def register(
     *,
     client: DPSGetClient,
     max_candidates: int = 10,
+    hidden_tools: frozenset[str] | None = None,
 ) -> None:
-    """Register identity tools onto the FastMCP registry."""
+    """Register identity tools onto the FastMCP registry.
+
+    Tools whose name is in ``hidden_tools`` are defined but NOT registered with
+    FastMCP, so they don't appear in ``/mcp``. Their logic stays intact (and
+    testable) — pass ``registry`` for a tool only when it should be visible.
+    """
+    hidden = hidden_tools or frozenset()
+
+    def _registry_for(name: str) -> ToolRegistry | None:
+        """Return the registry for ``name``, or None to skip registration (hidden)."""
+        return None if name in hidden else registry
 
     async def _identify_and_respond(
         identification_id: str,
@@ -1021,10 +1032,14 @@ def register(
         finally:
             _nlp_flush(conv)
 
-    # SKRYTÉ z /mcp: registry=None → tool sa nezaregistruje do FastMCP, takže ho
-    # LLM/klient nevidí. Funkcia ostáva definovaná (interný flow ju vie použiť).
-    # Pre znovuzobrazenie zmeň registry=None späť na registry=registry.
-    @mcp_tool(name="identifikacia_op", description=_OP_TOOL_DESCRIPTION, registry=None)
+    # Visibility controlled via `hidden_tools` (see register() + __init__.py).
+    # When hidden, _registry_for returns None → tool not registered with FastMCP,
+    # so it stays out of /mcp while its logic remains defined and testable.
+    @mcp_tool(
+        name="identifikacia_op",
+        description=_OP_TOOL_DESCRIPTION,
+        registry=_registry_for("identifikacia_op"),
+    )
     async def identifikacia_op(
         cislo_op: Annotated[
             str,
@@ -1051,9 +1066,12 @@ def register(
         finally:
             _nlp_flush(conv)
 
-    # SKRYTÉ z /mcp: registry=None → tool sa nezaregistruje do FastMCP (viď komentár
-    # pri identifikacia_op). Pre znovuzobrazenie zmeň registry=None späť na registry=registry.
-    @mcp_tool(name="identifikacia_pas", description=_PAS_TOOL_DESCRIPTION, registry=None)
+    # Visibility controlled via `hidden_tools` (see identifikacia_op note above).
+    @mcp_tool(
+        name="identifikacia_pas",
+        description=_PAS_TOOL_DESCRIPTION,
+        registry=_registry_for("identifikacia_pas"),
+    )
     async def identifikacia_pas(
         cislo_pasu: Annotated[
             str,

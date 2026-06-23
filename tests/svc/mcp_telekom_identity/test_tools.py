@@ -688,6 +688,26 @@ async def test_op_upstream_error_uses_unified_message(make_op_tool, conv) -> Non
     assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
 
 
+# ---- hidden_tools (visibility control) ----
+
+
+@pytest.mark.unit
+def test_hidden_tools_are_not_registered() -> None:
+    """`hidden_tools` keeps op/pas out of the registered set; others stay visible."""
+    stub = _StubClient()
+    fake = _FakeMCP()
+    registry = ToolRegistry(fake)  # type: ignore[arg-type]
+    identity_tools.register(
+        registry,
+        client=stub,
+        hidden_tools=frozenset({"identifikacia_op", "identifikacia_pas"}),
+    )
+    assert "identifikacia_op" not in fake.registered
+    assert "identifikacia_pas" not in fake.registered
+    # A non-hidden tool is still registered.
+    assert "identifikacia_rodne_cislo" in fake.registered
+
+
 # ---- identifikacia_pas ----
 
 
