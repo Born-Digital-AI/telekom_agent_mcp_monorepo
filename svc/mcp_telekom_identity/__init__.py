@@ -58,6 +58,20 @@ class MCPTelekomIdentityConfig(MCPServiceConfig):
     indexer_timeout_seconds: float = 30.0
     indexer_labels_cache_ttl_seconds: int = 300
 
+    @pydantic.field_validator(
+        "indexer_timeout_seconds", "indexer_labels_cache_ttl_seconds", mode="before"
+    )
+    @classmethod
+    def _blank_to_default(cls, v: Any, info: pydantic.ValidationInfo) -> Any:
+        """Treat an empty/blank env value as 'unset' so the field default applies.
+
+        A deployment that declares APP_INDEXER_TIMEOUT_SECONDS="" (blank) would
+        otherwise fail validation with 'Input should be a valid number'.
+        """
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return cls.model_fields[info.field_name].default
+        return v
+
     @pydantic.field_validator("indexer_index_ids", mode="before")
     @classmethod
     def _parse_index_ids(cls, v: Any) -> Any:
