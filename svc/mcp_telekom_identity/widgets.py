@@ -208,8 +208,7 @@ def identifikacia_widget(
         # Initial variant: intro text, bold list of accepted identifiers, divider, input.
         inner.append(
             _text(
-                "Rád vás identifikujem. Najprv potrebujem zistiť, s kým mám tú česť, "
-                "a potom spolu prejdeme ďalej."
+                "Na vyriešenie vašej požiadavky vás potrebujem najprv vyhľadať v systéme."
             )
         )
         inner.append(_text("Na identifikáciu mi stačí jeden z týchto údajov:", bold=True, color=_INK))

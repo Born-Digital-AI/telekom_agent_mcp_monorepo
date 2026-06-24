@@ -152,31 +152,46 @@ def _nlp_get_named_entities(conversation_id: str) -> dict[str, str]:
 
 
 def _consume_named_entity(conversation_id: str, key: str) -> str | None:
-    """Read and remove a named_entity from the mirror (one-shot widget input).
+    """Return a widget-submitted named_entity once per distinct value.
 
-    Widget-submitted values are consumed once so a later call doesn't re-apply a
-    stale value (e.g. re-verifying an already-handled auth factor).
+    Widget values are consumed once so a later call doesn't re-apply a stale value
+    (e.g. re-verifying an already-handled auth factor). Because :func:`_nlp_load`
+    re-fetches named_entities from the NLP engine on every tool call (the customer
+    may submit a widget *between* calls), popping from the mirror is not enough —
+    the next GET would simply re-supply the same value. Instead we remember the
+    (key, value) already consumed and refuse to hand the *same* value out again; a
+    genuinely new value (re-submission/correction) is consumed afresh.
     """
     if not conversation_id:
         return None
-    current = _NLP_MIRROR_STATE.get(conversation_id)
-    if not current or key not in current:
+    current = _NLP_MIRROR_STATE.get(conversation_id) or {}
+    value = current.get(key)
+    if value is None:
         return None
-    value = current.pop(key)
-    _NLP_MIRROR_STATE.set(conversation_id, current)
+    consumed = _NLP_CONSUMED_STATE.get(conversation_id) or {}
+    if consumed.get(key) == value:
+        return None  # already consumed this exact value
+    consumed[key] = value
+    _NLP_CONSUMED_STATE.set(conversation_id, consumed)
     return value
 
 
 async def _nlp_load(conversation_id: str) -> None:
-    """Populate local mirror from NLP engine if not already cached.
+    """Refresh the local read-mirror from the NLP engine on every tool call.
 
-    Falls back gracefully — 400/404 (no session) and network errors are logged
-    at DEBUG/WARNING and do not raise. Empty mirror after both sources is fine.
+    The customer may submit a widget *between* tool calls — the host then writes
+    the field values (e.g. ``identifikacia_vstup``) into the conversation's
+    named_entities on the NLP engine. So we must re-fetch every time rather than
+    trusting a warm cache (a stale warm mirror was why a freshly-submitted widget
+    value was invisible to the tool). Freshly fetched server entities are merged
+    *over* the mirror; locally-held keys the server does not return — test context
+    (:func:`nastav_test_kontext`) or tool writes not yet flushed — are preserved.
+
+    Falls back gracefully — 400/404 (no session) and network errors are logged and
+    leave the existing mirror untouched.
     """
     if not conversation_id:
         return
-    if _NLP_MIRROR_STATE.get(conversation_id):
-        return  # already warm
 
     url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/named_entities"
     try:
@@ -188,8 +203,10 @@ async def _nlp_load(conversation_id: str) -> None:
                 for k, v in (resp.json().get("named_entities") or {}).items()
             }
             if entities:
-                _NLP_MIRROR_STATE.set(conversation_id, entities)
-                _log.info("NLP GET named_entities %s -> loaded %d entities", url, len(entities))
+                current = dict(_NLP_MIRROR_STATE.get(conversation_id) or {})
+                current.update(entities)
+                _NLP_MIRROR_STATE.set(conversation_id, current)
+                _log.info("NLP GET named_entities %s -> merged %d entities", url, len(entities))
         elif resp.status_code in (400, 404):
             _log.debug("NLP GET named_entities %s -> %s (no session)", url, resp.status_code)
         else:
@@ -467,6 +484,12 @@ _NLP_MIRROR_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_T
 # engine. _nlp_flush PUTs exactly this (never the GET-ed conversation state) and
 # clears the pushed keys on success. Same TTL as the mirror.
 _NLP_PENDING_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
+
+# (key -> value) widget submissions already consumed by _consume_named_entity.
+# Because _nlp_load re-fetches named_entities on every call, the same value would
+# otherwise be re-applied each time; this guard enforces consume-once-per-value
+# while still letting a corrected re-submission (new value) through. Same TTL.
+_NLP_CONSUMED_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
 
 # Authentication
 _AUTH_TTL_SECONDS = 30 * 60

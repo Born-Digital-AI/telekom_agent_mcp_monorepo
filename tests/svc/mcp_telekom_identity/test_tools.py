@@ -11,6 +11,10 @@ import pytest
 from lib.boilerplate.logging import current_conversation_id, current_interaction_id
 from lib.mcp_service.legacy_compat import ToolRegistry
 from svc.mcp_telekom_identity import tools as identity_tools
+# Captured before the autouse fixture stubs the module attribute, so these tests
+# can exercise the real implementations.
+from svc.mcp_telekom_identity.tools import _consume_named_entity as _REAL_CONSUME
+from svc.mcp_telekom_identity.tools import _nlp_load as _REAL_NLP_LOAD
 from svc.mcp_telekom_identity.dps_get_client import (
     DPSAuthError,
     DPSInvalidResponseError,
@@ -173,9 +177,19 @@ def _reset_identity_state_and_silence_nlp(monkeypatch):
     identity_tools._NLP_PENDING_STATE = type(identity_tools._NLP_PENDING_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
+    identity_tools._NLP_CONSUMED_STATE = type(identity_tools._NLP_CONSUMED_STATE)(
+        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
+    )
     identity_tools._AUTH_STATE = type(identity_tools._AUTH_STATE)(
         ttl_seconds=identity_tools._AUTH_TTL_SECONDS,
     )
+
+    # _nlp_load now always GETs the NLP engine; tests drive state via the mirror
+    # and _nlp_set_state, so stub the load to keep tests offline and fast.
+    async def _no_nlp_load(conv):  # noqa: ANN001, ANN202
+        return None
+
+    monkeypatch.setattr(identity_tools, "_nlp_load", _no_nlp_load)
 
     # Silence + capture NLP pushes for assertions
     calls: list[tuple[str, dict]] = []
@@ -1355,8 +1369,8 @@ def test_nlp_get_named_entities_returns_empty_for_unknown_conv() -> None:
 
 
 @pytest.mark.unit
-def test_nlp_flush_puts_only_delta(monkeypatch) -> None:
-    """_nlp_flush pushes only changed/new named_entities, not the full set."""
+def test_nlp_flush_pushes_pending_only(monkeypatch) -> None:
+    """_nlp_flush pushes exactly the tool-written pending entities — no delta, not the mirror."""
     from svc.mcp_telekom_identity import tools as identity_tools
 
     # Run the fire-and-forget PUT synchronously and capture request bodies.
@@ -1385,18 +1399,15 @@ def test_nlp_flush_puts_only_delta(monkeypatch) -> None:
     monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
     monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
 
-    conv = "conv-delta"
-    # First flush: everything is new → full set goes out.
-    identity_tools._NLP_MIRROR_STATE.set(conv, {"a": "1", "b": "2"})
+    conv = "conv-pending"
+    # Only the pending buffer (entities our tools wrote) is pushed; the mirror —
+    # the large GET-ed conversation state — is never echoed back.
+    identity_tools._NLP_MIRROR_STATE.set(conv, {"gpt_history": "lots", "Channel": "chat"})
+    identity_tools._NLP_PENDING_STATE.set(conv, {"a": "1", "b": "2"})
     identity_tools._nlp_flush(conv)
     assert sent[-1] == {"named_entities": {"a": "1", "b": "2"}}
 
-    # Change `a`, add `c`, keep `b` → only the delta goes out.
-    identity_tools._NLP_MIRROR_STATE.set(conv, {"a": "9", "b": "2", "c": "3"})
-    identity_tools._nlp_flush(conv)
-    assert sent[-1] == {"named_entities": {"a": "9", "c": "3"}}
-
-    # No change since last acknowledged push → no PUT at all.
+    # A successful push clears the pending buffer → next flush sends nothing.
     before = len(sent)
     identity_tools._nlp_flush(conv)
     assert len(sent) == before
@@ -1436,14 +1447,83 @@ def test_nlp_flush_failure_keeps_entities_pending(monkeypatch) -> None:
     monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
 
     conv = "conv-fail"
-    identity_tools._NLP_MIRROR_STATE.set(conv, {"a": "1"})
-    identity_tools._nlp_flush(conv)  # fails → not acknowledged
+    identity_tools._NLP_PENDING_STATE.set(conv, {"a": "1"})
+    identity_tools._nlp_flush(conv)  # fails → not acknowledged, stays pending
     assert sent[-1] == {"named_entities": {"a": "1"}}
 
     fail_next["value"] = False
     identity_tools._nlp_flush(conv)  # retried, same entities resent, now succeeds
     assert sent[-1] == {"named_entities": {"a": "1"}}
     assert len(sent) == 2
+
+
+class _FakeNlpResp:
+    def __init__(self, entities: dict[str, str]) -> None:
+        self.status_code = 200
+        self._entities = entities
+
+    def json(self) -> dict:
+        return {"named_entities": self._entities}
+
+
+def _fake_async_client(entities: dict[str, str]):
+    class _FakeClient:
+        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):  # noqa: ANN002
+            return False
+
+        async def get(self, url):  # noqa: ANN001, ARG002
+            return _FakeNlpResp(entities)
+
+    return _FakeClient
+
+
+@pytest.mark.unit
+async def test_nlp_load_refetches_even_when_mirror_is_warm(monkeypatch) -> None:
+    """Regression: a warm mirror must NOT skip the GET.
+
+    The customer can submit a widget *between* tool calls; the host then writes the
+    value (e.g. identifikacia_vstup) into named_entities on the NLP engine. If
+    _nlp_load short-circuits on a warm mirror, that value stays invisible and the
+    tool wrongly returns input_required.
+    """
+    conv = "conv-refetch"
+    # Mirror already warm from an earlier turn (Channel was set at conversation start).
+    identity_tools._NLP_MIRROR_STATE.set(conv, {"Channel": "chat"})
+
+    # NLP engine now also has the freshly-submitted widget value.
+    monkeypatch.setattr(
+        identity_tools.httpx,
+        "AsyncClient",
+        _fake_async_client({"Channel": "chat", "identifikacia_vstup": "2315055000"}),
+    )
+
+    await _REAL_NLP_LOAD(conv)
+
+    merged = identity_tools._nlp_get_named_entities(conv)
+    assert merged["identifikacia_vstup"] == "2315055000"  # re-fetched despite warm mirror
+    assert merged["Channel"] == "chat"
+
+
+@pytest.mark.unit
+def test_consume_named_entity_is_once_per_value(monkeypatch) -> None:
+    """Consume-once survives re-fetch: the same value is handed out once, a new value afresh."""
+    conv = "conv-consume"
+    key = "autentifikacia_kod_adresata"
+
+    identity_tools._NLP_MIRROR_STATE.set(conv, {key: "4482259101"})
+    assert _REAL_CONSUME(conv, key) == "4482259101"
+    # A re-fetch re-supplies the same value into the mirror — must NOT be consumed again.
+    identity_tools._NLP_MIRROR_STATE.set(conv, {key: "4482259101"})
+    assert _REAL_CONSUME(conv, key) is None
+    # A corrected re-submission (new value) is consumed afresh.
+    identity_tools._NLP_MIRROR_STATE.set(conv, {key: "9999999999"})
+    assert _REAL_CONSUME(conv, key) == "9999999999"
 
 
 # ---- autentifikacia ----

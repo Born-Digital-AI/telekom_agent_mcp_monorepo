@@ -214,8 +214,17 @@ def _reset_state(monkeypatch):
     identity_tools._NLP_PENDING_STATE = type(identity_tools._NLP_PENDING_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
+    identity_tools._NLP_CONSUMED_STATE = type(identity_tools._NLP_CONSUMED_STATE)(
+        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
+    )
     # Make _nlp_flush a no-op by default (avoid background HTTP threads in tests).
     monkeypatch.setattr(identity_tools, "_nlp_flush", lambda conv: None)
+    # Tests seed _NLP_MIRROR_STATE directly; _nlp_load now always GETs the NLP
+    # engine, so stub it out to keep tests offline and fast.
+    async def _no_nlp_load(conv):  # noqa: ANN001, ANN202
+        return None
+
+    monkeypatch.setattr(identity_tools, "_nlp_load", _no_nlp_load)
 
 
 @pytest.fixture
