@@ -209,8 +209,8 @@ Response shape (unchanged):
 - **Multi match**: `{"found": true, "multiple_matches": true, "names": [...], "message": "..."}`
 - **Not found**: `{"found": false, "error": "not_found", "message": "..."}`
 - **Invalid input**: `{"found": false, "error": "invalid_input", "message": "..."}`
-- **Input required** (no value, non-chat): `{"found": false, "error": "input_required", ...}`
-- **Widget** (chat channel, no value): a `bubble_widget_result` envelope (see below).
+- **Input required** (no value): `{"found": false, "error": "input_required", "instruction": ...}` — instructs the LLM to show the widget (chat) or ask for the value (non-chat). `identifikacia` itself never renders a widget.
+- **Ambiguous type** (auto-detect collision, chat): `{"found": false, "error": "ambiguous_type", "alternatives": [...], "instruction": "...zobraz_identifikacny_widget(s_vyberom_typu=True)..."}`.
 - **System error**: `{"found": false, "error": "<code>", "message": "Vyskytol sa technický problém. Prepojím vás na operátora."}`
 
 After any successful identification the full candidate set is cached in a 30-minute
@@ -236,21 +236,29 @@ is a Customer ID (`GET /customers/{id}`); ending in `1–9` is a Billing Account
 
 When two **structured** signals genuinely collide (e.g. a `09…` value that is both a
 valid MSISDN and a valid RČ), auto-detect refuses to guess: in a chat channel it
-re-shows the widget asking the customer to pick the type; otherwise it returns
+returns `ambiguous_type` (instructing the LLM to show the type selector); otherwise
 `invalid_input`. Known limitation: a billing code that coincidentally passes RČ
 validation (≈0.7 %, e.g. `4108064301`) auto-detects as `rodne_cislo` — the customer
 selects the correct type in the dropdown for that rare miss.
 
-#### Widget (chat channel)
+#### Widgets (chat channel)
 
-When `named_entities.Channel == "chat"` and no value is supplied, `identifikacia`
-returns a Da-Bubble identification widget (one free-text input + a "Typ údaja"
-dropdown defaulting to *Automaticky rozpoznať*). On submit the host writes
-`identifikacia_vstup` + `identifikacia_typ` into `named_entities` and emits the
-hidden utterance `identifikacia_widget_submitted`; the LLM then calls
-`identifikacia()` again and the tool reads the value from `named_entities` — the raw
-identifier never enters the LLM turn. `autentifikacia` renders an analogous
-single-factor widget (+ "Nemám / Neviem nájsť" skip button) in chat channels.
+**Rendering and logic are separate tools.** Widgets are rendered ONLY by the
+dedicated render tools, which are *terminal* — after calling one the LLM stops and
+waits for the customer to submit. `identifikacia` / `autentifikacia` never render a
+widget; they only process/evaluate and return JSON.
+
+- **`zobraz_identifikacny_widget(s_vyberom_typu=False)`** — renders the identification
+  form (one free-text input; `s_vyberom_typu=True` adds the "Typ údaja" dropdown, used
+  only after an `ambiguous_type`).
+- **`zobraz_autentifikacny_widget(faktor=None)`** — renders the single-factor auth form
+  (+ "Nemám / Neviem nájsť" skip); factor auto-detected read-only via the auth state.
+
+Round-trip: on submit the host writes the field values into `named_entities`
+(`identifikacia_vstup`/`identifikacia_typ`, `autentifikacia_*`) and emits the hidden
+utterance (`identifikacia_widget_submitted` / `autentifikacia_widget_submitted`); the
+LLM then calls `identifikacia()` / `autentifikacia()`, which read the values from
+`named_entities` — the raw input never enters the LLM turn.
 
 Widget builders live in [`widgets.py`](widgets.py); the shared transport/submit
 helpers in [`lib/bubble_widgets`](../../lib/bubble_widgets/guide.md). Sensitive

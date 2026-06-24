@@ -303,15 +303,17 @@ _SERIAL_TOOL_DESCRIPTION = (
 )
 
 # Single identification entry point — auto-detects the identifier type.
+# NOTE: this tool only PROCESSES an identifier; it never renders a widget. To show
+# the form use zobraz_identifikacny_widget.
 _IDENTIFIKACIA_TOOL_DESCRIPTION = (
-    "Identifikuj zákazníka podľa ľubovoľného identifikačného údaja "
+    "SPRACUJ identifikačný údaj zákazníka a identifikuj ho "
     "(telefónne číslo, IČO, rodné číslo, kód zákazníka/fakturačného účtu, sériové číslo). "
-    "Tool typ údaja rozpozná sám podľa formátu — netreba ho určovať. "
-    "Po úspechu vráti meno zákazníka; interné identifikátory si uloží do pamäte konverzácie "
-    "pre ďalšie nástroje. V chat kanáli (Channel='chat') a bez zadanej hodnoty zobrazí "
-    "identifikačný widget — zavolaj ho bez parametrov, keď chceš zákazníka požiadať o údaje. "
-    "Hodnotu zadanú zákazníkom vo widgete si prečíta z pamäte konverzácie sám. "
-    "Mimo chatu (alebo keď už hodnotu máš) zavolaj s parametrom hodnota=<údaj>."
+    "Typ údaja rozpozná tool sám podľa formátu. Po úspechu vráti meno zákazníka a interné "
+    "identifikátory si uloží do pamäte konverzácie pre ďalšie nástroje.\n"
+    "KEDY volať: (1) keď už hodnotu máš → zavolaj s hodnota=<údaj>; (2) keď zákazník odoslal "
+    "identifikačný widget (utterance 'identifikacia_widget_submitted') → zavolaj BEZ parametrov, "
+    "hodnotu si prečíta z pamäte konverzácie. "
+    "Na ZOBRAZENIE formulára tento tool NEVOLAJ — na to slúži zobraz_identifikacny_widget."
 )
 
 _CHANNEL_KEY = "Channel"
@@ -333,20 +335,25 @@ _IDENT_UNRECOGNIZED_MESSAGE = (
     "Tento údaj sa mi nepodarilo rozpoznať. Skúste, prosím, telefónne číslo, rodné číslo, "
     "IČO, kód zákazníka alebo sériové číslo zariadenia."
 )
+_IDENT_AMBIGUOUS_MESSAGE = (
+    "Zadaný údaj sa dal rozpoznať viacerými spôsobmi — potrebujem, aby zákazník vybral typ."
+)
 
 _IDENT_WIDGET_TOOL_DESCRIPTION = (
-    "Zobraz zákazníkovi identifikačný widget (formulár na zadanie identifikačného údaja) "
-    "v chat kanáli. Zavolaj, keď chceš zákazníka vizuálne požiadať o identifikáciu — BEZ "
-    "spustenia samotnej identifikácie. Prvotný formulár má len jedno pole; typ údaja rozpozná "
-    "tool sám. Keď zákazník formulár odošle, zavolaj identifikacia() (hodnotu si prečíta z "
-    "pamäte konverzácie). Mimo chat kanála widget nemá zmysel — vtedy vypýtaj údaj textom."
+    "ZOBRAZ zákazníkovi identifikačný formulár (widget) v chat kanáli a požiadaj ho o "
+    "identifikačný údaj. Prvotný formulár má len jedno pole; typ údaja rozpozná tool sám. "
+    "TOTO JE VÝSTUP PRE ZÁKAZNÍKA A UKONČUJE TVOJ ŤAH: po zavolaní tohto toolu už NEVOLAJ "
+    "žiadny ďalší nástroj a počkaj, kým zákazník formulár odošle. Až po jeho odoslaní "
+    "(utterance 'identifikacia_widget_submitted') zavolaj identifikacia(). "
+    "Mimo chat kanála widget nemá zmysel — vtedy vypýtaj údaj textom."
 )
 
 _AUTH_WIDGET_TOOL_DESCRIPTION = (
-    "Zobraz zákazníkovi autentifikačný widget pre aktuálny overovací faktor v chat kanáli — "
-    "BEZ vyhodnotenia autentifikácie. Faktor sa určí automaticky z priebehu overenia "
-    "(voliteľne zadaj faktor: meno_priezvisko / kod_adresata / rc_last4). Vyžaduje "
-    "predchádzajúcu identifikáciu. Keď zákazník odošle, zavolaj autentifikacia()."
+    "ZOBRAZ zákazníkovi autentifikačný formulár (widget) pre aktuálny overovací faktor v chat "
+    "kanáli. Faktor sa určí automaticky z priebehu overenia (voliteľne zadaj faktor: "
+    "meno_priezvisko / kod_adresata / rc_last4). Vyžaduje predchádzajúcu identifikáciu. "
+    "TOTO JE VÝSTUP PRE ZÁKAZNÍKA A UKONČUJE TVOJ ŤAH: po zavolaní už NEVOLAJ žiadny ďalší "
+    "nástroj a počkaj na odpoveď. Až po odoslaní zavolaj autentifikacia()."
 )
 
 
@@ -923,22 +930,18 @@ def _need_factor_response(
     required: int,
     channel: str,
 ) -> str:
-    """Render the "need this factor next" response.
+    """Return the "need this factor next" evaluation as JSON (never a widget).
 
-    In a chat channel (and for a factor that has a widget) return an auth widget so
-    the customer fills it in privacy-safe; otherwise return the JSON the LLM uses to
-    collect the value via a parameter.
+    Rendering is the job of ``zobraz_autentifikacny_widget``. In a chat channel the
+    ``instruction`` tells the LLM to show that widget; otherwise to collect the value
+    via a parameter.
     """
-    suggested = _suggested_response_for_factor(next_factor)
     if channel == _CHANNEL_CHAT and next_factor in widgets.AUTH_FIELD_KEYS:
-        return _json(
-            bubble_widget_result(
-                summary=f"Autentifikačný widget ({next_factor})",
-                widget=widgets.auth_factor_widget(next_factor, caption=suggested),
-                template="autentifikacia",
-                assistant_text=suggested,
-            )
+        instruction = (
+            "V chat kanáli zobraz zobraz_autentifikacny_widget a počkaj na odoslanie zákazníkom."
         )
+    else:
+        instruction = _instruction_for_factor(next_factor)
     return _json(
         {
             "authenticated": False,
@@ -946,8 +949,8 @@ def _need_factor_response(
             "factors_satisfied": sorted(satisfied),
             "factors_remaining": required - len(satisfied),
             "next_factor": next_factor,
-            "suggested_response": suggested,
-            "instruction": _instruction_for_factor(next_factor),
+            "suggested_response": _suggested_response_for_factor(next_factor),
+            "instruction": instruction,
         }
     )
 
@@ -1533,27 +1536,23 @@ def register(
             hodnota = (hodnota or nlp.get(widgets.IDENT_INPUT_KEY) or "").strip()
             typ = (typ or nlp.get(widgets.IDENT_TYPE_KEY) or "").strip().lower()
 
-            # No value and no explicit type → render the widget (chat) or ask the LLM.
+            # No value and no explicit type → this tool does NOT render a widget.
+            # Tell the LLM to show the form (chat) or ask for the value (non-chat).
             # (An explicit `typ` with an empty value falls through to per-type
             # validation below, which returns invalid_input.)
             if not hodnota and typ in ("", _TYPE_AUTO):
-                if channel == _CHANNEL_CHAT:
-                    return _json(
-                        bubble_widget_result(
-                            summary="Identifikačný widget",
-                            widget=widgets.identifikacia_widget(),
-                            template="identifikacia",
-                            assistant_text="Pošlite mi, prosím, identifikačný údaj cez tento formulár.",
-                        )
-                    )
+                instruction = (
+                    "V chat kanáli zobraz formulár cez zobraz_identifikacny_widget a počkaj na "
+                    "odpoveď zákazníka."
+                    if channel == _CHANNEL_CHAT
+                    else "Zisti od zákazníka identifikačný údaj a zavolaj identifikacia(hodnota=<údaj>)."
+                )
                 return _json(
                     {
                         "found": False,
                         "error": "input_required",
                         "suggested_response": _IDENT_INPUT_REQUIRED_MESSAGE,
-                        "instruction": (
-                            "Zisti od zákazníka identifikačný údaj a zavolaj identifikacia(hodnota=<údaj>)."
-                        ),
+                        "instruction": instruction,
                     }
                 )
 
@@ -1561,21 +1560,19 @@ def register(
             if typ in ("", _TYPE_AUTO):
                 detected, alternatives = _classify_identifier(hodnota)
                 if detected is None:
-                    if channel == _CHANNEL_CHAT:
-                        caption = (
-                            "Tento údaj sa mi nepodarilo jednoznačne rozpoznať — vyberte, prosím, typ údaja."
-                            if alternatives
-                            else "Tento údaj sa mi nepodarilo rozpoznať — skúste to znova alebo vyberte typ údaja."
-                        )
+                    if alternatives and channel == _CHANNEL_CHAT:
+                        # Genuine collision → ask the customer to pick the type via the widget.
                         return _json(
-                            bubble_widget_result(
-                                summary="Identifikačný widget (upresnenie typu)",
-                                widget=widgets.identifikacia_widget(
-                                    caption=caption, with_type_select=True
+                            {
+                                "found": False,
+                                "error": "ambiguous_type",
+                                "alternatives": alternatives,
+                                "suggested_response": _IDENT_AMBIGUOUS_MESSAGE,
+                                "instruction": (
+                                    "Zobraz zobraz_identifikacny_widget(s_vyberom_typu=True), nech "
+                                    "zákazník vyberie typ údaja, a počkaj na odoslanie."
                                 ),
-                                template="identifikacia",
-                                assistant_text=caption,
-                            )
+                            }
                         )
                     return _json(
                         {
@@ -1595,7 +1592,16 @@ def register(
         description=_IDENT_WIDGET_TOOL_DESCRIPTION,
         registry=registry,
     )
-    async def zobraz_identifikacny_widget(_meta: dict[str, Any] | None = None) -> str:
+    async def zobraz_identifikacny_widget(
+        s_vyberom_typu: Annotated[  # noqa: FBT002
+            bool,
+            Field(
+                description="True iba keď identifikacia vrátila error=ambiguous_type — pridá do "
+                "formulára výber typu údaja. Inak nechaj False (jednoduchý formulár)."
+            ),
+        ] = False,
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
         conv = (_meta or {}).get("conversation_id", "")
         await _nlp_load(conv)
         channel = (_nlp_get_named_entities(conv).get(_CHANNEL_KEY) or "").strip().lower()
@@ -1611,10 +1617,15 @@ def register(
                     ),
                 }
             )
+        caption = (
+            "Zadaný údaj sa dal rozpoznať viacerými spôsobmi — vyberte, prosím, jeho typ."
+            if s_vyberom_typu
+            else None
+        )
         return _json(
             bubble_widget_result(
                 summary="Identifikačný widget",
-                widget=widgets.identifikacia_widget(),
+                widget=widgets.identifikacia_widget(caption=caption, with_type_select=s_vyberom_typu),
                 template="identifikacia",
                 assistant_text="Pošlite mi, prosím, identifikačný údaj cez tento formulár.",
             )
@@ -1894,22 +1905,18 @@ def register(
                             f"Tento údaj sa nezhoduje. Skúste, prosím, znova. "
                             f"Zostáva vám {'ešte jeden pokus' if remaining == 1 else f'{remaining} pokusy'}."
                         )
-                        if channel == _CHANNEL_CHAT and factor in widgets.AUTH_FIELD_KEYS:
-                            return _json(
-                                bubble_widget_result(
-                                    summary=f"Autentifikačný widget ({factor}, opakovanie)",
-                                    widget=widgets.auth_factor_widget(factor, caption=retry_msg),
-                                    template="autentifikacia",
-                                    assistant_text=retry_msg,
-                                )
-                            )
+                        retry_instruction = (
+                            "V chat kanáli zobraz znova zobraz_autentifikacny_widget a počkaj na odoslanie."
+                            if channel == _CHANNEL_CHAT and factor in widgets.AUTH_FIELD_KEYS
+                            else _instruction_for_factor(factor)
+                        )
                         return _json(
                             {
                                 "authenticated": False,
                                 "factor_failed": factor,
                                 "attempts_remaining": remaining,
                                 "suggested_response": retry_msg,
-                                "instruction": _instruction_for_factor(factor),
+                                "instruction": retry_instruction,
                             }
                         )
 

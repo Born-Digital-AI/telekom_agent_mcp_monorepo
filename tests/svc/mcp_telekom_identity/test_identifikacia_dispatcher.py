@@ -257,13 +257,14 @@ async def _call(tool, **kw) -> dict:
 
 
 @pytest.mark.unit
-async def test_chat_no_value_renders_widget(conv) -> None:  # noqa: ARG001
+async def test_chat_no_value_does_not_render_widget(conv) -> None:  # noqa: ARG001
+    # identifikacia never renders a widget — it points the LLM at zobraz_identifikacny_widget.
     _seed(Channel="chat")
     tool, _ = _make()
     result = await _call(tool)
-    assert result["type"] == "bubble_widget_result"
-    assert result["template"] == "identifikacia"
-    assert result["widget"]["type"] == "Form"
+    assert result["found"] is False
+    assert result["error"] == "input_required"
+    assert "zobraz_identifikacny_widget" in result["instruction"]
 
 
 @pytest.mark.unit
@@ -276,22 +277,15 @@ async def test_non_chat_no_value_asks_for_input(conv) -> None:  # noqa: ARG001
 
 
 @pytest.mark.unit
-async def test_chat_ambiguous_auto_reprompts_widget(conv) -> None:  # noqa: ARG001
+async def test_chat_ambiguous_auto_returns_ambiguous_type(conv) -> None:  # noqa: ARG001
     _seed(Channel="chat")
     tool, _ = _make()
-    # phone/RC collision + auto type → widget asking to pick the type, WITH dropdown
+    # phone/RC collision + auto type → ambiguous_type (no widget), instruct to show selector
     result = await _call(tool, hodnota="0901010000", typ="auto")
-    assert result["type"] == "bubble_widget_result"
-    assert result["template"] == "identifikacia"
-    assert _find(result["widget"], "Select")  # disambiguation variant has the dropdown
-
-
-@pytest.mark.unit
-async def test_dispatcher_initial_widget_has_no_dropdown(conv) -> None:  # noqa: ARG001
-    _seed(Channel="chat")
-    tool, _ = _make()
-    result = await _call(tool)  # no value → initial widget
-    assert _find(result["widget"], "Select") == []
+    assert result["found"] is False
+    assert result["error"] == "ambiguous_type"
+    assert set(result["alternatives"]) == {"telefon", "rodne_cislo"}
+    assert "s_vyberom_typu" in result["instruction"]
 
 
 def _registry(customer_by_id: dict[str, dict | None] | None = None):
@@ -328,6 +322,15 @@ async def test_zobraz_identifikacny_widget_chat_no_dropdown(conv) -> None:  # no
     assert result["type"] == "bubble_widget_result"
     assert result["template"] == "identifikacia"
     assert _find(result["widget"], "Select") == []  # initial render, no dropdown
+
+
+@pytest.mark.unit
+async def test_zobraz_identifikacny_widget_with_type_select(conv) -> None:  # noqa: ARG001
+    _seed(Channel="chat")
+    reg, _ = _registry()
+    result = json.loads(await reg["zobraz_identifikacny_widget"](s_vyberom_typu=True))
+    assert result["type"] == "bubble_widget_result"
+    assert len(_find(result["widget"], "Select")) == 1  # disambiguation variant
 
 
 @pytest.mark.unit
