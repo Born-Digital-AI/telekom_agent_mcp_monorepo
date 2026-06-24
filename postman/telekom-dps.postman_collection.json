@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "577067e3-2dd2-45b6-b08a-93cff83d9024",
     "name": "Telekom DPS APIs",
-    "description": "DPS HAL APIs — party-management 3.54.0, customer-management 4.67.0, product-inventory 4.64, omni-party-interactions 1.3.0.\n\n**Setup:**\n1. Import `telekom-dps-test.postman_environment.json` a vyber ho v dropdown-e.\n2. Vyplň `bearer_token`.\n3. **VPN required** — `teai.st.sk:8243` (DPS) a `tapigw.sk.tmo` (OMNI).\n\n**Auto-headers:** collection-level pre-request script automaticky generuje UUID pre `X-Request-Id`, `X-Request-Tracking-Id`, `X-Request-Session-Id`.\n\n**Collection variables:**\n- `base_url` — `https://teai.st.sk:8243/omni/test1` (Party Management, Customer Management, Product Inventory)\n- `omni_pi_base_url` — `https://tapigw.sk.tmo/omni/test1/party-interactions/1.3.0` (OMNI Party Interactions)\n\nGroups:\n- **Party Management** — identify a party by RČ/OP/pas/IČO, fetch single party\n- **Customer Management** — fetch customer, billing account, related sub-resources\n- **Product Inventory** — MSISDN lookup, product details, per-customer counts\n- **OMNI Party Interactions** — read and write customer interaction records (calls, chats, emails)\n- **End-to-end flows** — composed requests that mirror the live `identifikacia_*` tools",
+    "description": "DPS HAL APIs — party-management 3.54.0, customer-management 4.67.0, product-inventory 4.64, omni-party-interactions 1.3.0.\n\n**Setup:**\n1. Import `telekom-dps-test.postman_environment.json` a vyber ho v dropdown-e.\n2. Vyplň `bearer_token`.\n3. **VPN required** — `teai.st.sk:8243` (DPS) a `tapigw.sk.tmo` (OMNI).\n\n**Auto-headers:** collection-level pre-request script automaticky generuje UUID pre `X-Request-Id`, `X-Request-Tracking-Id`, `X-Request-Session-Id`.\n\n**Collection variables:**\n- `base_url` — `https://teai.st.sk:8243/omni/test1` (Party Management, Customer Management, Product Inventory)\n- `omni_pi_base_url` — `https://tapigw.sk.tmo/omni/test1/party-interactions/1.3.0` (OMNI Party Interactions)\n\nGroups:\n- **Party Management** — identify a party by RČ/IČO, fetch single party\n- **Customer Management** — fetch customer, billing account, related sub-resources\n- **Product Inventory** — MSISDN lookup, product details, per-customer counts\n- **OMNI Party Interactions** — read and write customer interaction records (calls, chats, emails)\n- **End-to-end flows** — composed requests that mirror the live `identifikacia_*` tools",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -61,7 +61,7 @@
   "item": [
     {
       "name": "Party Management 3.54.0",
-      "description": "`/party-management/3.54.0/v2/parties` — where rodné číslo / OP / pas / IČO live as `Identification` records under a Party. See [`dps-party-mgmt-api`](file:///Users/michaljurco/.claude/skills/dps-party-mgmt-api/SKILL.md) skill.",
+      "description": "`/party-management/3.54.0/v2/parties` — where rodné číslo / IČO live as `Identification` records under a Party. See [`dps-party-mgmt-api`](file:///Users/michaljurco/.claude/skills/dps-party-mgmt-api/SKILL.md) skill.",
       "item": [
         {
           "name": "Search by rodné číslo (socialSecurityNumber)",
@@ -100,84 +100,6 @@
               ]
             },
             "description": "Returns `Party[]` — empty array means not found (HTTP 200 []).\n\nMapping for the Slovak market:\n- `rodne_cislo` (RČ, 9–10 digits) → `identificationType=socialSecurityNumber`"
-          }
-        },
-        {
-          "name": "Search by OP (nationalIdentityCard)",
-          "request": {
-            "method": "GET",
-            "header": [
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "url": {
-              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{op}}&identificationType=nationalIdentityCard&fields=*",
-              "host": [
-                "{{base_url}}"
-              ],
-              "path": [
-                "party-management",
-                "3.54.0",
-                "v2",
-                "parties"
-              ],
-              "query": [
-                {
-                  "key": "identificationId",
-                  "value": "{{op}}"
-                },
-                {
-                  "key": "identificationType",
-                  "value": "nationalIdentityCard"
-                },
-                {
-                  "key": "fields",
-                  "value": "*"
-                }
-              ]
-            },
-            "description": "OP format: 2 uppercase letters + 6 digits (e.g. `AB123456`)."
-          }
-        },
-        {
-          "name": "Search by passport",
-          "request": {
-            "method": "GET",
-            "header": [
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "url": {
-              "raw": "{{base_url}}/party-management/3.54.0/v2/parties?identificationId={{pas}}&identificationType=passport&fields=*",
-              "host": [
-                "{{base_url}}"
-              ],
-              "path": [
-                "party-management",
-                "3.54.0",
-                "v2",
-                "parties"
-              ],
-              "query": [
-                {
-                  "key": "identificationId",
-                  "value": "{{pas}}"
-                },
-                {
-                  "key": "identificationType",
-                  "value": "passport"
-                },
-                {
-                  "key": "fields",
-                  "value": "*"
-                }
-              ]
-            },
-            "description": "Passport format: 1–2 uppercase letters + 6–8 digits (e.g. `BR154151`)."
           }
         },
         {

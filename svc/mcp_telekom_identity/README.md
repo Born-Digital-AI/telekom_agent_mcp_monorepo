@@ -58,12 +58,15 @@ current factor (if the customer doesn't have that data) by calling
 
 ### Auto-credit from identification
 
-| Identification method                                                  | Factor auto-credited                         |
-| ---------------------------------------------------------------------- | -------------------------------------------- |
-| `identifikacia_rodne_cislo`                                            | **4** (caller already proved RČ knowledge)   |
-| `identifikacia_kod_zakaznika`, ends `1–9` (billing account)            | **3** (billing account = kod adresáta)       |
-| `identifikacia_kod_zakaznika`, ends `0` (customer id)                  | none                                         |
-| `identifikacia_op` / `_pas` / `_ico` / `_telefon` / `_seriove_cislo`  | none                                          |
+Auto-credit is keyed on the detected identification *method* (the dispatcher
+records it internally, the LLM still calls a single `identifikacia` tool):
+
+| Identification method                              | Factor auto-credited                       |
+| -------------------------------------------------- | ------------------------------------------ |
+| `rodne_cislo`                                      | **4** (caller already proved RČ knowledge) |
+| `kod_zakaznika`, ends `1–9` (billing account)      | **3** (billing account = kod adresáta)     |
+| `kod_zakaznika`, ends `0` (customer id)            | none                                       |
+| `ico` / `telefon` / `seriove_cislo`                | none                                       |
 
 Factor 1 (trusted source) is **always** re-evaluated on each call against
 the current `input_source` from the NLP mirror — it can credit later if
@@ -189,88 +192,69 @@ Notes:
 
 ## Tools
 
-All identification tools share the same response shape:
+### `identifikacia(hodnota, typ)` — single identification entry point
 
-- **Single match** (1 unique party_id found): `{"found": true, "name": "..."}`
-- **Multi match** (more than 1 party): `{"found": true, "multiple_matches": true, "names": [...], "message": "..."}`
+The seven former per-type tools were merged into **one** dispatcher. The LLM calls
+`identifikacia` and the tool figures out which identifier it received. Both
+parameters are optional:
+
+- `hodnota` — the identifier value (telefón / IČO / rodné číslo / kód zákazníka /
+  fakturačný účet / sériové číslo).
+- `typ` — optional override: `telefon | ico | rodne_cislo | kod_zakaznika |
+  seriove_cislo | auto`. Default `auto` → the classifier decides.
+
+Response shape (unchanged):
+
+- **Single match**: `{"found": true, "name": "..."}`
+- **Multi match**: `{"found": true, "multiple_matches": true, "names": [...], "message": "..."}`
 - **Not found**: `{"found": false, "error": "not_found", "message": "..."}`
-- **Invalid input** (bad format): `{"found": false, "error": "invalid_input", "message": "..."}`
-- **System error** (auth/timeout/network/upstream): `{"found": false, "error": "<code>", "message": "Vyskytol sa technický problém. Prepojím vás na operátora."}`
+- **Invalid input**: `{"found": false, "error": "invalid_input", "message": "..."}`
+- **Input required** (no value, non-chat): `{"found": false, "error": "input_required", ...}`
+- **Widget** (chat channel, no value): a `bubble_widget_result` envelope (see below).
+- **System error**: `{"found": false, "error": "<code>", "message": "Vyskytol sa technický problém. Prepojím vás na operátora."}`
 
-After any successful identification the full candidate set (with `party_id`, `customer_id`,
-`contacts`, `identifications`, account info, etc.) is cached in a 30-minute TTL store keyed
-by the MCP `X-Conversation-Id` header. Subsequent tools (e.g. account lookup) read this
-cache instead of re-querying DPS.
+After any successful identification the full candidate set is cached in a 30-minute
+TTL store keyed by `X-Conversation-Id`; downstream tools read the cache.
 
-### `identifikacia_rodne_cislo(rodne_cislo)` — Rodné číslo
+#### Classifier (auto-detect)
 
-| Parameter | Format |
-|---|---|
-| `rodne_cislo` | 9 or 10 digits, no slash |
+The value is routed to a per-type lookup by **structure**, not just length —
+overlap between numeric identifiers is resolved by validation, not guesswork:
 
-### `identifikacia_op(cislo_op)` — Občiansky preukaz
+| Signal                                              | → type           |
+| --------------------------------------------------- | ---------------- |
+| contains a letter (8–30 alphanumeric)               | `seriove_cislo`  |
+| explicit `+`/`421`/`00421` prefix                   | `telefon`        |
+| 8 digits + valid **IČO mod-11** checksum            | `ico`            |
+| 9–10 digits + valid **RČ** (date + 10-digit mod-11) | `rodne_cislo`    |
+| bare local `0…` that normalises to a SK MSISDN      | `telefon`        |
+| anything else 8–12 digits (no structure)            | `kod_zakaznika`  |
 
-| Parameter  | Format                                           |
-| ---------- | ------------------------------------------------ |
-| `cislo_op` | 2 uppercase letters + 6 digits (e.g. `AB123456`) |
+`kod_zakaznika` is the fallback — it has no checksum. `kod_zakaznika` ending in `0`
+is a Customer ID (`GET /customers/{id}`); ending in `1–9` is a Billing Account
+(`GET /billingAccounts/{id}` → linked customer).
 
-Lowercase letters, spaces, and hyphens in the input are normalized away
-(e.g. `ea-123456` → `EA123456`) before validation.
+When two **structured** signals genuinely collide (e.g. a `09…` value that is both a
+valid MSISDN and a valid RČ), auto-detect refuses to guess: in a chat channel it
+re-shows the widget asking the customer to pick the type; otherwise it returns
+`invalid_input`. Known limitation: a billing code that coincidentally passes RČ
+validation (≈0.7 %, e.g. `4108064301`) auto-detects as `rodne_cislo` — the customer
+selects the correct type in the dropdown for that rare miss.
 
-### `identifikacia_pas(cislo_pasu)` — Cestovný pas
+#### Widget (chat channel)
 
-| Parameter | Format |
-|---|---|
-| `cislo_pasu` | 1–2 uppercase letters + 6–8 digits (e.g. `BR154151`) |
+When `named_entities.Channel == "chat"` and no value is supplied, `identifikacia`
+returns a Da-Bubble identification widget (one free-text input + a "Typ údaja"
+dropdown defaulting to *Automaticky rozpoznať*). On submit the host writes
+`identifikacia_vstup` + `identifikacia_typ` into `named_entities` and emits the
+hidden utterance `identifikacia_widget_submitted`; the LLM then calls
+`identifikacia()` again and the tool reads the value from `named_entities` — the raw
+identifier never enters the LLM turn. `autentifikacia` renders an analogous
+single-factor widget (+ "Nemám / Neviem nájsť" skip button) in chat channels.
 
-### `identifikacia_ico(ico)` — IČO firmy
-
-| Parameter | Format |
-|---|---|
-| `ico` | Exactly 8 digits |
-
-DPS stores IČO under `identificationType=subjectRegistrationId`.
-
-### `identifikacia_kod_zakaznika(kod_zakaznika)` — Kód zákazníka / fakturačného účtu
-
-| Parameter         | Format                                  |
-| ----------------- | --------------------------------------- |
-| `kod_zakaznika`   | 8–12 digits (e.g. `4482259100`)         |
-
-The tool dispatches based on the trailing digit:
-
-- Last digit is **`0`** → treated as **Customer ID**, fetched via `GET /customers/{id}`.
-- Last digit is **`1–9`** → treated as **Billing Account ID**, fetched via `GET /billingAccounts/{id}` → the linked Customer is then fetched via `GET /customers/{id}`.
-
-For B2C customers DPS stores the name as `"Surname,FirstName"` (no space after the comma).
-The tool detects this pattern and presents it as `"FirstName Surname"`. B2B names
-(which may legitimately contain a comma followed by a space, e.g. `"Creditinfo Slovakia, S.R.O."`)
-are returned verbatim.
-
-### `identifikacia_telefon(telefon)` — Telefónne číslo (MSISDN)
-
-| Parameter | Format                                                              |
-| --------- | ------------------------------------------------------------------- |
-| `telefon` | SK local (`0904...`) or international (`+421904...` / `421904...`) |
-
-The tool normalizes the input to international format `421XXXXXXXXX` (12 digits, no `+`),
-then queries Product Inventory `GET /products?query=publicIdentifier==<msisdn>`. The
-matched product carries `customer.id` which is resolved via the same path used by
-`identifikacia_kod_zakaznika`.
-
-### `identifikacia_seriove_cislo(seriove_cislo)` — Sériové číslo zariadenia
-
-| Parameter         | Format                                                |
-| ----------------- | ----------------------------------------------------- |
-| `seriove_cislo`   | 8–30 alphanumeric characters (e.g. `M91450EB0603`)    |
-
-Suited for the customer reading the serial off a router, set-top box, modem
-or similar device. The tool strips spaces, dashes, slashes and dots from the
-input and uppercases letters before the lookup, then queries Product Inventory
-via `GET /products?query=productSerialNumber==<sn>`. The matched product
-carries `customer.id` which is resolved through customer-management. The
-backing field is case-sensitive in DPS — normalization is the responsibility
-of the tool.
+Widget builders live in [`widgets.py`](widgets.py); the shared transport/submit
+helpers in [`lib/bubble_widgets`](../../lib/bubble_widgets/guide.md). Sensitive
+widget inputs are never pushed back to the NLP engine (`_DO_NOT_FLUSH_KEYS`).
 
 ## Environment variables
 
@@ -341,7 +325,10 @@ skill.
 ## Live test scenarios (verified against DPS test environment)
 
 These inputs map to known parties in the DPS staging environment. Use them via the
-`mcp-tester` GUI above or directly through any MCP client. **VPN required.**
+`mcp-tester` GUI above or directly through any MCP client. **VPN required.** All
+calls now go through the single `identifikacia` tool — the headers below name the
+classifier route each input takes (call `identifikacia(hodnota=<input>)`, or pin it
+with `typ=`).
 
 ### `identifikacia_rodne_cislo`
 
@@ -354,24 +341,6 @@ These inputs map to known parties in the DPS staging environment. Use them via t
 | `8753189467` | `{found, multiple_matches: true, names: [...]}` | Test pollution: ~450 records |
 | `0000000000` | `{found: false, error: "not_found"}` | — |
 | `abc`, `12345` | `{found: false, error: "invalid_input"}` | — |
-
-### `identifikacia_op`
-
-| Input | Expected | Backing party |
-|---|---|---|
-| `RC932733` | `{found, name: "Stano Muziková"}` | PARTY_1002203200 |
-| `HY258342` | `{found, name: "Valent Dorcak"}` | PARTY_4103349400 |
-| `MM852148` | `{found, multiple_matches: true, names: [...]}` | Test pollution |
-| `XX000000` | `{found: false, error: "not_found"}` | — |
-| `123`, `ABCDEF12` | `{found: false, error: "invalid_input"}` | — |
-
-### `identifikacia_pas`
-
-| Input | Expected | Backing party |
-|---|---|---|
-| `BR154151` | `{found, name: "Imre Mlynarcik"}` | PARTY_1138860700 |
-| `XX000000` | `{found: false, error: "not_found"}` | — |
-| `123`, `ABCD12345` | `{found: false, error: "invalid_input"}` | — |
 
 ### `identifikacia_ico`
 

@@ -146,7 +146,15 @@ def make_tool():
         fake = _FakeMCP()
         registry = ToolRegistry(fake)  # type: ignore[arg-type]
         identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_rodne_cislo"], stub
+        ident = fake.registered["identifikacia"]
+
+        # The 7 per-type tools were merged into one `identifikacia` dispatcher.
+        # This adapter pins typ="rodne_cislo" so the existing per-type tests keep
+        # exercising the rodné-číslo route + validation deterministically.
+        async def _rc(rodne_cislo="", _meta=None):
+            return await ident(hodnota=rodne_cislo, typ="rodne_cislo", _meta=_meta)
+
+        return _rc, stub
 
     return _factory
 
@@ -561,261 +569,6 @@ async def test_successful_identification_caches_full_candidates(make_tool, conv)
     assert any(c["type"] == "mobile" for c in cached_candidate["contacts"])
 
 
-# ---- identifikacia_op ----
-
-
-@pytest.fixture
-def make_op_tool():
-    """Factory specifically for the identifikacia_op tool."""
-
-    def _factory(
-        parties=None,
-        customers_by_party=None,
-        max_candidates: int = 10,
-    ):
-        stub = _StubClient(parties=parties, customers_by_party=customers_by_party)
-        fake = _FakeMCP()
-        registry = ToolRegistry(fake)  # type: ignore[arg-type]
-        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_op"], stub
-
-    return _factory
-
-
-@pytest.mark.unit
-async def test_op_rejects_empty_input(make_op_tool, conv) -> None:  # noqa: ARG001
-    tool, stub = make_op_tool()
-    result = await _call(tool, cislo_op="")
-    assert result["found"] is False
-    assert result["error"] == "invalid_input"
-    assert "občianskeho preukazu" in result["message"]
-    assert stub.party_calls == []
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "A1234567",  # 1 letter + 7 digits
-        "ABCDEF12",  # 6 letters + 2 digits
-        "12345",  # too short
-        "A2B345678",  # mixed
-        " ",  # blank
-        "12345678",  # all-numeric: no longer accepted (no legacy SK OP)
-        "123456789",  # 9 digits
-        "1234567",  # 7 digits
-        "AB12345",  # 5 digits (one short)
-        "AB1234567",  # 7 digits (one over)
-    ],
-)
-async def test_op_rejects_bad_format(make_op_tool, conv, bad) -> None:  # noqa: ARG001
-    tool, stub = make_op_tool()
-    result = await _call(tool, cislo_op=bad)
-    assert result["error"] == "invalid_input"
-    assert stub.party_calls == []
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    ("good_input", "expected_normalized"),
-    [
-        ("AB123456", "AB123456"),
-        ("ab123456", "AB123456"),  # lowercase normalized
-        (" AB123456 ", "AB123456"),  # leading/trailing whitespace
-        ("AB-123456", "AB123456"),  # hyphen separator
-        ("AB 123 456", "AB123456"),  # spaces between groups
-        ("ea-123456", "EA123456"),  # combo: lowercase + hyphen
-    ],
-)
-async def test_op_valid_format_reaches_party_call_with_correct_type(
-    make_op_tool,
-    conv,  # noqa: ARG001
-    good_input,
-    expected_normalized,
-) -> None:
-    tool, stub = make_op_tool(parties=[])
-    await _call(tool, cislo_op=good_input)
-    assert len(stub.party_calls) == 1
-    called_id, called_type = stub.party_calls[0]
-    assert called_id == expected_normalized
-    assert called_type == "nationalIdentityCard"
-
-
-@pytest.mark.unit
-async def test_op_single_match_returns_name_only(make_op_tool, conv) -> None:  # noqa: ARG001
-    party = _full_party()  # default name "Tester AT NECHYTAT", id PARTY_4482259100
-    customer = _customer()
-    tool, _ = make_op_tool(
-        parties=[party],
-        customers_by_party={"PARTY_4482259100": [customer]},
-    )
-    result = await _call(tool, cislo_op="MM852148")
-    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
-
-
-@pytest.mark.unit
-async def test_op_not_found_uses_op_specific_message(make_op_tool, conv) -> None:  # noqa: ARG001
-    tool, _ = make_op_tool(parties=[])
-    result = await _call(tool, cislo_op="MM852148")
-    assert result == {
-        "found": False,
-        "error": "not_found",
-        "message": "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť.",
-    }
-
-
-@pytest.mark.unit
-async def test_op_caches_full_candidates(make_op_tool, conv) -> None:  # noqa: ARG001
-    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
-
-    party = _full_party()
-    customer = _customer()
-    tool, _ = make_op_tool(
-        parties=[party],
-        customers_by_party={"PARTY_4482259100": [customer]},
-    )
-    await _call(tool, cislo_op="MM852148")
-    cached = _IDENTITY_STATE.get("conv-test")
-    assert cached is not None
-    [cached_candidate] = cached["candidates"]
-    assert cached_candidate["party_id"] == "PARTY_4482259100"
-    assert cached_candidate["customer_id"] == "4482259100"
-
-
-@pytest.mark.unit
-async def test_op_upstream_error_uses_unified_message(make_op_tool, conv) -> None:  # noqa: ARG001
-    from svc.mcp_telekom_identity.dps_get_client import DPSAuthError
-
-    tool, _ = make_op_tool(parties=DPSAuthError("bad token"))
-    result = await _call(tool, cislo_op="MM852148")
-    assert result["error"] == "auth_failed"
-    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
-
-
-# ---- hidden_tools (visibility control) ----
-
-
-@pytest.mark.unit
-def test_hidden_tools_are_not_registered() -> None:
-    """`hidden_tools` keeps op/pas out of the registered set; others stay visible."""
-    stub = _StubClient()
-    fake = _FakeMCP()
-    registry = ToolRegistry(fake)  # type: ignore[arg-type]
-    identity_tools.register(
-        registry,
-        client=stub,
-        hidden_tools=frozenset({"identifikacia_op", "identifikacia_pas"}),
-    )
-    assert "identifikacia_op" not in fake.registered
-    assert "identifikacia_pas" not in fake.registered
-    # A non-hidden tool is still registered.
-    assert "identifikacia_rodne_cislo" in fake.registered
-
-
-# ---- identifikacia_pas ----
-
-
-@pytest.fixture
-def make_pas_tool():
-    """Factory specifically for the identifikacia_pas tool."""
-
-    def _factory(
-        parties=None,
-        customers_by_party=None,
-        max_candidates: int = 10,
-    ):
-        stub = _StubClient(parties=parties, customers_by_party=customers_by_party)
-        fake = _FakeMCP()
-        registry = ToolRegistry(fake)  # type: ignore[arg-type]
-        identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_pas"], stub
-
-    return _factory
-
-
-@pytest.mark.unit
-async def test_pas_rejects_empty_input(make_pas_tool, conv) -> None:  # noqa: ARG001
-    tool, stub = make_pas_tool()
-    result = await _call(tool, cislo_pasu="")
-    assert result["found"] is False
-    assert result["error"] == "invalid_input"
-    assert "cestovného pasu" in result["message"]
-    assert stub.party_calls == []
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("bad", ["123", "ABCD12345", "A1234567890", " "])
-async def test_pas_rejects_bad_format(make_pas_tool, conv, bad) -> None:  # noqa: ARG001
-    tool, stub = make_pas_tool()
-    result = await _call(tool, cislo_pasu=bad)
-    assert result["error"] == "invalid_input"
-    assert stub.party_calls == []
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("good", ["BR154151", "br154151", " BR154151 ", "AB123456", "X1234567"])
-async def test_pas_valid_format_reaches_party_call_with_correct_type(
-    make_pas_tool,
-    conv,  # noqa: ARG001
-    good,
-) -> None:
-    tool, stub = make_pas_tool(parties=[])
-    await _call(tool, cislo_pasu=good)
-    assert len(stub.party_calls) == 1
-    called_id, called_type = stub.party_calls[0]
-    assert called_id == good.strip().upper()
-    assert called_type == "passport"
-
-
-@pytest.mark.unit
-async def test_pas_single_match_returns_name_only(make_pas_tool, conv) -> None:  # noqa: ARG001
-    party = _full_party()
-    customer = _customer()
-    tool, _ = make_pas_tool(
-        parties=[party],
-        customers_by_party={"PARTY_4482259100": [customer]},
-    )
-    result = await _call(tool, cislo_pasu="BR154151")
-    assert result == {"found": True, "name": "Tester AT NECHYTAT"}
-
-
-@pytest.mark.unit
-async def test_pas_not_found_uses_pas_specific_message(make_pas_tool, conv) -> None:  # noqa: ARG001
-    tool, _ = make_pas_tool(parties=[])
-    result = await _call(tool, cislo_pasu="BR154151")
-    assert result == {
-        "found": False,
-        "error": "not_found",
-        "message": "Zákazníka s týmto číslom cestovného pasu sa nepodarilo nájsť.",
-    }
-
-
-@pytest.mark.unit
-async def test_pas_upstream_error_uses_unified_message(make_pas_tool, conv) -> None:  # noqa: ARG001
-    tool, _ = make_pas_tool(parties=DPSAuthError("bad token"))
-    result = await _call(tool, cislo_pasu="BR154151")
-    assert result["error"] == "auth_failed"
-    assert result["message"] == "Vyskytol sa technický problém. Prepojím vás na operátora."
-
-
-@pytest.mark.unit
-async def test_pas_caches_full_candidates(make_pas_tool, conv) -> None:  # noqa: ARG001
-    from svc.mcp_telekom_identity.tools import _IDENTITY_STATE
-
-    party = _full_party()
-    customer = _customer()
-    tool, _ = make_pas_tool(
-        parties=[party],
-        customers_by_party={"PARTY_4482259100": [customer]},
-    )
-    await _call(tool, cislo_pasu="BR154151")
-    cached = _IDENTITY_STATE.get("conv-test")
-    assert cached is not None
-    [cached_candidate] = cached["candidates"]
-    assert cached_candidate["party_id"] == "PARTY_4482259100"
-    assert cached_candidate["customer_id"] == "4482259100"
-
-
 # ---- identifikacia_ico ----
 
 
@@ -852,7 +605,12 @@ def make_ico_tool():
         fake = _FakeMCP()
         registry = ToolRegistry(fake)  # type: ignore[arg-type]
         identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_ico"], stub
+        ident = fake.registered["identifikacia"]
+
+        async def _ico(ico="", _meta=None):
+            return await ident(hodnota=ico, typ="ico", _meta=_meta)
+
+        return _ico, stub
 
     return _factory
 
@@ -966,7 +724,12 @@ def make_kod_tool():
         fake = _FakeMCP()
         registry = ToolRegistry(fake)  # type: ignore[arg-type]
         identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_kod_zakaznika"], stub
+        ident = fake.registered["identifikacia"]
+
+        async def _kod(kod_zakaznika="", _meta=None):
+            return await ident(hodnota=kod_zakaznika, typ="kod_zakaznika", _meta=_meta)
+
+        return _kod, stub
 
     return _factory
 
@@ -1134,7 +897,12 @@ def make_tel_tool():
         fake = _FakeMCP()
         registry = ToolRegistry(fake)  # type: ignore[arg-type]
         identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_telefon"], stub
+        ident = fake.registered["identifikacia"]
+
+        async def _tel(telefon="", _meta=None):
+            return await ident(hodnota=telefon, typ="telefon", _meta=_meta)
+
+        return _tel, stub
 
     return _factory
 
@@ -1276,7 +1044,12 @@ def make_serial_tool():
         fake = _FakeMCP()
         registry = ToolRegistry(fake)  # type: ignore[arg-type]
         identity_tools.register(registry, client=stub, max_candidates=max_candidates)
-        return fake.registered["identifikacia_seriove_cislo"], stub
+        ident = fake.registered["identifikacia"]
+
+        async def _serial(seriove_cislo="", _meta=None):
+            return await ident(hodnota=seriove_cislo, typ="seriove_cislo", _meta=_meta)
+
+        return _serial, stub
 
     return _factory
 
@@ -1466,27 +1239,6 @@ async def test_rodne_cislo_pushes_only_last4_to_nlp(
     assert named_entities == {
         "identification_method": "rodne_cislo",
         "identification": "last4=9467",
-    }
-
-
-@pytest.mark.unit
-async def test_op_pushes_only_last4_to_nlp(
-    make_op_tool,
-    conv,  # noqa: ARG001
-    _reset_identity_state_and_silence_nlp,
-) -> None:
-    party = _full_party()
-    customer = _customer()
-    tool, _ = make_op_tool(
-        parties=[party],
-        customers_by_party={"PARTY_4482259100": [customer]},
-    )
-    await _call(tool, cislo_op="MM852148")
-    nlp_calls = _reset_identity_state_and_silence_nlp
-    _, named_entities = nlp_calls[0]
-    assert named_entities == {
-        "identification_method": "op",
-        "identification": "last4=2148",
     }
 
 
@@ -1713,12 +1465,23 @@ def make_auth_tool():
         fake = _FakeMCP()
         registry = ToolRegistry(fake)  # type: ignore[arg-type]
         identity_tools.register(registry, client=stub, max_candidates=max_candidates)
+        ident = fake.registered["identifikacia"]
+
+        def _typed(typ):
+            async def _call_typed(_meta=None, **kw):
+                # accept the original per-type kwarg (rodne_cislo=, kod_zakaznika=, telefon=)
+                value = next(iter(kw.values())) if kw else ""
+                return await ident(hodnota=value, typ=typ, _meta=_meta)
+
+            return _call_typed
+
         return {
             "autentifikacia": fake.registered["autentifikacia"],
             "nastav_test_kontext": fake.registered["nastav_test_kontext"],
-            "identifikacia_rodne_cislo": fake.registered["identifikacia_rodne_cislo"],
-            "identifikacia_kod_zakaznika": fake.registered["identifikacia_kod_zakaznika"],
-            "identifikacia_telefon": fake.registered["identifikacia_telefon"],
+            "identifikacia": ident,
+            "identifikacia_rodne_cislo": _typed("rodne_cislo"),
+            "identifikacia_kod_zakaznika": _typed("kod_zakaznika"),
+            "identifikacia_telefon": _typed("telefon"),
         }, stub
 
     return _factory

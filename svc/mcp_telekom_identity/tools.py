@@ -1,16 +1,9 @@
 """MCP tools for mcp_telekom_identity.
 
-identifikacia_rodne_cislo(rodne_cislo)
-— Find Telekom customer(s) by Slovak personal identification number (rodné číslo).
-
-identifikacia_op(cislo_op)
-— Find Telekom customer(s) by Slovak national ID card number (občiansky preukaz).
-
-identifikacia_pas(cislo_pasu)
-— Find Telekom customer(s) by passport number.
-
-identifikacia_ico(ico)
-— Find Telekom customer(s) by Slovak company ID (IČO).
+identifikacia(hodnota, typ)
+— Single entry point: identify a Telekom customer by any supported identifier
+  (telefón / IČO / rodné číslo / kód zákazníka / sériové číslo). Auto-detects the
+  type via the classifier, or renders an identification widget in chat channels.
 """
 
 from __future__ import annotations
@@ -32,8 +25,10 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
+from lib.bubble_widgets import bubble_widget_result
 from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
 from lib.mcp_service.state import TTLStore
+from svc.mcp_telekom_identity import widgets
 from svc.mcp_telekom_identity.dps_get_client import (
     DPSAuthError,
     DPSError,
@@ -58,11 +53,6 @@ _RC_TOOL_DESCRIPTION = (
     "a kontakty si tool uloží do pamäte konverzácie pre ďalšie nástroje "
     "— netreba ich od neho znova žiadať."
 )
-
-# SK OP since 1993: exactly 2 uppercase letters + 6 digits (8 chars). Pre-1993
-# Czechoslovak numeric IDs are expired and not in active DPS records.
-# Strip whitespace/dashes + uppercase before matching so "EA 123 456" and "ea-123456" normalize.
-_OP_NORMALIZE_RE = re.compile(r"[\s\-]")
 
 # MSISDN normalization:
 # - strip whitespace, dashes, parentheses, dots, leading "+"
@@ -96,31 +86,6 @@ def _normalize_serial(raw: str) -> str | None:
     return None
 
 
-_OP_PATTERN = re.compile(r"^[A-Z]{2}\d{6}$")
-_OP_INVALID_MESSAGE = "Číslo občianskeho preukazu má tvar 2 písmená a 6 cifier (napr. AB123456)."
-_OP_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom občianskeho preukazu sa nepodarilo nájsť."
-_OP_TOOL_DESCRIPTION = (
-    "Identifikuj zákazníka podľa čísla občianskeho preukazu. Po úspechu vráti meno "
-    "(alebo zoznam mien ak je záznamov viac). Interné identifikátory a kontakty "
-    "si tool uloží do pamäte konverzácie pre ďalšie nástroje — netreba ich od neho "
-    "znova žiadať."
-)
-
-# Passport format: 2 letters + 6-8 digits (SK) or 1-2 letters + 6-8 digits (international).
-# Strip + uppercase before matching.
-_PAS_PATTERN = re.compile(r"^[A-Z]{1,2}\d{6,8}$")
-_PAS_INVALID_MESSAGE = (
-    "Číslo cestovného pasu nie je v správnom tvare. "
-    "Zadajte ho ako 1 alebo 2 písmená a 6 až 8 cifier (napr. BR154151)."
-)
-_PAS_NOT_FOUND_MESSAGE = "Zákazníka s týmto číslom cestovného pasu sa nepodarilo nájsť."
-_PAS_TOOL_DESCRIPTION = (
-    "Identifikuj zákazníka podľa čísla cestovného pasu. Po úspechu vráti meno "
-    "(alebo zoznam mien ak je záznamov viac). Interné identifikátory a kontakty "
-    "si tool uloží do pamäte konverzácie pre ďalšie nástroje — netreba ich od neho "
-    "znova žiadať."
-)
-
 # Slovak IČO: exactly 8 digits.
 _ICO_PATTERN = re.compile(r"^\d{8}$")
 _ICO_INVALID_MESSAGE = "IČO nie je v správnom tvare. Zadajte ho ako 8 cifier."
@@ -139,6 +104,20 @@ _NLP_BASE_URL = os.environ.get("APP_GOODBOT_URL") or os.environ.get(
 )
 _NLP_TIMEOUT_SECONDS = 1.0
 
+# Widget-submitted raw inputs land in the mirror (the host writes them into
+# named_entities on submit). They are never pushed back to the NLP engine — they
+# may contain sensitive identifiers (rodné číslo, auth secrets). We read them,
+# use them, and let them expire with the mirror; the LLM never sees them.
+_DO_NOT_FLUSH_KEYS = frozenset(
+    {
+        "identifikacia_vstup",
+        "identifikacia_typ",
+        "autentifikacia_meno_priezvisko",
+        "autentifikacia_kod_adresata",
+        "autentifikacia_rc_last4",
+    }
+)
+
 
 def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
     """Store named_entities in the per-conversation session store (single source of truth)."""
@@ -155,6 +134,22 @@ def _nlp_get_named_entities(conversation_id: str) -> dict[str, str]:
     if not conversation_id:
         return {}
     return _NLP_MIRROR_STATE.get(conversation_id) or {}
+
+
+def _consume_named_entity(conversation_id: str, key: str) -> str | None:
+    """Read and remove a named_entity from the mirror (one-shot widget input).
+
+    Widget-submitted values are consumed once so a later call doesn't re-apply a
+    stale value (e.g. re-verifying an already-handled auth factor).
+    """
+    if not conversation_id:
+        return None
+    current = _NLP_MIRROR_STATE.get(conversation_id)
+    if not current or key not in current:
+        return None
+    value = current.pop(key)
+    _NLP_MIRROR_STATE.set(conversation_id, current)
+    return value
 
 
 async def _nlp_load(conversation_id: str) -> None:
@@ -206,7 +201,11 @@ def _nlp_flush(conversation_id: str) -> None:
     if not current:
         return
     last = _NLP_FLUSHED_STATE.get(conversation_id) or {}
-    delta = {k: v for k, v in current.items() if last.get(k) != v}
+    delta = {
+        k: v
+        for k, v in current.items()
+        if last.get(k) != v and k not in _DO_NOT_FLUSH_KEYS
+    }
     if not delta:
         return  # nothing changed since the last push
 
@@ -288,6 +287,134 @@ _SERIAL_TOOL_DESCRIPTION = (
     "(router, set-top box, modem, …). Po úspechu vráti meno zákazníka. "
     "Interné identifikátory si tool uloží do pamäte konverzácie pre ďalšie nástroje."
 )
+
+# Single identification entry point — auto-detects the identifier type.
+_IDENTIFIKACIA_TOOL_DESCRIPTION = (
+    "Identifikuj zákazníka podľa ľubovoľného identifikačného údaja "
+    "(telefónne číslo, IČO, rodné číslo, kód zákazníka/fakturačného účtu, sériové číslo). "
+    "Tool typ údaja rozpozná sám podľa formátu — netreba ho určovať. "
+    "Po úspechu vráti meno zákazníka; interné identifikátory si uloží do pamäte konverzácie "
+    "pre ďalšie nástroje. V chat kanáli (Channel='chat') a bez zadanej hodnoty zobrazí "
+    "identifikačný widget — zavolaj ho bez parametrov, keď chceš zákazníka požiadať o údaje. "
+    "Hodnotu zadanú zákazníkom vo widgete si prečíta z pamäte konverzácie sám. "
+    "Mimo chatu (alebo keď už hodnotu máš) zavolaj s parametrom hodnota=<údaj>."
+)
+
+_CHANNEL_KEY = "Channel"
+_CHANNEL_CHAT = "chat"
+
+# Identifier route keys (also the dropdown values in the widget).
+_TYPE_TELEFON = "telefon"
+_TYPE_ICO = "ico"
+_TYPE_RODNE_CISLO = "rodne_cislo"
+_TYPE_KOD_ZAKAZNIKA = "kod_zakaznika"
+_TYPE_SERIOVE_CISLO = "seriove_cislo"
+_TYPE_AUTO = "auto"
+
+_IDENT_INPUT_REQUIRED_MESSAGE = (
+    "Potrebujem identifikačný údaj — napríklad telefónne číslo, rodné číslo, "
+    "IČO, kód zákazníka alebo sériové číslo zariadenia."
+)
+_IDENT_UNRECOGNIZED_MESSAGE = (
+    "Tento údaj sa mi nepodarilo rozpoznať. Skúste, prosím, telefónne číslo, rodné číslo, "
+    "IČO, kód zákazníka alebo sériové číslo zariadenia."
+)
+
+
+def _is_valid_ico(digits: str) -> bool:
+    """Slovak/Czech IČO checksum: 8 digits, weighted mod-11 over the first 7."""
+    if len(digits) != 8 or not digits.isdigit():
+        return False
+    weights = (8, 7, 6, 5, 4, 3, 2)
+    total = sum(int(digits[i]) * weights[i] for i in range(7))
+    check = 11 - (total % 11)
+    if check == 10:
+        check = 0
+    elif check == 11:
+        check = 1
+    return check == int(digits[7])
+
+
+def _is_valid_rodne_cislo(digits: str) -> bool:
+    """Structural RČ validation: 9 or 10 digits, plausible YYMMDD, and (10-digit) mod 11.
+
+    Month accepts the standard 1-12 and +50 (women). The rare post-2003 +20/+70
+    extensions are intentionally NOT accepted — they widen the false-positive
+    surface (customer/billing codes that happen to parse as a date) more than
+    they help. The mod-11 divisibility check (10-digit RČ only) is the main guard
+    that keeps a random customer code from being mistaken for a rodné číslo.
+    """
+    if not digits.isdigit() or len(digits) not in (9, 10):
+        return False
+    month = int(digits[2:4])
+    if month > 50:
+        month -= 50
+    if not 1 <= month <= 12:
+        return False
+    day = int(digits[4:6])
+    if not 1 <= day <= 31:
+        return False
+    if len(digits) == 10 and int(digits) % 11 != 0:
+        return False
+    return True
+
+
+def _classify_identifier(raw: str) -> tuple[str | None, list[str]]:
+    """Classify a free-text identifier into a route key.
+
+    Returns ``(type, [])`` for a confident single match, ``(None, candidates)``
+    when two *structured* signals genuinely collide (caller should disambiguate),
+    or ``(None, [])`` when nothing plausible matches.
+
+    Priority: a structurally valid serial / phone / IČO / rodné číslo wins;
+    ``kod_zakaznika`` (8-12 digits, no checksum) is only the fallback when no
+    structured signal fires.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None, []
+
+    # 1. Contains a letter → only the serial number is alphanumeric.
+    serial_norm = _SERIAL_STRIP_RE.sub("", value).upper()
+    if any(c.isalpha() for c in serial_norm):
+        if _SERIAL_PATTERN.fullmatch(serial_norm):
+            return _TYPE_SERIOVE_CISLO, []
+        return None, []
+
+    # 2. Digits only from here.
+    stripped = _MSISDN_STRIP_RE.sub("", value)
+    if not stripped or not stripped.isdigit():
+        return None, []
+
+    msisdn = _normalize_msisdn(value)
+    explicit_phone = msisdn is not None and (
+        value.strip().startswith("+")
+        or stripped.startswith("00421")
+        or stripped.startswith("421")
+    )
+    if explicit_phone:
+        return _TYPE_TELEFON, []
+
+    digits = stripped
+    n = len(digits)
+
+    strong: list[str] = []
+    if _is_valid_rodne_cislo(digits):
+        strong.append(_TYPE_RODNE_CISLO)
+    if n == 8 and _is_valid_ico(digits):
+        strong.append(_TYPE_ICO)
+    if msisdn is not None:  # bare local 0… that normalises to a SK MSISDN
+        strong.append(_TYPE_TELEFON)
+
+    if len(strong) == 1:
+        return strong[0], []
+    if len(strong) >= 2:
+        return None, strong  # genuine collision (e.g. 09… valid as phone and RČ)
+
+    # No structured signal → numeric customer/billing code is the fallback.
+    if _KOD_PATTERN.fullmatch(digits):
+        return _TYPE_KOD_ZAKAZNIKA, []
+    return None, []
 
 _IDENTITY_TTL_SECONDS = 30 * 60
 _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_SECONDS)
@@ -376,8 +503,8 @@ _VIAZANOST_TOOL_DESCRIPTION = (
     "surové dáta zmlúv a odporúčanú odpoveď pre zákazníka."
 )
 
-# Tools whose input is PII (sent to NLP only as last4=XXXX marker).
-_PII_METHODS = frozenset({"rodne_cislo", "op", "pas"})
+# Methods whose input is PII (sent to NLP only as last4=XXXX marker).
+_PII_METHODS = frozenset({"rodne_cislo"})
 
 
 def _persist_identification(
@@ -759,6 +886,43 @@ def _instruction_for_factor(factor: str) -> str:
     return "Zavolaj autentifikacia bez parametrov pre opätovné vyhodnotenie."
 
 
+def _need_factor_response(
+    next_factor: str,
+    *,
+    auth_type: str,
+    satisfied: set[str],
+    required: int,
+    channel: str,
+) -> str:
+    """Render the "need this factor next" response.
+
+    In a chat channel (and for a factor that has a widget) return an auth widget so
+    the customer fills it in privacy-safe; otherwise return the JSON the LLM uses to
+    collect the value via a parameter.
+    """
+    suggested = _suggested_response_for_factor(next_factor)
+    if channel == _CHANNEL_CHAT and next_factor in widgets.AUTH_FIELD_KEYS:
+        return _json(
+            bubble_widget_result(
+                summary=f"Autentifikačný widget ({next_factor})",
+                widget=widgets.auth_factor_widget(next_factor, caption=suggested),
+                template="autentifikacia",
+                assistant_text=suggested,
+            )
+        )
+    return _json(
+        {
+            "authenticated": False,
+            "level_required": auth_type,
+            "factors_satisfied": sorted(satisfied),
+            "factors_remaining": required - len(satisfied),
+            "next_factor": next_factor,
+            "suggested_response": suggested,
+            "instruction": _instruction_for_factor(next_factor),
+        }
+    )
+
+
 def _persist_auth_state(conv: str, state: dict[str, Any]) -> None:
     """Serialise sets to lists before storing in TTLStore (so retrieval is sane)."""
     serialised = dict(state)
@@ -914,19 +1078,8 @@ def register(
     *,
     client: DPSGetClient,
     max_candidates: int = 10,
-    hidden_tools: frozenset[str] | None = None,
 ) -> None:
-    """Register identity tools onto the FastMCP registry.
-
-    Tools whose name is in ``hidden_tools`` are defined but NOT registered with
-    FastMCP, so they don't appear in ``/mcp``. Their logic stays intact (and
-    testable) — pass ``registry`` for a tool only when it should be visible.
-    """
-    hidden = hidden_tools or frozenset()
-
-    def _registry_for(name: str) -> ToolRegistry | None:
-        """Return the registry for ``name``, or None to skip registration (hidden)."""
-        return None if name in hidden else registry
+    """Register identity tools onto the FastMCP registry."""
 
     async def _identify_and_respond(
         identification_id: str,
@@ -1024,380 +1177,340 @@ def register(
             }
         )
 
-    @mcp_tool(name="identifikacia_rodne_cislo", description=_RC_TOOL_DESCRIPTION, registry=registry)
-    async def identifikacia_rodne_cislo(
-        rodne_cislo: Annotated[
-            str,
-            Field(description="Rodné číslo zákazníka — 9 alebo 10 cifier, bez lomky."),
-        ],
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conv = (_meta or {}).get("conversation_id", "")
-        await _nlp_load(conv)
+    # --- Internal identifier lookups -------------------------------------
+    # Each assumes the value is already validated/normalised by the dispatcher.
+    # NLP load/flush is handled once by the `identifikacia` dispatcher, not here.
+
+    async def _lookup_rodne_cislo(value: str, conv: str) -> str:
+        return await _identify_and_respond(
+            identification_id=value,
+            identification_type="socialSecurityNumber",
+            not_found_message=_RC_NOT_FOUND_MESSAGE,
+            conversation_id=conv,
+            log_id_tag="rc_last4",
+            method="rodne_cislo",
+        )
+
+    async def _lookup_ico(value: str, conv: str) -> str:
+        return await _identify_and_respond(
+            identification_id=value,
+            identification_type="subjectRegistrationId",
+            not_found_message=_ICO_NOT_FOUND_MESSAGE,
+            conversation_id=conv,
+            log_id_tag="ico_last4",
+            method="ico",
+        )
+
+    async def _lookup_kod_zakaznika(value: str, conv: str) -> str:
+        _log.info("identifikacia kod_zakaznika code_suffix=%s conv=%s", value[-1], conv)
         try:
-            value = (rodne_cislo or "").strip()
-            if not _RC_PATTERN.fullmatch(value):
-                return _json({"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE})
-            return await _identify_and_respond(
-                identification_id=value,
-                identification_type="socialSecurityNumber",
-                not_found_message=_RC_NOT_FOUND_MESSAGE,
-                conversation_id=conv,
-                log_id_tag="rc_last4",
-                method="rodne_cislo",
-            )
-        finally:
-            _nlp_flush(conv)
-
-    # Visibility controlled via `hidden_tools` (see register() + __init__.py).
-    # When hidden, _registry_for returns None → tool not registered with FastMCP,
-    # so it stays out of /mcp while its logic remains defined and testable.
-    @mcp_tool(
-        name="identifikacia_op",
-        description=_OP_TOOL_DESCRIPTION,
-        registry=_registry_for("identifikacia_op"),
-    )
-    async def identifikacia_op(
-        cislo_op: Annotated[
-            str,
-            Field(
-                description="Číslo občianskeho preukazu — 2 písmená a 6 cifier (napr. AB123456)."
-            ),
-        ],
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conv = (_meta or {}).get("conversation_id", "")
-        await _nlp_load(conv)
-        try:
-            value = _OP_NORMALIZE_RE.sub("", cislo_op or "").upper()
-            if not _OP_PATTERN.fullmatch(value):
-                return _json({"found": False, "error": "invalid_input", "message": _OP_INVALID_MESSAGE})
-            return await _identify_and_respond(
-                identification_id=value,
-                identification_type="nationalIdentityCard",
-                not_found_message=_OP_NOT_FOUND_MESSAGE,
-                conversation_id=conv,
-                log_id_tag="op_last4",
-                method="op",
-            )
-        finally:
-            _nlp_flush(conv)
-
-    # Visibility controlled via `hidden_tools` (see identifikacia_op note above).
-    @mcp_tool(
-        name="identifikacia_pas",
-        description=_PAS_TOOL_DESCRIPTION,
-        registry=_registry_for("identifikacia_pas"),
-    )
-    async def identifikacia_pas(
-        cislo_pasu: Annotated[
-            str,
-            Field(description="Číslo cestovného pasu — napr. BR154151."),
-        ],
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conv = (_meta or {}).get("conversation_id", "")
-        await _nlp_load(conv)
-        try:
-            value = (cislo_pasu or "").strip().upper()
-            if not _PAS_PATTERN.fullmatch(value):
-                return _json(
-                    {"found": False, "error": "invalid_input", "message": _PAS_INVALID_MESSAGE}
-                )
-            return await _identify_and_respond(
-                identification_id=value,
-                identification_type="passport",
-                not_found_message=_PAS_NOT_FOUND_MESSAGE,
-                conversation_id=conv,
-                log_id_tag="pas_last4",
-                method="pas",
-            )
-        finally:
-            _nlp_flush(conv)
-
-    @mcp_tool(name="identifikacia_ico", description=_ICO_TOOL_DESCRIPTION, registry=registry)
-    async def identifikacia_ico(
-        ico: Annotated[
-            str,
-            Field(description="IČO spoločnosti — 8 cifier."),
-        ],
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conv = (_meta or {}).get("conversation_id", "")
-        await _nlp_load(conv)
-        try:
-            value = (ico or "").strip()
-            if not _ICO_PATTERN.fullmatch(value):
-                return _json(
-                    {"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE}
-                )
-            return await _identify_and_respond(
-                identification_id=value,
-                identification_type="subjectRegistrationId",
-                not_found_message=_ICO_NOT_FOUND_MESSAGE,
-                conversation_id=conv,
-                log_id_tag="ico_last4",
-                method="ico",
-            )
-        finally:
-            _nlp_flush(conv)
-
-    @mcp_tool(
-        name="identifikacia_kod_zakaznika", description=_KOD_TOOL_DESCRIPTION, registry=registry
-    )
-    async def identifikacia_kod_zakaznika(
-        kod_zakaznika: Annotated[
-            str,
-            Field(
-                description="Kód zákazníka alebo fakturačného účtu — len cifry (napr. 4482259100)."
-            ),
-        ],
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conv = (_meta or {}).get("conversation_id", "")
-        await _nlp_load(conv)
-        try:
-            value = (kod_zakaznika or "").strip()
-            if not _KOD_PATTERN.fullmatch(value):
-                return _json(
-                    {"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE}
-                )
-
-            _log.info("identifikacia_kod_zakaznika called code_suffix=%s conv=%s", value[-1], conv)
-
-            try:
-                if value.endswith("0"):
-                    customer = await client.get_customer_by_id(value)
+            if value.endswith("0"):
+                customer = await client.get_customer_by_id(value)
+            else:
+                ba = await client.get_billing_account_by_id(value)
+                if ba is None:
+                    customer = None
                 else:
-                    ba = await client.get_billing_account_by_id(value)
-                    if ba is None:
+                    cust_id = (ba.get("customer") or {}).get("id")
+                    if not isinstance(cust_id, str):
+                        _log.warning(
+                            "billing account %s has no customer.id — treating as not_found", value
+                        )
                         customer = None
                     else:
-                        cust_id = (ba.get("customer") or {}).get("id")
-                        if not isinstance(cust_id, str):
-                            _log.warning(
-                                "billing account %s has no customer.id — treating as not_found", value
-                            )
-                            customer = None
-                        else:
-                            customer = await client.get_customer_by_id(cust_id)
-            except DPSError as exc:
-                _log.warning("identifikacia_kod_zakaznika failed: %s", exc)
-                return _json(_dps_error_payload(exc))
+                        customer = await client.get_customer_by_id(cust_id)
+        except DPSError as exc:
+            _log.warning("identifikacia kod_zakaznika failed: %s", exc)
+            return _json(_dps_error_payload(exc))
 
-            if customer is None:
-                return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
+        if customer is None:
+            return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
 
-            candidate = _candidate_from_customer(customer)
-            if not candidate.get("name"):
-                # Defensive: the Customer record exists but has no usable name field
-                return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
+        candidate = _candidate_from_customer(customer)
+        if not candidate.get("name"):
+            # Defensive: the Customer record exists but has no usable name field
+            return _json({"found": False, "error": "not_found", "message": _KOD_NOT_FOUND_MESSAGE})
 
-            _persist_identification(
-                conversation_id=conv,
-                method="kod_zakaznika",
-                value=value,
-                candidates=[candidate],
-            )
+        _persist_identification(
+            conversation_id=conv,
+            method="kod_zakaznika",
+            value=value,
+            candidates=[candidate],
+        )
 
-            return _json({"found": True, "name": candidate["name"]})
-        finally:
-            _nlp_flush(conv)
+        return _json({"found": True, "name": candidate["name"]})
 
-    @mcp_tool(name="identifikacia_telefon", description=_TEL_TOOL_DESCRIPTION, registry=registry)
-    async def identifikacia_telefon(
-        telefon: Annotated[
-            str,
-            Field(description="Telefónne číslo — 0904... alebo +421904... / 421904..."),
-        ],
-        _meta: dict[str, Any] | None = None,
-    ) -> str:
-        conv = (_meta or {}).get("conversation_id", "")
-        await _nlp_load(conv)
+    async def _lookup_telefon(normalized: str, conv: str) -> str:
+        _log.info("identifikacia telefon msisdn_last4=%s conv=%s", normalized[-4:], conv)
+
         try:
-            normalized = _normalize_msisdn(telefon or "")
-            if not normalized:
-                return _json(
-                    {"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE}
-                )
+            products = await client.get_products_by_public_identifier(normalized)
+        except DPSError as exc:
+            _log.warning("identifikacia telefon product lookup failed: %s", exc)
+            return _json(_dps_error_payload(exc))
 
-            _log.info("identifikacia_telefon called msisdn_last4=%s conv=%s", normalized[-4:], conv)
+        if not products:
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
 
-            try:
-                products = await client.get_products_by_public_identifier(normalized)
-            except DPSError as exc:
-                _log.warning("identifikacia_telefon product lookup failed: %s", exc)
-                return _json(_dps_error_payload(exc))
+        # Extract unique customer ids from returned products
+        customer_ids: list[str] = []
+        seen: set[str] = set()
+        for p in products:
+            cid = (p.get("customer") or {}).get("id")
+            if isinstance(cid, str) and cid not in seen:
+                seen.add(cid)
+                customer_ids.append(cid)
 
-            if not products:
-                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+        if not customer_ids:
+            _log.warning("identifikacia telefon: products returned but no customer.id linkage")
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
 
-            # Extract unique customer ids from returned products
-            customer_ids: list[str] = []
-            seen: set[str] = set()
-            for p in products:
-                cid = (p.get("customer") or {}).get("id")
-                if isinstance(cid, str) and cid not in seen:
-                    seen.add(cid)
-                    customer_ids.append(cid)
-
-            if not customer_ids:
-                _log.warning("identifikacia_telefon: products returned but no customer.id linkage")
-                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
-
-            # Fetch each unique customer
-            try:
-                customers_raw = await asyncio.gather(
-                    *(client.get_customer_by_id(cid) for cid in customer_ids)
-                )
-            except DPSError as exc:
-                _log.warning("identifikacia_telefon customer fanout failed: %s", exc)
-                return _json(_dps_error_payload(exc))
-
-            customers = [c for c in customers_raw if c is not None]
-            if not customers:
-                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
-
-            candidates = [_candidate_from_customer(c) for c in customers]
-            candidates = [c for c in candidates if c.get("name")]
-            if not candidates:
-                return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
-
-            # The queried MSISDN matched the customer's Product.publicIdentifier — that is a
-            # verified mobile contact for this customer. Inject it into candidate.contacts so
-            # the auth tool's `trusted_source` factor can match against it without an extra
-            # Party fetch.
-            for cand in candidates:
-                existing = list(cand.get("contacts") or [])
-                if not any(
-                    ct.get("type") == "mobile"
-                    and _normalize_msisdn(ct.get("value") or "") == normalized
-                    for ct in existing
-                ):
-                    existing.append({"type": "mobile", "value": normalized})
-                    cand["contacts"] = existing
-
-            _persist_identification(
-                conversation_id=conv,
-                method="telefon",
-                value=normalized,
-                candidates=candidates,
+        # Fetch each unique customer
+        try:
+            customers_raw = await asyncio.gather(
+                *(client.get_customer_by_id(cid) for cid in customer_ids)
             )
+        except DPSError as exc:
+            _log.warning("identifikacia telefon customer fanout failed: %s", exc)
+            return _json(_dps_error_payload(exc))
 
-            if len(candidates) == 1:
-                return _json({"found": True, "name": candidates[0]["name"]})
+        customers = [c for c in customers_raw if c is not None]
+        if not customers:
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
 
-            names = sorted({c["name"] for c in candidates if c["name"]})
+        candidates = [_candidate_from_customer(c) for c in customers]
+        candidates = [c for c in candidates if c.get("name")]
+        if not candidates:
+            return _json({"found": False, "error": "not_found", "message": _TEL_NOT_FOUND_MESSAGE})
+
+        # The queried MSISDN matched the customer's Product.publicIdentifier — that is a
+        # verified mobile contact for this customer. Inject it into candidate.contacts so
+        # the auth tool's `trusted_source` factor can match against it without an extra
+        # Party fetch.
+        for cand in candidates:
+            existing = list(cand.get("contacts") or [])
+            if not any(
+                ct.get("type") == "mobile"
+                and _normalize_msisdn(ct.get("value") or "") == normalized
+                for ct in existing
+            ):
+                existing.append({"type": "mobile", "value": normalized})
+                cand["contacts"] = existing
+
+        _persist_identification(
+            conversation_id=conv,
+            method="telefon",
+            value=normalized,
+            candidates=candidates,
+        )
+
+        if len(candidates) == 1:
+            return _json({"found": True, "name": candidates[0]["name"]})
+
+        names = sorted({c["name"] for c in candidates if c["name"]})
+        return _json(
+            {
+                "found": True,
+                "multiple_matches": True,
+                "names": names,
+                "message": (
+                    "Pre toto telefónne číslo som našla viacero záznamov. "
+                    "Bude potrebné si vyžiadať dodatočné údaje."
+                ),
+            }
+        )
+
+    async def _lookup_seriove_cislo(normalized: str, conv: str) -> str:
+        _log.info(
+            "identifikacia seriove_cislo serial_last4=%s conv=%s", normalized[-4:], conv
+        )
+
+        try:
+            products = await client.get_products_by_serial_number(normalized)
+        except DPSError as exc:
+            _log.warning("identifikacia seriove_cislo product lookup failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        if not products:
             return _json(
-                {
-                    "found": True,
-                    "multiple_matches": True,
-                    "names": names,
-                    "message": (
-                        "Pre toto telefónne číslo som našla viacero záznamov. "
-                        "Bude potrebné si vyžiadať dodatočné údaje."
-                    ),
-                }
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
             )
-        finally:
-            _nlp_flush(conv)
 
-    @mcp_tool(
-        name="identifikacia_seriove_cislo", description=_SERIAL_TOOL_DESCRIPTION, registry=registry
-    )
-    async def identifikacia_seriove_cislo(
-        seriove_cislo: Annotated[
-            str,
+        # Extract unique customer ids
+        customer_ids: list[str] = []
+        seen: set[str] = set()
+        for p in products:
+            cid = (p.get("customer") or {}).get("id")
+            if isinstance(cid, str) and cid not in seen:
+                seen.add(cid)
+                customer_ids.append(cid)
+
+        if not customer_ids:
+            _log.warning(
+                "identifikacia seriove_cislo: products returned but no customer.id linkage"
+            )
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        try:
+            customers_raw = await asyncio.gather(
+                *(client.get_customer_by_id(cid) for cid in customer_ids)
+            )
+        except DPSError as exc:
+            _log.warning("identifikacia seriove_cislo customer fanout failed: %s", exc)
+            return _json(_dps_error_payload(exc))
+
+        customers = [c for c in customers_raw if c is not None]
+        if not customers:
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        candidates = [_candidate_from_customer(c) for c in customers]
+        candidates = [c for c in candidates if c.get("name")]
+        if not candidates:
+            return _json(
+                {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
+            )
+
+        _persist_identification(
+            conversation_id=conv,
+            method="seriove_cislo",
+            value=normalized,
+            candidates=candidates,
+        )
+
+        if len(candidates) == 1:
+            return _json({"found": True, "name": candidates[0]["name"]})
+
+        names = sorted({c["name"] for c in candidates if c["name"]})
+        return _json(
+            {
+                "found": True,
+                "multiple_matches": True,
+                "names": names,
+                "message": (
+                    "Pre toto sériové číslo som našla viacero záznamov. "
+                    "Bude potrebné si vyžiadať dodatočné údaje."
+                ),
+            }
+        )
+
+    # --- Dispatcher: the single public identification tool ----------------
+
+    async def _route_identifikacia(typ: str, hodnota: str, conv: str) -> str:
+        """Validate/normalise per type then call the matching internal lookup."""
+        if typ == _TYPE_TELEFON:
+            normalized = _normalize_msisdn(hodnota)
+            if not normalized:
+                return _json({"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE})
+            return await _lookup_telefon(normalized, conv)
+        if typ == _TYPE_ICO:
+            value = hodnota.strip()
+            if not _ICO_PATTERN.fullmatch(value):
+                return _json({"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE})
+            return await _lookup_ico(value, conv)
+        if typ == _TYPE_RODNE_CISLO:
+            value = hodnota.strip()
+            if not _RC_PATTERN.fullmatch(value):
+                return _json({"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE})
+            return await _lookup_rodne_cislo(value, conv)
+        if typ == _TYPE_KOD_ZAKAZNIKA:
+            value = hodnota.strip()
+            if not _KOD_PATTERN.fullmatch(value):
+                return _json({"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE})
+            return await _lookup_kod_zakaznika(value, conv)
+        if typ == _TYPE_SERIOVE_CISLO:
+            normalized = _normalize_serial(hodnota)
+            if not normalized:
+                return _json({"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE})
+            return await _lookup_seriove_cislo(normalized, conv)
+        return _json({"found": False, "error": "invalid_input", "message": _IDENT_UNRECOGNIZED_MESSAGE})
+
+    @mcp_tool(name="identifikacia", description=_IDENTIFIKACIA_TOOL_DESCRIPTION, registry=registry)
+    async def identifikacia(
+        hodnota: Annotated[
+            str | None,
             Field(
-                description="Sériové číslo zariadenia — 8 až 30 alfanumerických znakov (napr. M91450EB0603)."
+                description=(
+                    "Identifikačný údaj zákazníka (telefón, IČO, rodné číslo, kód zákazníka, "
+                    "sériové číslo). Nechaj prázdne v chat kanáli — zobrazí sa widget a hodnotu "
+                    "si tool prečíta z pamäte konverzácie."
+                )
             ),
-        ],
+        ] = None,
+        typ: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Voliteľný typ údaja: telefon | ico | rodne_cislo | kod_zakaznika | "
+                    "seriove_cislo | auto. Default 'auto' — typ sa rozpozná automaticky podľa formátu."
+                )
+            ),
+        ] = None,
         _meta: dict[str, Any] | None = None,
     ) -> str:
         conv = (_meta or {}).get("conversation_id", "")
         await _nlp_load(conv)
         try:
-            normalized = _normalize_serial(seriove_cislo or "")
-            if not normalized:
+            nlp = _nlp_get_named_entities(conv)
+            channel = (nlp.get(_CHANNEL_KEY) or "").strip().lower()
+            hodnota = (hodnota or nlp.get(widgets.IDENT_INPUT_KEY) or "").strip()
+            typ = (typ or nlp.get(widgets.IDENT_TYPE_KEY) or "").strip().lower()
+
+            # No value and no explicit type → render the widget (chat) or ask the LLM.
+            # (An explicit `typ` with an empty value falls through to per-type
+            # validation below, which returns invalid_input.)
+            if not hodnota and typ in ("", _TYPE_AUTO):
+                if channel == _CHANNEL_CHAT:
+                    return _json(
+                        bubble_widget_result(
+                            summary="Identifikačný widget",
+                            widget=widgets.identifikacia_widget(),
+                            template="identifikacia",
+                            assistant_text="Pošlite mi, prosím, identifikačný údaj cez tento formulár.",
+                        )
+                    )
                 return _json(
-                    {"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE}
+                    {
+                        "found": False,
+                        "error": "input_required",
+                        "suggested_response": _IDENT_INPUT_REQUIRED_MESSAGE,
+                        "instruction": (
+                            "Zisti od zákazníka identifikačný údaj a zavolaj identifikacia(hodnota=<údaj>)."
+                        ),
+                    }
                 )
 
-            _log.info(
-                "identifikacia_seriove_cislo called serial_last4=%s conv=%s", normalized[-4:], conv
-            )
+            # Resolve the type — explicit dropdown/param value wins over auto-detection.
+            if typ in ("", _TYPE_AUTO):
+                detected, alternatives = _classify_identifier(hodnota)
+                if detected is None:
+                    if channel == _CHANNEL_CHAT:
+                        caption = (
+                            "Tento údaj sa mi nepodarilo jednoznačne rozpoznať — vyberte, prosím, typ údaja."
+                            if alternatives
+                            else "Tento údaj sa mi nepodarilo rozpoznať — skúste to znova alebo vyberte typ údaja."
+                        )
+                        return _json(
+                            bubble_widget_result(
+                                summary="Identifikačný widget (upresnenie typu)",
+                                widget=widgets.identifikacia_widget(caption=caption),
+                                template="identifikacia",
+                                assistant_text=caption,
+                            )
+                        )
+                    return _json(
+                        {
+                            "found": False,
+                            "error": "invalid_input",
+                            "message": _IDENT_UNRECOGNIZED_MESSAGE,
+                        }
+                    )
+                typ = detected
 
-            try:
-                products = await client.get_products_by_serial_number(normalized)
-            except DPSError as exc:
-                _log.warning("identifikacia_seriove_cislo product lookup failed: %s", exc)
-                return _json(_dps_error_payload(exc))
-
-            if not products:
-                return _json(
-                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-                )
-
-            # Extract unique customer ids
-            customer_ids: list[str] = []
-            seen: set[str] = set()
-            for p in products:
-                cid = (p.get("customer") or {}).get("id")
-                if isinstance(cid, str) and cid not in seen:
-                    seen.add(cid)
-                    customer_ids.append(cid)
-
-            if not customer_ids:
-                _log.warning(
-                    "identifikacia_seriove_cislo: products returned but no customer.id linkage"
-                )
-                return _json(
-                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-                )
-
-            try:
-                customers_raw = await asyncio.gather(
-                    *(client.get_customer_by_id(cid) for cid in customer_ids)
-                )
-            except DPSError as exc:
-                _log.warning("identifikacia_seriove_cislo customer fanout failed: %s", exc)
-                return _json(_dps_error_payload(exc))
-
-            customers = [c for c in customers_raw if c is not None]
-            if not customers:
-                return _json(
-                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-                )
-
-            candidates = [_candidate_from_customer(c) for c in customers]
-            candidates = [c for c in candidates if c.get("name")]
-            if not candidates:
-                return _json(
-                    {"found": False, "error": "not_found", "message": _SERIAL_NOT_FOUND_MESSAGE}
-                )
-
-            _persist_identification(
-                conversation_id=conv,
-                method="seriove_cislo",
-                value=normalized,
-                candidates=candidates,
-            )
-
-            if len(candidates) == 1:
-                return _json({"found": True, "name": candidates[0]["name"]})
-
-            names = sorted({c["name"] for c in candidates if c["name"]})
-            return _json(
-                {
-                    "found": True,
-                    "multiple_matches": True,
-                    "names": names,
-                    "message": (
-                        "Pre toto sériové číslo som našla viacero záznamov. "
-                        "Bude potrebné si vyžiadať dodatočné údaje."
-                    ),
-                }
-            )
+            return await _route_identifikacia(typ, hodnota, conv)
         finally:
             _nlp_flush(conv)
 
@@ -1500,9 +1613,19 @@ def register(
             # Step 3: read NLP mirror
             nlp = _nlp_get_named_entities(conv)
             input_source = nlp.get("input_source", "")
+            channel = (nlp.get(_CHANNEL_KEY) or "").strip().lower()
             auth_type = nlp.get("authentication_type") or _AUTH_TYPE_STANDARD
             if auth_type not in (_AUTH_TYPE_STANDARD, _AUTH_TYPE_SENSITIVE):
                 auth_type = _AUTH_TYPE_STANDARD
+
+            # Chat widget submit path: a factor value entered in the auth widget lands
+            # in named_entities. Pull it (consume-once) when the LLM didn't pass a param.
+            if meno_priezvisko is None:
+                meno_priezvisko = _consume_named_entity(conv, widgets.AUTH_FIELD_KEYS["name"])
+            if kod_adresata is None:
+                kod_adresata = _consume_named_entity(conv, widgets.AUTH_FIELD_KEYS["kod_adresata"])
+            if rc_last4 is None:
+                rc_last4 = _consume_named_entity(conv, widgets.AUTH_FIELD_KEYS["rc_last4"])
 
             # Step 4: auto-credit factors (recompute every call — input_source may arrive late)
             credited = _credited_factors_from_identification(
@@ -1608,15 +1731,25 @@ def register(
                     else:
                         remaining = _MAX_AUTH_ATTEMPTS_PER_FACTOR - attempts_map[factor]
                         _persist_auth_state(conv, state)
+                        retry_msg = (
+                            f"Tento údaj sa nezhoduje. Skúste, prosím, znova. "
+                            f"Zostáva vám {'ešte jeden pokus' if remaining == 1 else f'{remaining} pokusy'}."
+                        )
+                        if channel == _CHANNEL_CHAT and factor in widgets.AUTH_FIELD_KEYS:
+                            return _json(
+                                bubble_widget_result(
+                                    summary=f"Autentifikačný widget ({factor}, opakovanie)",
+                                    widget=widgets.auth_factor_widget(factor, caption=retry_msg),
+                                    template="autentifikacia",
+                                    assistant_text=retry_msg,
+                                )
+                            )
                         return _json(
                             {
                                 "authenticated": False,
                                 "factor_failed": factor,
                                 "attempts_remaining": remaining,
-                                "suggested_response": (
-                                    f"Tento údaj sa nezhoduje. Skúste, prosím, znova. "
-                                    f"Zostáva vám {'ešte jeden pokus' if remaining == 1 else f'{remaining} pokusy'}."
-                                ),
+                                "suggested_response": retry_msg,
                                 "instruction": _instruction_for_factor(factor),
                             }
                         )
@@ -1693,16 +1826,12 @@ def register(
                         }
                     )
 
-            return _json(
-                {
-                    "authenticated": False,
-                    "level_required": auth_type,
-                    "factors_satisfied": sorted(state["factors_satisfied"]),
-                    "factors_remaining": required - satisfied_count,
-                    "next_factor": next_f,
-                    "suggested_response": _suggested_response_for_factor(next_f),
-                    "instruction": _instruction_for_factor(next_f),
-                }
+            return _need_factor_response(
+                next_f,
+                auth_type=auth_type,
+                satisfied=state["factors_satisfied"],
+                required=required,
+                channel=channel,
             )
         finally:
             _nlp_flush(conv)

@@ -22,10 +22,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-# Identification tools defined but kept out of /mcp (hidden from the LLM/clients).
-# Their logic stays intact and tested; flip this set to change visibility.
-_HIDDEN_IDENTIFICATION_TOOLS = frozenset({"identifikacia_op", "identifikacia_pas"})
-
 
 class MCPTelekomIdentityConfig(MCPServiceConfig):
     """Configuration for the Telekom Identity MCP service."""
@@ -135,7 +131,6 @@ class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
             registry,
             client=self._dps_client,
             max_candidates=self._identity_config.dps_max_candidates,
-            hidden_tools=_HIDDEN_IDENTIFICATION_TOOLS,
         )
         self._setup_knowledge_base_tools(mcp)
 
