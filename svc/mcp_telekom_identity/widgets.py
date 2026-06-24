@@ -101,6 +101,64 @@ def _select(name: str, options: tuple[tuple[str, str], ...], default: str) -> di
     }
 
 
+def _text(value: str, *, size: str = "sm", bold: bool = False, color: str = _MUTED) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "type": "Text",
+        "value": value,
+        "size": size,
+        "style": {"margin": "0", "color": color, "lineHeight": 1.5},
+    }
+    if bold:
+        node["weight"] = "bold"
+    return node
+
+
+def _divider() -> dict[str, Any]:
+    return {
+        "type": "Box",
+        "width": "100%",
+        "height": "1px",
+        "background": "#E2E8F0",
+        "style": {"margin": "8px 0"},
+    }
+
+
+# Identifier options listed (bold, with a check mark) in the widget intro.
+_IDENT_INTRO_OPTIONS = (
+    "Telefónne číslo",
+    "IČO (firemný zákazník)",
+    "Rodné číslo",
+    "Kód zákazníka alebo fakturačného účtu",
+    "Sériové číslo zariadenia (router, set-top box, modem)",
+)
+
+
+def _identifikacia_input_col() -> dict[str, Any]:
+    return {
+        "type": "Col",
+        "gap": 4,
+        "width": "100%",
+        "children": [
+            {"type": "Label", "fieldName": IDENT_INPUT_KEY, "value": "Identifikačný údaj"},
+            {
+                "type": "Input",
+                "name": IDENT_INPUT_KEY,
+                "inputType": "text",
+                "required": True,
+                "placeholder": "napr. 0902 804 660, IČO, rodné číslo, kód zákazníka…",
+                "variant": "outline",
+                "size": "md",
+                "pattern": "^.{3,}$",
+                "style": _field_style(),
+                "errorMessages": {
+                    "required": "Zadajte, prosím, identifikačný údaj.",
+                    "validation": "Zadajte aspoň 3 znaky.",
+                },
+            },
+        ],
+    }
+
+
 def identifikacia_widget(
     caption: str | None = None,
     *,
@@ -108,11 +166,10 @@ def identifikacia_widget(
 ) -> dict[str, Any]:
     """Identification widget.
 
-    Default (first render) is a single free-text input — the customer just types
-    their identifier and the classifier figures out the type. When the classifier
-    *cannot* disambiguate the type, the dispatcher re-renders with
-    ``with_type_select=True``: the "Typ údaja" dropdown is added (default ``auto``)
-    together with an explanation of why it appeared.
+    Default (first render): a short intro, the supported identifiers listed in bold,
+    a divider, then a single free-text input — the classifier figures out the type.
+    When the classifier *cannot* disambiguate (``with_type_select=True``), a "Typ
+    údaja" dropdown (default ``auto``) is added with an explanation of why.
     """
     inner: list[dict[str, Any]] = [
         {
@@ -121,39 +178,21 @@ def identifikacia_widget(
             "size": "md",
             "weight": "bold",
             "style": {"margin": "0", "color": _INK},
-        },
-        {
-            "type": "Caption",
-            "value": caption or "Zadajte jeden z vašich identifikačných údajov.",
-            "size": "sm",
-            "style": {"margin": "0", "color": _MUTED},
-        },
-        {
-            "type": "Col",
-            "gap": 4,
-            "width": "100%",
-            "children": [
-                {"type": "Label", "fieldName": IDENT_INPUT_KEY, "value": "Identifikačný údaj"},
-                {
-                    "type": "Input",
-                    "name": IDENT_INPUT_KEY,
-                    "inputType": "text",
-                    "required": True,
-                    "placeholder": "napr. 0902 804 660, IČO, rodné číslo, kód zákazníka…",
-                    "variant": "outline",
-                    "size": "md",
-                    "pattern": "^.{3,}$",
-                    "style": _field_style(),
-                    "errorMessages": {
-                        "required": "Zadajte, prosím, identifikačný údaj.",
-                        "validation": "Zadajte aspoň 3 znaky.",
-                    },
-                },
-            ],
-        },
+        }
     ]
 
     if with_type_select:
+        # Disambiguation variant: short explanation + input + type dropdown.
+        inner.append(
+            _text(
+                caption
+                or "Zadaný údaj sa dal rozpoznať viacerými spôsobmi — vyberte, prosím, jeho typ."
+            )
+        )
+        inner.append(_divider())
+        inner.append({"type": "Title", "value": "Vyplňte údaje", "size": "sm", "weight": "bold",
+                      "style": {"margin": "0", "color": _INK}})
+        inner.append(_identifikacia_input_col())
         inner.append(
             {
                 "type": "Col",
@@ -161,25 +200,37 @@ def identifikacia_widget(
                 "width": "100%",
                 "children": [
                     {"type": "Label", "fieldName": IDENT_TYPE_KEY, "value": "Typ údaja"},
-                    {
-                        "type": "Caption",
-                        "value": (
-                            "Zadaný údaj sa dal rozpoznať viacerými spôsobmi — vyberte, "
-                            "prosím, o aký typ ide (alebo nechajte „Automaticky rozpoznať“)."
-                        ),
-                        "size": "sm",
-                        "style": {"margin": "0", "color": _MUTED},
-                    },
                     _select(IDENT_TYPE_KEY, IDENT_TYPE_OPTIONS, default="auto"),
                 ],
             }
         )
+    else:
+        # Initial variant: intro text, bold list of accepted identifiers, divider, input.
+        inner.append(
+            _text(
+                "Rád vás identifikujem. Najprv potrebujem zistiť, s kým mám tú česť, "
+                "a potom spolu prejdeme ďalej."
+            )
+        )
+        inner.append(_text("Na identifikáciu mi stačí jeden z týchto údajov:", bold=True, color=_INK))
+        inner.append(
+            {
+                "type": "Col",
+                "gap": 6,
+                "children": [_text(f"✓ {opt}", bold=True, color=_INK) for opt in _IDENT_INTRO_OPTIONS],
+            }
+        )
+        inner.append(_text("Stačí vyplniť jeden z uvedených údajov."))
+        inner.append(_divider())
+        inner.append({"type": "Title", "value": "Vyplňte údaj", "size": "sm", "weight": "bold",
+                      "style": {"margin": "0", "color": _INK}})
+        inner.append(_identifikacia_input_col())
 
     inner.append(_primary_button("POKRAČOVAŤ", IDENT_SUBMIT_UTTERANCE))
 
     return {
         "type": "Form",
-        "gap": 18,
+        "gap": 14,
         "padding": 24,
         "align": "start",
         "radius": "xl",
@@ -199,39 +250,96 @@ def identifikacia_widget(
 
 _AUTH_FACTOR_UI = {
     "name": {
-        "title": "Overenie totožnosti",
         "label": "Meno a priezvisko",
         "placeholder": "Jana Nováková",
         "input_type": "text",
         "pattern": r"^.{2,}$",
         "validation_msg": "Zadajte meno a priezvisko.",
+        "hint": "Uveďte meno a priezvisko tak, ako ich evidujeme v zmluve.",
     },
     "kod_adresata": {
-        "title": "Overenie totožnosti",
         "label": "Kód adresáta (z faktúry)",
         "placeholder": "napr. 4482259101",
         "input_type": "text",
         "pattern": r"^\d{6,12}$",
         "validation_msg": "Kód adresáta nájdete na faktúre — len cifry.",
+        "hint": "Kód adresáta nájdete na svojej faktúre.",
     },
     "rc_last4": {
-        "title": "Overenie totožnosti",
         "label": "Posledné 4 cifry rodného čísla",
         "placeholder": "1234",
         "input_type": "tel",
         "pattern": r"^\d{4}$",
         "validation_msg": "Zadajte presne 4 cifry.",
+        "hint": "Stačí posledné 4 cifry — celé rodné číslo nezadávajte.",
     },
 }
 
 
 def auth_factor_widget(factor: str, *, caption: str | None = None) -> dict[str, Any]:
-    """Authentication widget for a single factor + a skip ("Nemám / Neviem nájsť") button."""
+    """Authentication widget for a single factor + a skip ("Nemám / Neviem nájsť") button.
+
+    Same layout as the identification widget: short intro, the required field in bold,
+    a divider, then the input.
+    """
     ui = _AUTH_FACTOR_UI[factor]
     field_key = AUTH_FIELD_KEYS[factor]
+    inner: list[dict[str, Any]] = [
+        {
+            "type": "Title",
+            "value": "Overenie totožnosti",
+            "size": "md",
+            "weight": "bold",
+            "style": {"margin": "0", "color": _INK},
+        },
+        _text(
+            caption
+            or "Pre vašu bezpečnosť ešte overím vašu totožnosť. Potom vám rád pomôžem ďalej."
+        ),
+        _text("Na overenie od vás potrebujem:", bold=True, color=_INK),
+        {
+            "type": "Col",
+            "gap": 6,
+            "children": [_text(f"✓ {ui['label']}", bold=True, color=_INK)],
+        },
+        _text(ui["hint"]),
+        _divider(),
+        {
+            "type": "Title",
+            "value": "Vyplňte údaj",
+            "size": "sm",
+            "weight": "bold",
+            "style": {"margin": "0", "color": _INK},
+        },
+        {
+            "type": "Col",
+            "gap": 4,
+            "width": "100%",
+            "children": [
+                {"type": "Label", "fieldName": field_key, "value": ui["label"]},
+                {
+                    "type": "Input",
+                    "name": field_key,
+                    "inputType": ui["input_type"],
+                    "required": True,
+                    "placeholder": ui["placeholder"],
+                    "variant": "outline",
+                    "size": "md",
+                    "pattern": ui["pattern"],
+                    "style": _field_style(),
+                    "errorMessages": {
+                        "required": ui["validation_msg"],
+                        "validation": ui["validation_msg"],
+                    },
+                },
+            ],
+        },
+        _primary_button("POKRAČOVAŤ", AUTH_SUBMIT_UTTERANCE),
+        _ghost_button("Nemám / Neviem nájsť", AUTH_SKIP_UTTERANCE),
+    ]
     return {
         "type": "Form",
-        "gap": 18,
+        "gap": 14,
         "padding": 24,
         "align": "start",
         "radius": "xl",
@@ -243,46 +351,7 @@ def auth_factor_widget(factor: str, *, caption: str | None = None) -> dict[str, 
                 "gap": 14,
                 "width": "100%",
                 "style": {"maxWidth": "520px"},
-                "children": [
-                    {
-                        "type": "Title",
-                        "value": ui["title"],
-                        "size": "md",
-                        "weight": "bold",
-                        "style": {"margin": "0", "color": _INK},
-                    },
-                    {
-                        "type": "Caption",
-                        "value": caption or "Zadajte, prosím, požadovaný overovací údaj.",
-                        "size": "sm",
-                        "style": {"margin": "0", "color": _MUTED},
-                    },
-                    {
-                        "type": "Col",
-                        "gap": 4,
-                        "width": "100%",
-                        "children": [
-                            {"type": "Label", "fieldName": field_key, "value": ui["label"]},
-                            {
-                                "type": "Input",
-                                "name": field_key,
-                                "inputType": ui["input_type"],
-                                "required": True,
-                                "placeholder": ui["placeholder"],
-                                "variant": "outline",
-                                "size": "md",
-                                "pattern": ui["pattern"],
-                                "style": _field_style(),
-                                "errorMessages": {
-                                    "required": ui["validation_msg"],
-                                    "validation": ui["validation_msg"],
-                                },
-                            },
-                        ],
-                    },
-                    _primary_button("POKRAČOVAŤ", AUTH_SUBMIT_UTTERANCE),
-                    _ghost_button("Nemám / Neviem nájsť", AUTH_SKIP_UTTERANCE),
-                ],
+                "children": inner,
             },
         ],
     }
