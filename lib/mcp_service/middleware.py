@@ -46,6 +46,26 @@ def _header(headers: list[tuple[bytes, bytes]], name: str) -> str:
     return ""
 
 
+def _ensure_utf8_charset(content_type: bytes) -> bytes:
+    """Append ``; charset=utf-8`` to text/JSON content types that omit a charset.
+
+    FastMCP's streamable-http transport emits ``text/event-stream`` (and tool JSON)
+    without a charset. Per HTTP, ``text/*`` without a charset defaults to ISO-8859-1
+    on many clients, so UTF-8 Slovak diacritics in tool descriptions/results arrive
+    mojibake (``zákazník`` -> ``zÃ¡kaznÃ\xadk``). Declaring UTF-8 fixes it for every client.
+    """
+    try:
+        text = content_type.decode("latin-1")
+    except Exception:
+        return content_type
+    lowered = text.lower()
+    if "charset=" in lowered:
+        return content_type
+    if lowered.startswith("text/") or lowered.startswith("application/json"):
+        return f"{text}; charset=utf-8".encode("latin-1")
+    return content_type
+
+
 class TracingMiddleware:
     """Bind trace/conversation/interaction IDs from request headers into ContextVars.
 
@@ -85,7 +105,10 @@ class TracingMiddleware:
 
         async def send_with_trace(message: Message) -> None:
             if message["type"] == "http.response.start":
-                response_headers = list(message.get("headers", []))
+                response_headers = [
+                    (key, _ensure_utf8_charset(value) if key.lower() == b"content-type" else value)
+                    for key, value in message.get("headers", [])
+                ]
                 response_headers.append((trace_header_name, trace_id_bytes))
                 message["headers"] = response_headers
             await send(message)
