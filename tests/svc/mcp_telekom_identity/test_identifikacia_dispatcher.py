@@ -128,23 +128,32 @@ def _find(node: Any, type_name: str) -> list[dict[str, Any]]:
 
 
 @pytest.mark.unit
-def test_identifikacia_widget_shape() -> None:
+def test_identifikacia_widget_initial_has_no_type_select() -> None:
+    # First render: just the input, no type dropdown.
     w = widgets.identifikacia_widget()
     assert w["type"] == "Form"
     inputs = _find(w, "Input")
     assert [i["name"] for i in inputs] == [widgets.IDENT_INPUT_KEY]
-    selects = _find(w, "Select")
-    assert len(selects) == 1
-    sel = selects[0]
-    assert sel["name"] == widgets.IDENT_TYPE_KEY
-    assert sel["defaultValue"] == "auto"
-    assert sel["options"][0]["value"] == "auto"
+    assert _find(w, "Select") == []
     # submit button carries the hidden submit utterance
     buttons = _find(w, "Button")
     submit = next(b for b in buttons if b.get("submit"))
     action = submit["onClickAction"]
     assert action["type"] == "as_buttons"
     assert action["payload"] == {"utterance": widgets.IDENT_SUBMIT_UTTERANCE, "hidden": True}
+
+
+@pytest.mark.unit
+def test_identifikacia_widget_disambiguation_has_type_select() -> None:
+    # Re-render after an ambiguous classification: the type dropdown appears.
+    w = widgets.identifikacia_widget(caption="…", with_type_select=True)
+    selects = _find(w, "Select")
+    assert len(selects) == 1
+    sel = selects[0]
+    assert sel["name"] == widgets.IDENT_TYPE_KEY
+    assert sel["defaultValue"] == "auto"
+    assert sel["options"][0]["value"] == "auto"
+    assert _find(w, "Input")[0]["name"] == widgets.IDENT_INPUT_KEY
 
 
 @pytest.mark.unit
@@ -202,7 +211,7 @@ def _reset_state(monkeypatch):
     identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
-    identity_tools._NLP_FLUSHED_STATE = type(identity_tools._NLP_FLUSHED_STATE)(
+    identity_tools._NLP_PENDING_STATE = type(identity_tools._NLP_PENDING_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
     # Make _nlp_flush a no-op by default (avoid background HTTP threads in tests).
@@ -270,10 +279,83 @@ async def test_non_chat_no_value_asks_for_input(conv) -> None:  # noqa: ARG001
 async def test_chat_ambiguous_auto_reprompts_widget(conv) -> None:  # noqa: ARG001
     _seed(Channel="chat")
     tool, _ = _make()
-    # phone/RC collision + auto type → widget asking to pick the type
+    # phone/RC collision + auto type → widget asking to pick the type, WITH dropdown
     result = await _call(tool, hodnota="0901010000", typ="auto")
     assert result["type"] == "bubble_widget_result"
     assert result["template"] == "identifikacia"
+    assert _find(result["widget"], "Select")  # disambiguation variant has the dropdown
+
+
+@pytest.mark.unit
+async def test_dispatcher_initial_widget_has_no_dropdown(conv) -> None:  # noqa: ARG001
+    _seed(Channel="chat")
+    tool, _ = _make()
+    result = await _call(tool)  # no value → initial widget
+    assert _find(result["widget"], "Select") == []
+
+
+def _registry(customer_by_id: dict[str, dict | None] | None = None):
+    stub = _CustomerStub(customer_by_id or {})
+
+    class _FakeMCP:
+        def __init__(self) -> None:
+            self.registered: dict[str, Any] = {}
+
+        def tool(self, *, name: str, description: str | None = None):  # noqa: ARG002
+            def deco(fn):
+                self.registered[name] = fn
+                return fn
+
+            return deco
+
+    fake = _FakeMCP()
+    identity_tools.register(ToolRegistry(fake), client=stub)  # type: ignore[arg-type]
+    return fake.registered, stub
+
+
+@pytest.mark.unit
+async def test_render_tools_are_registered(conv) -> None:  # noqa: ARG001
+    reg, _ = _registry()
+    assert "zobraz_identifikacny_widget" in reg
+    assert "zobraz_autentifikacny_widget" in reg
+
+
+@pytest.mark.unit
+async def test_zobraz_identifikacny_widget_chat_no_dropdown(conv) -> None:  # noqa: ARG001
+    _seed(Channel="chat")
+    reg, _ = _registry()
+    result = json.loads(await reg["zobraz_identifikacny_widget"]())
+    assert result["type"] == "bubble_widget_result"
+    assert result["template"] == "identifikacia"
+    assert _find(result["widget"], "Select") == []  # initial render, no dropdown
+
+
+@pytest.mark.unit
+async def test_zobraz_identifikacny_widget_non_chat(conv) -> None:  # noqa: ARG001
+    _seed(Channel="voice")
+    reg, _ = _registry()
+    result = json.loads(await reg["zobraz_identifikacny_widget"]())
+    assert result["rendered"] is False
+    assert result["reason"] == "not_chat"
+
+
+@pytest.mark.unit
+async def test_zobraz_autentifikacny_widget_explicit_factor(conv) -> None:  # noqa: ARG001
+    _seed(Channel="chat")
+    reg, _ = _registry()
+    result = json.loads(await reg["zobraz_autentifikacny_widget"](faktor="rc_last4"))
+    assert result["type"] == "bubble_widget_result"
+    assert result["template"] == "autentifikacia"
+    assert _find(result["widget"], "Input")[0]["name"] == widgets.AUTH_FIELD_KEYS["rc_last4"]
+
+
+@pytest.mark.unit
+async def test_zobraz_autentifikacny_widget_without_identification(conv) -> None:  # noqa: ARG001
+    _seed(Channel="chat")
+    reg, _ = _registry()
+    result = json.loads(await reg["zobraz_autentifikacny_widget"]())
+    assert result["rendered"] is False
+    assert result["reason"] == "no_factor"
 
 
 @pytest.mark.unit
@@ -310,13 +392,9 @@ async def test_explicit_type_overrides_autodetect(conv) -> None:  # noqa: ARG001
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.unit
-def test_do_not_flush_excludes_sensitive_widget_keys(monkeypatch) -> None:
-    # Run the real _nlp_flush (the autouse fixture stubbed it to a no-op) with a
-    # synchronous Thread and a capturing urlopen, and assert the PUT body excludes
-    # the sensitive widget-input keys.
+def _capturing_flush_env(monkeypatch) -> list[dict]:
+    """Wire the real _nlp_flush to run synchronously against a capturing urlopen."""
     monkeypatch.setattr(identity_tools, "_nlp_flush", _REAL_NLP_FLUSH)
-
     captured: list[dict] = []
 
     class _Resp:
@@ -341,9 +419,44 @@ def test_do_not_flush_excludes_sensitive_widget_keys(monkeypatch) -> None:
 
     monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
     monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
+    return captured
 
-    identity_tools._NLP_FLUSHED_STATE.set(_CONV, {})
+
+@pytest.mark.unit
+def test_flush_pushes_only_tool_written_entities(monkeypatch) -> None:
+    # The mirror holds the large GET-ed conversation state; the pending buffer holds
+    # only what our tools wrote. _nlp_flush must push ONLY the pending buffer.
+    captured = _capturing_flush_env(monkeypatch)
+
     identity_tools._NLP_MIRROR_STATE.set(
+        _CONV,
+        {  # simulates state GET-ed from the NLP engine — must never be pushed back
+            "channel": "chat",
+            "gpt_history": "[...huge...]",
+            "current_utterance": "4002152400",
+            "Direction": "inbound",
+        },
+    )
+    # Tool writes go through _nlp_set_state → pending buffer.
+    identity_tools._nlp_set_state(_CONV, {"identification_method": "kod_zakaznika"})
+    identity_tools._nlp_set_state(_CONV, {"identification": "4002152400"})
+
+    identity_tools._nlp_flush(_CONV)
+
+    assert len(captured) == 1
+    assert captured[0]["named_entities"] == {
+        "identification_method": "kod_zakaznika",
+        "identification": "4002152400",
+    }
+    # Pending is cleared after a successful push.
+    assert identity_tools._NLP_PENDING_STATE.get(_CONV) == {}
+
+
+@pytest.mark.unit
+def test_flush_filters_sensitive_widget_keys(monkeypatch) -> None:
+    # Defensive: even if a sensitive key reached the pending buffer it is filtered.
+    captured = _capturing_flush_env(monkeypatch)
+    identity_tools._NLP_PENDING_STATE.set(
         _CONV,
         {
             "identification": "1002203200",        # normal → pushed
@@ -355,5 +468,4 @@ def test_do_not_flush_excludes_sensitive_widget_keys(monkeypatch) -> None:
     identity_tools._nlp_flush(_CONV)
 
     assert len(captured) == 1
-    pushed = captured[0]["named_entities"]
-    assert pushed == {"identification": "1002203200"}
+    assert captured[0]["named_entities"] == {"identification": "1002203200"}

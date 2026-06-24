@@ -170,7 +170,7 @@ def _reset_identity_state_and_silence_nlp(monkeypatch):
     identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
-    identity_tools._NLP_FLUSHED_STATE = type(identity_tools._NLP_FLUSHED_STATE)(
+    identity_tools._NLP_PENDING_STATE = type(identity_tools._NLP_PENDING_STATE)(
         ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
     )
     identity_tools._AUTH_STATE = type(identity_tools._AUTH_STATE)(

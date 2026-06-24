@@ -101,8 +101,82 @@ def _select(name: str, options: tuple[tuple[str, str], ...], default: str) -> di
     }
 
 
-def identifikacia_widget(caption: str | None = None) -> dict[str, Any]:
-    """Single-input identification widget: free input + type dropdown (default auto)."""
+def identifikacia_widget(
+    caption: str | None = None,
+    *,
+    with_type_select: bool = False,
+) -> dict[str, Any]:
+    """Identification widget.
+
+    Default (first render) is a single free-text input — the customer just types
+    their identifier and the classifier figures out the type. When the classifier
+    *cannot* disambiguate the type, the dispatcher re-renders with
+    ``with_type_select=True``: the "Typ údaja" dropdown is added (default ``auto``)
+    together with an explanation of why it appeared.
+    """
+    inner: list[dict[str, Any]] = [
+        {
+            "type": "Title",
+            "value": "Identifikácia",
+            "size": "md",
+            "weight": "bold",
+            "style": {"margin": "0", "color": _INK},
+        },
+        {
+            "type": "Caption",
+            "value": caption or "Zadajte jeden z vašich identifikačných údajov.",
+            "size": "sm",
+            "style": {"margin": "0", "color": _MUTED},
+        },
+        {
+            "type": "Col",
+            "gap": 4,
+            "width": "100%",
+            "children": [
+                {"type": "Label", "fieldName": IDENT_INPUT_KEY, "value": "Identifikačný údaj"},
+                {
+                    "type": "Input",
+                    "name": IDENT_INPUT_KEY,
+                    "inputType": "text",
+                    "required": True,
+                    "placeholder": "napr. 0902 804 660, IČO, rodné číslo, kód zákazníka…",
+                    "variant": "outline",
+                    "size": "md",
+                    "pattern": "^.{3,}$",
+                    "style": _field_style(),
+                    "errorMessages": {
+                        "required": "Zadajte, prosím, identifikačný údaj.",
+                        "validation": "Zadajte aspoň 3 znaky.",
+                    },
+                },
+            ],
+        },
+    ]
+
+    if with_type_select:
+        inner.append(
+            {
+                "type": "Col",
+                "gap": 4,
+                "width": "100%",
+                "children": [
+                    {"type": "Label", "fieldName": IDENT_TYPE_KEY, "value": "Typ údaja"},
+                    {
+                        "type": "Caption",
+                        "value": (
+                            "Zadaný údaj sa dal rozpoznať viacerými spôsobmi — vyberte, "
+                            "prosím, o aký typ ide (alebo nechajte „Automaticky rozpoznať“)."
+                        ),
+                        "size": "sm",
+                        "style": {"margin": "0", "color": _MUTED},
+                    },
+                    _select(IDENT_TYPE_KEY, IDENT_TYPE_OPTIONS, default="auto"),
+                ],
+            }
+        )
+
+    inner.append(_primary_button("POKRAČOVAŤ", IDENT_SUBMIT_UTTERANCE))
+
     return {
         "type": "Form",
         "gap": 18,
@@ -117,55 +191,7 @@ def identifikacia_widget(caption: str | None = None) -> dict[str, Any]:
                 "gap": 14,
                 "width": "100%",
                 "style": {"maxWidth": "520px"},
-                "children": [
-                    {
-                        "type": "Title",
-                        "value": "Identifikácia",
-                        "size": "md",
-                        "weight": "bold",
-                        "style": {"margin": "0", "color": _INK},
-                    },
-                    {
-                        "type": "Caption",
-                        "value": caption
-                        or "Zadajte jeden z vašich identifikačných údajov.",
-                        "size": "sm",
-                        "style": {"margin": "0", "color": _MUTED},
-                    },
-                    {
-                        "type": "Col",
-                        "gap": 4,
-                        "width": "100%",
-                        "children": [
-                            {"type": "Label", "fieldName": IDENT_INPUT_KEY, "value": "Identifikačný údaj"},
-                            {
-                                "type": "Input",
-                                "name": IDENT_INPUT_KEY,
-                                "inputType": "text",
-                                "required": True,
-                                "placeholder": "napr. 0902 804 660, IČO, rodné číslo, kód zákazníka…",
-                                "variant": "outline",
-                                "size": "md",
-                                "pattern": "^.{3,}$",
-                                "style": _field_style(),
-                                "errorMessages": {
-                                    "required": "Zadajte, prosím, identifikačný údaj.",
-                                    "validation": "Zadajte aspoň 3 znaky.",
-                                },
-                            },
-                        ],
-                    },
-                    {
-                        "type": "Col",
-                        "gap": 4,
-                        "width": "100%",
-                        "children": [
-                            {"type": "Label", "fieldName": IDENT_TYPE_KEY, "value": "Typ údaja"},
-                            _select(IDENT_TYPE_KEY, IDENT_TYPE_OPTIONS, default="auto"),
-                        ],
-                    },
-                    _primary_button("POKRAČOVAŤ", IDENT_SUBMIT_UTTERANCE),
-                ],
+                "children": inner,
             },
         ],
     }

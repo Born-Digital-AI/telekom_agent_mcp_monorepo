@@ -120,13 +120,28 @@ _DO_NOT_FLUSH_KEYS = frozenset(
 
 
 def _nlp_set_state(conversation_id: str, named_entities: dict[str, Any]) -> None:
-    """Store named_entities in the per-conversation session store (single source of truth)."""
+    """Record named_entities written *by our tools*.
+
+    Two stores are updated:
+
+    - :data:`_NLP_MIRROR_STATE` — the read mirror, so later reads in the same turn
+      see the tool's write (alongside whatever was GET-ed from the NLP engine).
+    - :data:`_NLP_PENDING_STATE` — the *only* thing :func:`_nlp_flush` pushes back.
+      We push exactly the entities our tools created/changed, never the large set
+      of state GET-ed from the NLP engine (gpt_history, channel, …).
+    """
     if not conversation_id:
         return
-    current = _NLP_MIRROR_STATE.get(conversation_id) or {}
     # Coerce to str; named_entities only carries scalars.
-    current.update({k: str(v) for k, v in named_entities.items()})
+    coerced = {k: str(v) for k, v in named_entities.items()}
+
+    current = _NLP_MIRROR_STATE.get(conversation_id) or {}
+    current.update(coerced)
     _NLP_MIRROR_STATE.set(conversation_id, current)
+
+    pending = _NLP_PENDING_STATE.get(conversation_id) or {}
+    pending.update(coerced)
+    _NLP_PENDING_STATE.set(conversation_id, pending)
 
 
 def _nlp_get_named_entities(conversation_id: str) -> dict[str, str]:
@@ -184,33 +199,27 @@ async def _nlp_load(conversation_id: str) -> None:
 
 
 def _nlp_flush(conversation_id: str) -> None:
-    """Fire-and-forget PUT of the *delta* of named_entities to the NLP engine.
+    """Fire-and-forget PUT of the entities *our tools wrote* to the NLP engine.
 
-    The session store (:data:`_NLP_MIRROR_STATE`) holds the full cumulative state.
-    We only push entities that changed or were newly added since the last
-    acknowledged push (tracked in :data:`_NLP_FLUSHED_STATE`) — not the whole set.
+    We push exactly :data:`_NLP_PENDING_STATE` — the named_entities accumulated by
+    :func:`_nlp_set_state` — and nothing else. No delta against the GET-ed state is
+    computed, so the large set of conversation state mirrored from the NLP engine
+    (gpt_history, channel, …) is never echoed back.
 
-    On a successful PUT the current snapshot is recorded as acknowledged, so the
-    next flush diffs against it. On failure nothing is acknowledged, so the
-    pending entities are retried on the next flush. Retries up to 3 times on 429
-    honouring Retry-After. Errors are logged at WARNING and never raised.
+    Sensitive widget inputs (:data:`_DO_NOT_FLUSH_KEYS`) are filtered out as a
+    safety net. On a successful PUT the pushed keys are removed from the pending
+    buffer; on failure they stay and are retried on the next flush. Retries up to
+    3 times on 429 honouring Retry-After. Errors are logged and never raised.
     """
     if not conversation_id:
         return
-    current = dict(_NLP_MIRROR_STATE.get(conversation_id) or {})
-    if not current:
+    pending = dict(_NLP_PENDING_STATE.get(conversation_id) or {})
+    to_push = {k: v for k, v in pending.items() if k not in _DO_NOT_FLUSH_KEYS}
+    if not to_push:
         return
-    last = _NLP_FLUSHED_STATE.get(conversation_id) or {}
-    delta = {
-        k: v
-        for k, v in current.items()
-        if last.get(k) != v and k not in _DO_NOT_FLUSH_KEYS
-    }
-    if not delta:
-        return  # nothing changed since the last push
 
     url = f"{_NLP_BASE_URL}/conversations/{conversation_id}/states"
-    payload = {"named_entities": delta}
+    payload = {"named_entities": to_push}
     body = json.dumps(payload, ensure_ascii=False).encode()
 
     def _do() -> None:
@@ -220,12 +229,17 @@ def _nlp_flush(conversation_id: str) -> None:
                 url, data=body, method="PUT",
                 headers={"Content-Type": "application/json"},
             )
-            _log.info("NLP state PUT %s delta=%s", url, json.dumps(payload, ensure_ascii=False))
+            _log.info("NLP state PUT %s named_entities=%s", url, json.dumps(payload, ensure_ascii=False))
             try:
                 with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
                     _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
-                    # Acknowledge: NLP now holds everything in `current`.
-                    _NLP_FLUSHED_STATE.set(conversation_id, current)
+                    # Drop the pushed keys from the pending buffer (keep any added since).
+                    remaining = {
+                        k: v
+                        for k, v in (_NLP_PENDING_STATE.get(conversation_id) or {}).items()
+                        if k not in to_push
+                    }
+                    _NLP_PENDING_STATE.set(conversation_id, remaining)
                     return
             except urllib.error.HTTPError as exc:
                 if exc.code == 429 and attempt < max_retries:
@@ -318,6 +332,21 @@ _IDENT_INPUT_REQUIRED_MESSAGE = (
 _IDENT_UNRECOGNIZED_MESSAGE = (
     "Tento údaj sa mi nepodarilo rozpoznať. Skúste, prosím, telefónne číslo, rodné číslo, "
     "IČO, kód zákazníka alebo sériové číslo zariadenia."
+)
+
+_IDENT_WIDGET_TOOL_DESCRIPTION = (
+    "Zobraz zákazníkovi identifikačný widget (formulár na zadanie identifikačného údaja) "
+    "v chat kanáli. Zavolaj, keď chceš zákazníka vizuálne požiadať o identifikáciu — BEZ "
+    "spustenia samotnej identifikácie. Prvotný formulár má len jedno pole; typ údaja rozpozná "
+    "tool sám. Keď zákazník formulár odošle, zavolaj identifikacia() (hodnotu si prečíta z "
+    "pamäte konverzácie). Mimo chat kanála widget nemá zmysel — vtedy vypýtaj údaj textom."
+)
+
+_AUTH_WIDGET_TOOL_DESCRIPTION = (
+    "Zobraz zákazníkovi autentifikačný widget pre aktuálny overovací faktor v chat kanáli — "
+    "BEZ vyhodnotenia autentifikácie. Faktor sa určí automaticky z priebehu overenia "
+    "(voliteľne zadaj faktor: meno_priezvisko / kod_adresata / rc_last4). Vyžaduje "
+    "predchádzajúcu identifikáciu. Keď zákazník odošle, zavolaj autentifikacia()."
 )
 
 
@@ -427,10 +456,10 @@ _IDENTITY_STATE: TTLStore[dict[str, Any]] = TTLStore(ttl_seconds=_IDENTITY_TTL_S
 _NLP_MIRROR_TTL_SECONDS = 30 * 60
 _NLP_MIRROR_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
 
-# Last snapshot acknowledged by the NLP engine (HTTP 2xx on PUT /states). _nlp_flush
-# diffs the mirror against this to push only changed/new named_entities. Same TTL as
-# the mirror so both expire together for an idle conversation.
-_NLP_FLUSHED_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
+# named_entities written by our tools that still need to be pushed to the NLP
+# engine. _nlp_flush PUTs exactly this (never the GET-ed conversation state) and
+# clears the pushed keys on success. Same TTL as the mirror.
+_NLP_PENDING_STATE: TTLStore[dict[str, str]] = TTLStore(ttl_seconds=_NLP_MIRROR_TTL_SECONDS)
 
 # Authentication
 _AUTH_TTL_SECONDS = 30 * 60
@@ -921,6 +950,51 @@ def _need_factor_response(
             "instruction": _instruction_for_factor(next_factor),
         }
     )
+
+
+def _peek_next_auth_factor(conv: str) -> str | None:
+    """Read-only: the next customer-facing auth factor, or None if not applicable.
+
+    Mirrors ``autentifikacia``'s credit + blocked computation WITHOUT mutating any
+    state. Returns ``name`` / ``kod_adresata`` / ``rc_last4``; returns None when
+    there is no single identification, auth is already complete, or only the
+    automatic ``trusted_source`` factor would remain.
+    """
+    identity = _IDENTITY_STATE.get(conv)
+    if not identity:
+        return None
+    candidates = identity.get("candidates") or []
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+
+    state = _AUTH_STATE.get(conv) or {}
+    satisfied = set(state.get("factors_satisfied") or [])
+    failed = set(state.get("factors_failed") or [])
+    skipped = set(state.get("factors_skipped") or [])
+
+    nlp = _nlp_get_named_entities(conv)
+    input_source = nlp.get("input_source", "")
+    auth_type = nlp.get("authentication_type") or _AUTH_TYPE_STANDARD
+    if auth_type not in (_AUTH_TYPE_STANDARD, _AUTH_TYPE_SENSITIVE):
+        auth_type = _AUTH_TYPE_STANDARD
+
+    satisfied |= _credited_factors_from_identification(
+        identity.get("identification_method") or "",
+        identity.get("identification_value") or "",
+        candidate.get("contacts") or [],
+        input_source,
+    )
+    if len(satisfied) >= _required_factors(auth_type):
+        return None  # already authenticated
+
+    blocked = satisfied | failed | skipped
+    if _FACTOR_TRUSTED_SOURCE not in satisfied and not input_source:
+        blocked = blocked | {_FACTOR_TRUSTED_SOURCE}
+    nxt = _next_factor(blocked)
+    if nxt == _FACTOR_TRUSTED_SOURCE:  # automatic — the customer can't act on it
+        nxt = _next_factor(blocked | {_FACTOR_TRUSTED_SOURCE})
+    return nxt if nxt in widgets.AUTH_FIELD_KEYS else None
 
 
 def _persist_auth_state(conv: str, state: dict[str, Any]) -> None:
@@ -1496,7 +1570,9 @@ def register(
                         return _json(
                             bubble_widget_result(
                                 summary="Identifikačný widget (upresnenie typu)",
-                                widget=widgets.identifikacia_widget(caption=caption),
+                                widget=widgets.identifikacia_widget(
+                                    caption=caption, with_type_select=True
+                                ),
                                 template="identifikacia",
                                 assistant_text=caption,
                             )
@@ -1513,6 +1589,89 @@ def register(
             return await _route_identifikacia(typ, hodnota, conv)
         finally:
             _nlp_flush(conv)
+
+    @mcp_tool(
+        name="zobraz_identifikacny_widget",
+        description=_IDENT_WIDGET_TOOL_DESCRIPTION,
+        registry=registry,
+    )
+    async def zobraz_identifikacny_widget(_meta: dict[str, Any] | None = None) -> str:
+        conv = (_meta or {}).get("conversation_id", "")
+        await _nlp_load(conv)
+        channel = (_nlp_get_named_entities(conv).get(_CHANNEL_KEY) or "").strip().lower()
+        if channel != _CHANNEL_CHAT:
+            return _json(
+                {
+                    "rendered": False,
+                    "reason": "not_chat",
+                    "suggested_response": _IDENT_INPUT_REQUIRED_MESSAGE,
+                    "instruction": (
+                        "Toto nie je chat kanál — widget sa nezobrazí. Vypýtaj údaj textom "
+                        "a zavolaj identifikacia(hodnota=<údaj>)."
+                    ),
+                }
+            )
+        return _json(
+            bubble_widget_result(
+                summary="Identifikačný widget",
+                widget=widgets.identifikacia_widget(),
+                template="identifikacia",
+                assistant_text="Pošlite mi, prosím, identifikačný údaj cez tento formulár.",
+            )
+        )
+
+    @mcp_tool(
+        name="zobraz_autentifikacny_widget",
+        description=_AUTH_WIDGET_TOOL_DESCRIPTION,
+        registry=registry,
+    )
+    async def zobraz_autentifikacny_widget(
+        faktor: Annotated[
+            str | None,
+            Field(
+                description="Voliteľný faktor: meno_priezvisko | kod_adresata | rc_last4. "
+                "Ak vynecháš, určí sa automaticky podľa priebehu overenia."
+            ),
+        ] = None,
+        _meta: dict[str, Any] | None = None,
+    ) -> str:
+        conv = (_meta or {}).get("conversation_id", "")
+        await _nlp_load(conv)
+        channel = (_nlp_get_named_entities(conv).get(_CHANNEL_KEY) or "").strip().lower()
+        if channel != _CHANNEL_CHAT:
+            return _json(
+                {
+                    "rendered": False,
+                    "reason": "not_chat",
+                    "instruction": "Mimo chatu zbieraj overovací údaj textom cez autentifikacia(...).",
+                }
+            )
+        # LLM may pass the factor under its widget key (meno_priezvisko) or the
+        # internal factor name (name) — accept both.
+        requested = (faktor or "").strip()
+        factor = {"meno_priezvisko": _FACTOR_NAME}.get(requested, requested)
+        if factor not in widgets.AUTH_FIELD_KEYS:
+            factor = _peek_next_auth_factor(conv)
+        if factor not in widgets.AUTH_FIELD_KEYS:
+            return _json(
+                {
+                    "rendered": False,
+                    "reason": "no_factor",
+                    "instruction": (
+                        "Nemám aktuálny overovací faktor — najprv identifikuj zákazníka a "
+                        "vyhodnoť stav cez autentifikacia()."
+                    ),
+                }
+            )
+        suggested = _suggested_response_for_factor(factor)
+        return _json(
+            bubble_widget_result(
+                summary=f"Autentifikačný widget ({factor})",
+                widget=widgets.auth_factor_widget(factor, caption=suggested),
+                template="autentifikacia",
+                assistant_text=suggested,
+            )
+        )
 
     @mcp_tool(name="autentifikacia", description=_AUTH_TOOL_DESCRIPTION, registry=registry)
     async def autentifikacia(
@@ -1848,6 +2007,13 @@ def register(
             str | None,
             Field(description="'standard' alebo 'sensitive' — simuluje typ transakcie z NLP."),
         ] = None,
+        channel: Annotated[
+            str | None,
+            Field(
+                description="Kanál konverzácie, napr. 'chat' (zapne widgety) alebo 'voice' — "
+                "simuluje named_entity Channel z NLP."
+            ),
+        ] = None,
         _meta: dict[str, Any] | None = None,
     ) -> str:
         conv = (_meta or {}).get("conversation_id", "")
@@ -1855,18 +2021,20 @@ def register(
             return _json({"ok": False, "error": "missing_conversation_id"})
 
         await _nlp_load(conv)
-        try:
-            entities: dict[str, str] = {}
-            if input_source is not None:
-                entities["input_source"] = input_source
-            if authentication_type is not None:
-                entities["authentication_type"] = authentication_type
-            if entities:
-                _nlp_set_state(conv, entities)
+        # Debug tool: write straight to the read mirror (simulate NLP-provided
+        # named_entities). These are NOT queued for push back to the NLP engine.
+        entities: dict[str, str] = {}
+        if input_source is not None:
+            entities["input_source"] = input_source
+        if authentication_type is not None:
+            entities["authentication_type"] = authentication_type
+        if channel is not None:
+            entities[_CHANNEL_KEY] = channel
+        if entities:
             current = _NLP_MIRROR_STATE.get(conv) or {}
-            return _json({"ok": True, "named_entities": dict(current)})
-        finally:
-            _nlp_flush(conv)
+            current.update(entities)
+            _NLP_MIRROR_STATE.set(conv, current)
+        return _json({"ok": True, "named_entities": dict(_NLP_MIRROR_STATE.get(conv) or {})})
 
     @mcp_tool(name="over_viazanost", description=_VIAZANOST_TOOL_DESCRIPTION, registry=registry)
     async def over_viazanost(_meta: dict[str, Any] | None = None) -> str:
