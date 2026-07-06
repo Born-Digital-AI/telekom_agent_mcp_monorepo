@@ -91,6 +91,7 @@ ignore = [
 "svc/mcp_telekom_identity/classify.py" = ["PLR2004", "C901", "PLR0911"]  # identifier heuristics — digit-length/format checks
 "svc/mcp_telekom_identity/knowledge_base_tools.py" = ["C901", "PLR0913", "PLR0915"]  # MCP tool registration, same shape as tools.py
 "svc/mcp_telekom_identity/nlp_state.py" = ["BLE001", "S310"]  # fire-and-forget sync must never raise; internal NLP-engine URL
+"svc/mcp_telekom_identity/roaming_refresh.py" = ["ANN401"]  # parses untrusted CMS payload — helpers take Any
 "svc/**/customer_db.py" = ["D100", "D103", "D205", "ERA001", "FBT001", "FBT002", "PLR2004"]  # Mock data fixture modules — relaxed rules
 "svc/**/troubleshooting_data.py" = ["D100", "D103", "D205", "D400", "D415", "ERA001", "RUF001"]  # Static data with multi-line module docstring
 "svc/**/intent_catalog.py" = ["RUF001", "ERA001"]  # Slovak unicode literals

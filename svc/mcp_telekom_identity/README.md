@@ -267,6 +267,42 @@ Widget builders live in [`widgets.py`](widgets.py); the shared transport/submit
 helpers in [`lib/bubble_widgets`](../../lib/bubble_widgets/guide.md). Sensitive
 widget inputs are never pushed back to the NLP engine (`_DO_NOT_FLUSH_KEYS`).
 
+### Roaming tools (`roaming_info`, `roaming_zoznam_krajin`)
+
+Answer "what does roaming cost in country X" questions. Independent of the DPS
+flow — data comes from a **bundled snapshot** of the public
+[telekom.sk roaming page](https://www.telekom.sk/volania/roaming)
+(Storyblok CMS payload + CloudFront network-coverage JSON), so no network calls
+and no VPN are needed at request time.
+
+- **`roaming_info(krajina, typ_zakaznika=None)`** — resolves the country
+  (Slovak/English names, CMS aliases, ISO2/ISO3 codes; diacritics-insensitive;
+  ambiguous input returns `kandidati`, typos return `navrhy`) and responds with
+  the roaming zone (`Zóna 0`–`4` / `Bez roamingu`), `eu_regulacia` flag,
+  per-unit prices, available packages and notes per customer segment
+  (`pausal` / `dobijacia_karta` / `bez_zavazkov` — packages differ per segment),
+  plus partner networks with technologies. `typ_zakaznika` cuts the response to
+  one segment.
+- **`roaming_zoznam_krajin(zona=None)`** — country list, optionally filtered by
+  zone (`0`–`4` or `bez_roamingu`).
+
+Modules: [`roaming.py`](roaming.py) (catalog + matching),
+[`roaming_tools.py`](roaming_tools.py) (MCP registration),
+[`roaming_refresh.py`](roaming_refresh.py) (snapshot generator),
+[`data/roaming_sk.json`](data/roaming_sk.json) (the snapshot; `stiahnute` holds
+the snapshot date).
+
+**Refreshing the data** (when Telekom changes roaming prices/packages — the
+page structure is parsed by the refresh script only, never at runtime):
+
+```bash
+python -m svc.mcp_telekom_identity.roaming_refresh
+```
+
+The script validates the extracted dataset (≥250 countries, known zones,
+priced countries) and fails loudly instead of writing a truncated snapshot.
+Commit the regenerated JSON.
+
 ## Environment variables
 
 | Var | Default | Notes |
