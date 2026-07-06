@@ -64,7 +64,7 @@ class MCPTelekomIdentityConfig(MCPServiceConfig):
         A deployment that declares APP_INDEXER_TIMEOUT_SECONDS="" (blank) would
         otherwise fail validation with 'Input should be a valid number'.
         """
-        if v is None or (isinstance(v, str) and not v.strip()):
+        if (v is None or (isinstance(v, str) and not v.strip())) and info.field_name is not None:
             return cls.model_fields[info.field_name].default
         return v
 

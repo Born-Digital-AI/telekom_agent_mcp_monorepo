@@ -11,10 +11,6 @@ import pytest
 from lib.boilerplate.logging import current_conversation_id, current_interaction_id
 from lib.mcp_service.legacy_compat import ToolRegistry
 from svc.mcp_telekom_identity import tools as identity_tools
-# Captured before the autouse fixture stubs the module attribute, so these tests
-# can exercise the real implementations.
-from svc.mcp_telekom_identity.tools import _consume_named_entity as _REAL_CONSUME
-from svc.mcp_telekom_identity.tools import _nlp_load as _REAL_NLP_LOAD
 from svc.mcp_telekom_identity.dps_get_client import (
     DPSAuthError,
     DPSInvalidResponseError,
@@ -22,6 +18,11 @@ from svc.mcp_telekom_identity.dps_get_client import (
     DPSTimeoutError,
     DPSUpstreamError,
 )
+
+# Captured before the autouse fixture stubs the module attribute, so these tests
+# can exercise the real implementations.
+from svc.mcp_telekom_identity.tools import _consume_named_entity as _real_consume
+from svc.mcp_telekom_identity.tools import _nlp_load as _real_nlp_load
 
 _UPSTREAM_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
 
@@ -175,7 +176,7 @@ def _reset_identity_state_and_silence_nlp(monkeypatch):
 
     # _nlp_load now always GETs the NLP engine; tests drive state via the mirror
     # and _nlp_set_state, so stub the load to keep tests offline and fast.
-    async def _no_nlp_load(conv):  # noqa: ANN001, ANN202
+    async def _no_nlp_load(_conv):
         return None
 
     monkeypatch.setattr(identity_tools, "_nlp_load", _no_nlp_load)
@@ -1424,7 +1425,8 @@ def test_nlp_flush_failure_keeps_entities_pending(monkeypatch) -> None:
     def _fake_urlopen(req, timeout=None):  # noqa: ARG001
         sent.append(json.loads(req.data.decode()))
         if fail_next["value"]:
-            raise urllib.error.URLError("boom")
+            reason = "boom"
+            raise urllib.error.URLError(reason)
         return _Resp()
 
     class _SyncThread:
@@ -1459,16 +1461,16 @@ class _FakeNlpResp:
 
 def _fake_async_client(entities: dict[str, str]):
     class _FakeClient:
-        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+        def __init__(self, *a, **k) -> None:
             pass
 
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, *a):  # noqa: ANN002
+        async def __aexit__(self, *a):
             return False
 
-        async def get(self, url):  # noqa: ANN001, ARG002
+        async def get(self, url):  # noqa: ARG002
             return _FakeNlpResp(entities)
 
     return _FakeClient
@@ -1496,7 +1498,7 @@ async def test_nlp_load_refetches_even_when_mirror_is_warm(monkeypatch) -> None:
         _fake_async_client({"Channel": "chat", "identifikacia_vstup": "2315055000"}),
     )
 
-    await _REAL_NLP_LOAD(conv)
+    await _real_nlp_load(conv)
 
     merged = identity_tools._nlp_get_named_entities(conv)
     assert merged["identifikacia_vstup"] == "2315055000"  # re-fetched despite warm mirror
@@ -1504,19 +1506,19 @@ async def test_nlp_load_refetches_even_when_mirror_is_warm(monkeypatch) -> None:
 
 
 @pytest.mark.unit
-def test_consume_named_entity_is_once_per_value(monkeypatch) -> None:
+def test_consume_named_entity_is_once_per_value() -> None:
     """Consume-once survives re-fetch: the same value is handed out once, a new value afresh."""
     conv = "conv-consume"
     key = "autentifikacia_kod_adresata"
 
     identity_tools._NLP_MIRROR_STATE.set(conv, {key: "4482259101"})
-    assert _REAL_CONSUME(conv, key) == "4482259101"
+    assert _real_consume(conv, key) == "4482259101"
     # A re-fetch re-supplies the same value into the mirror — must NOT be consumed again.
     identity_tools._NLP_MIRROR_STATE.set(conv, {key: "4482259101"})
-    assert _REAL_CONSUME(conv, key) is None
+    assert _real_consume(conv, key) is None
     # A corrected re-submission (new value) is consumed afresh.
     identity_tools._NLP_MIRROR_STATE.set(conv, {key: "9999999999"})
-    assert _REAL_CONSUME(conv, key) == "9999999999"
+    assert _real_consume(conv, key) == "9999999999"
 
 
 # ---- autentifikacia ----

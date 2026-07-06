@@ -87,8 +87,11 @@ def _ghost_button(label: str, utterance: str) -> dict[str, Any]:
 
 
 def _select(name: str, options: tuple[tuple[str, str], ...], default: str) -> dict[str, Any]:
-    """Da-Bubble Select. Prop shape follows the widget-builder spec — centralised
-    here so a spec change is a one-line fix."""
+    """Build a Da-Bubble Select.
+
+    Prop shape follows the widget-builder spec — centralised here so a spec
+    change is a one-line fix.
+    """
     return {
         "type": "Select",
         "name": name,
@@ -101,7 +104,9 @@ def _select(name: str, options: tuple[tuple[str, str], ...], default: str) -> di
     }
 
 
-def _text(value: str, *, size: str = "sm", bold: bool = False, color: str = _MUTED) -> dict[str, Any]:
+def _text(
+    value: str, *, size: str = "sm", bold: bool = False, color: str = _MUTED
+) -> dict[str, Any]:
     node: dict[str, Any] = {
         "type": "Text",
         "value": value,
@@ -190,8 +195,15 @@ def identifikacia_widget(
             )
         )
         inner.append(_divider())
-        inner.append({"type": "Title", "value": "Vyplňte údaje", "size": "sm", "weight": "bold",
-                      "style": {"margin": "0", "color": _INK}})
+        inner.append(
+            {
+                "type": "Title",
+                "value": "Vyplňte údaje",
+                "size": "sm",
+                "weight": "bold",
+                "style": {"margin": "0", "color": _INK},
+            }
+        )
         inner.append(_identifikacia_input_col())
         inner.append(
             {
@@ -207,22 +219,31 @@ def identifikacia_widget(
     else:
         # Initial variant: intro text, bold list of accepted identifiers, divider, input.
         inner.append(
-            _text(
-                "Na vyriešenie vašej požiadavky vás potrebujem najprv vyhľadať v systéme."
-            )
+            _text("Na vyriešenie vašej požiadavky vás potrebujem najprv vyhľadať v systéme.")
         )
-        inner.append(_text("Na identifikáciu mi stačí jeden z týchto údajov:", bold=True, color=_INK))
+        inner.append(
+            _text("Na identifikáciu mi stačí jeden z týchto údajov:", bold=True, color=_INK)
+        )
         inner.append(
             {
                 "type": "Col",
                 "gap": 6,
-                "children": [_text(f"✓ {opt}", bold=True, color=_INK) for opt in _IDENT_INTRO_OPTIONS],
+                "children": [
+                    _text(f"✓ {opt}", bold=True, color=_INK) for opt in _IDENT_INTRO_OPTIONS
+                ],
             }
         )
         inner.append(_text("Stačí vyplniť jeden z uvedených údajov."))
         inner.append(_divider())
-        inner.append({"type": "Title", "value": "Vyplňte údaj", "size": "sm", "weight": "bold",
-                      "style": {"margin": "0", "color": _INK}})
+        inner.append(
+            {
+                "type": "Title",
+                "value": "Vyplňte údaj",
+                "size": "sm",
+                "weight": "bold",
+                "style": {"margin": "0", "color": _INK},
+            }
+        )
         inner.append(_identifikacia_input_col())
 
     inner.append(_primary_button("POKRAČOVAŤ", IDENT_SUBMIT_UTTERANCE))
@@ -276,7 +297,7 @@ _AUTH_FACTOR_UI = {
 
 
 def auth_factor_widget(factor: str, *, caption: str | None = None) -> dict[str, Any]:
-    """Authentication widget for a single factor + a skip ("Nemám / Neviem nájsť") button.
+    """Build the authentication widget for one factor + a skip ("Nemám / Neviem nájsť") button.
 
     Same layout as the identification widget: short intro, the required field in bold,
     a divider, then the input.

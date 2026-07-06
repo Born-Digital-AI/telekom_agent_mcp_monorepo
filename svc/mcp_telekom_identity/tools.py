@@ -18,8 +18,8 @@ Names re-exported below (``# noqa: F401``) keep the historical
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
-from datetime import date
 from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
@@ -489,9 +489,7 @@ def register(
         )
 
     async def _lookup_seriove_cislo(normalized: str, conv: str) -> str:
-        _log.info(
-            "identifikacia seriove_cislo serial_last4=%s conv=%s", normalized[-4:], conv
-        )
+        _log.info("identifikacia seriove_cislo serial_last4=%s conv=%s", normalized[-4:], conv)
 
         try:
             products = await client.get_products_by_serial_number(normalized)
@@ -572,29 +570,41 @@ def register(
         if typ == _TYPE_TELEFON:
             normalized = _normalize_msisdn(hodnota)
             if not normalized:
-                return _json({"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE})
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _TEL_INVALID_MESSAGE}
+                )
             return await _lookup_telefon(normalized, conv)
         if typ == _TYPE_ICO:
             value = hodnota.strip()
             if not _ICO_PATTERN.fullmatch(value):
-                return _json({"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE})
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _ICO_INVALID_MESSAGE}
+                )
             return await _lookup_ico(value, conv)
         if typ == _TYPE_RODNE_CISLO:
             value = hodnota.strip()
             if not _RC_PATTERN.fullmatch(value):
-                return _json({"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE})
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _RC_INVALID_MESSAGE}
+                )
             return await _lookup_rodne_cislo(value, conv)
         if typ == _TYPE_KOD_ZAKAZNIKA:
             value = hodnota.strip()
             if not _KOD_PATTERN.fullmatch(value):
-                return _json({"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE})
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _KOD_INVALID_MESSAGE}
+                )
             return await _lookup_kod_zakaznika(value, conv)
         if typ == _TYPE_SERIOVE_CISLO:
             normalized = _normalize_serial(hodnota)
             if not normalized:
-                return _json({"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE})
+                return _json(
+                    {"found": False, "error": "invalid_input", "message": _SERIAL_INVALID_MESSAGE}
+                )
             return await _lookup_seriove_cislo(normalized, conv)
-        return _json({"found": False, "error": "invalid_input", "message": _IDENT_UNRECOGNIZED_MESSAGE})
+        return _json(
+            {"found": False, "error": "invalid_input", "message": _IDENT_UNRECOGNIZED_MESSAGE}
+        )
 
     @mcp_tool(name="identifikacia", description=_IDENTIFIKACIA_TOOL_DESCRIPTION, registry=registry)
     async def identifikacia(
@@ -716,7 +726,9 @@ def register(
         return _json(
             bubble_widget_result(
                 summary="Identifikačný widget",
-                widget=widgets.identifikacia_widget(caption=caption, with_type_select=s_vyberom_typu),
+                widget=widgets.identifikacia_widget(
+                    caption=caption, with_type_select=s_vyberom_typu
+                ),
                 template="identifikacia",
                 assistant_text="Pošlite mi, prosím, identifikačný údaj cez tento formulár.",
             )
@@ -897,7 +909,9 @@ def register(
             )
             state["factors_satisfied"] |= credited
 
-            blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            blocked = (
+                state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            )
 
             # Auto-skip trusted_source if input_source is missing (nothing the caller can do).
             # This must happen before out-of-order checks so that factor 2 is the first "expected".
@@ -963,7 +977,9 @@ def register(
                             try:
                                 party = await client.get_party_by_id(party_id)
                             except DPSError as exc:
-                                _log.warning("autentifikacia: party fetch failed for rc check: %s", exc)
+                                _log.warning(
+                                    "autentifikacia: party fetch failed for rc check: %s", exc
+                                )
                                 return _json(_dps_error_payload(exc))
                             if party is not None:
                                 rc4 = _extract_rc_last4_from_party(party)
@@ -1015,7 +1031,9 @@ def register(
             if skip_current_factor and expected and expected != _FACTOR_TRUSTED_SOURCE:
                 state["factors_skipped"].add(expected)
 
-            blocked = state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            blocked = (
+                state["factors_satisfied"] | state["factors_failed"] | state["factors_skipped"]
+            )
 
             # Step 7: check if we have enough
             required = _required_factors(auth_type)
@@ -1027,7 +1045,9 @@ def register(
                     state["authenticated_sensitive"] = satisfied_count >= 3
                 _persist_auth_state(conv, state)
                 level = (
-                    _AUTH_TYPE_SENSITIVE if state["authenticated_sensitive"] else _AUTH_TYPE_STANDARD
+                    _AUTH_TYPE_SENSITIVE
+                    if state["authenticated_sensitive"]
+                    else _AUTH_TYPE_STANDARD
                 )
                 _nlp_set_state(
                     conv,
@@ -1138,49 +1158,57 @@ def register(
     async def over_viazanost(_meta: dict[str, Any] | None = None) -> str:
         conv = (_meta or {}).get("conversation_id", "")
         if not conv:
-            return _json({
-                "found": False,
-                "error": "missing_conversation_id",
-                "message": _UPSTREAM_ERROR_MESSAGE,
-            })
+            return _json(
+                {
+                    "found": False,
+                    "error": "missing_conversation_id",
+                    "message": _UPSTREAM_ERROR_MESSAGE,
+                }
+            )
 
         await _nlp_load(conv)
         try:
             # Require standard authentication before returning contract data.
             auth_state = _AUTH_STATE.get(conv)
             if not auth_state or not auth_state.get("authenticated_standard"):
-                return _json({
-                    "found": False,
-                    "error": "authentication_required",
-                    "suggested_response": (
-                        "Na zobrazenie informácií o viazanosti musím najprv overiť vašu totožnosť."
-                    ),
-                    "instruction": "Zavolaj autentifikacia tool a až potom over_viazanost.",
-                })
+                return _json(
+                    {
+                        "found": False,
+                        "error": "authentication_required",
+                        "suggested_response": (
+                            "Na zobrazenie informácií o viazanosti musím najprv overiť vašu totožnosť."
+                        ),
+                        "instruction": "Zavolaj autentifikacia tool a až potom over_viazanost.",
+                    }
+                )
 
             identity = _IDENTITY_STATE.get(conv)
             if not identity:
-                return _json({
-                    "found": False,
-                    "error": "identification_required",
-                    "suggested_response": (
-                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
-                        "kód zákazníka alebo telefónne číslo?"
-                    ),
-                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
-                })
+                return _json(
+                    {
+                        "found": False,
+                        "error": "identification_required",
+                        "suggested_response": (
+                            "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                            "kód zákazníka alebo telefónne číslo?"
+                        ),
+                        "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                    }
+                )
 
             candidates = identity.get("candidates") or []
             if not candidates:
-                return _json({
-                    "found": False,
-                    "error": "identification_required",
-                    "suggested_response": (
-                        "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
-                        "kód zákazníka alebo telefónne číslo?"
-                    ),
-                    "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
-                })
+                return _json(
+                    {
+                        "found": False,
+                        "error": "identification_required",
+                        "suggested_response": (
+                            "Najprv potrebujem zistiť, kto ste. Môžete mi povedať vaše rodné číslo, "
+                            "kód zákazníka alebo telefónne číslo?"
+                        ),
+                        "instruction": "Zavolaj najprv niektorý z identifikacia_* toolov.",
+                    }
+                )
 
             candidate = candidates[0]
             customer_id: str | None = candidate.get("customer_id") or None
@@ -1189,7 +1217,9 @@ def register(
             # Prefer customer_id (covers all products); fall back to MSISDN only when
             # identification was by phone and no customer_id linkage exists.
             msisdn: str | None = (
-                identification_value if (not customer_id and identification_method == "telefon") else None
+                identification_value
+                if (not customer_id and identification_method == "telefon")
+                else None
             )
 
             _log.info(
@@ -1208,9 +1238,11 @@ def register(
                 _log.warning("over_viazanost: PI fetch failed: %s", exc)
                 return _json(_dps_error_payload(exc))
 
-            today = date.today()
+            today = dt.datetime.now(dt.UTC).date()
             active_products = _parse_products_with_active_agreements(products_raw, today)
-            viazanost_typ, suggested_response, latest_date = _classify_viazanost(active_products, today)
+            viazanost_typ, suggested_response, latest_date = _classify_viazanost(
+                active_products, today
+            )
 
             _log.info(
                 "over_viazanost: conv=%s fetched=%d active=%d typ=%s",
@@ -1243,13 +1275,15 @@ def register(
             services_grouped = {k: grouped[k] for k in _VIAZANOST_TYP_ORDER if k in grouped}
 
             _nlp_set_state(conv, {"over_viazanost_result": viazanost_typ})
-            return _json({
-                "found": True,
-                "viazanost_typ": viazanost_typ,
-                "viazanost_do": str(latest_date) if latest_date else None,
-                "services": services_grouped,
-                "count": len(active_products),
-                "suggested_response": suggested_response,
-            })
+            return _json(
+                {
+                    "found": True,
+                    "viazanost_typ": viazanost_typ,
+                    "viazanost_do": str(latest_date) if latest_date else None,
+                    "services": services_grouped,
+                    "count": len(active_products),
+                    "suggested_response": suggested_response,
+                }
+            )
         finally:
             _nlp_flush(conv)

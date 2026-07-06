@@ -12,7 +12,7 @@ import unicodedata
 
 from svc.mcp_telekom_identity import widgets
 from svc.mcp_telekom_identity._state import _AUTH_STATE, _IDENTITY_STATE
-from svc.mcp_telekom_identity.candidates import _json
+from svc.mcp_telekom_identity.candidates import _RC_LAST4_LEN, _json
 from svc.mcp_telekom_identity.classify import _normalize_msisdn
 from svc.mcp_telekom_identity.nlp_state import _CHANNEL_CHAT, _nlp_get_named_entities
 
@@ -69,9 +69,9 @@ def _check_rc_last4(provided: str, candidate_rc_last4: str | None) -> bool:
     if not candidate_rc_last4:
         return False
     digits = re.sub(r"\D", "", provided or "")
-    if len(digits) < 4:
+    if len(digits) < _RC_LAST4_LEN:
         return False
-    return digits[-4:] == candidate_rc_last4
+    return digits[-_RC_LAST4_LEN:] == candidate_rc_last4
 
 
 def _normalize_email(s: str) -> str:

@@ -99,9 +99,7 @@ def _is_valid_rodne_cislo(digits: str) -> bool:
     day = int(digits[4:6])
     if not 1 <= day <= 31:
         return False
-    if len(digits) == 10 and int(digits) % 11 != 0:
-        return False
-    return True
+    return not (len(digits) == 10 and int(digits) % 11 != 0)
 
 
 def _classify_identifier(raw: str) -> tuple[str | None, list[str]]:
@@ -133,9 +131,7 @@ def _classify_identifier(raw: str) -> tuple[str | None, list[str]]:
 
     msisdn = _normalize_msisdn(value)
     explicit_phone = msisdn is not None and (
-        value.strip().startswith("+")
-        or stripped.startswith("00421")
-        or stripped.startswith("421")
+        value.strip().startswith("+") or stripped.startswith(("00421", "421"))
     )
     if explicit_phone:
         return _TYPE_TELEFON, []

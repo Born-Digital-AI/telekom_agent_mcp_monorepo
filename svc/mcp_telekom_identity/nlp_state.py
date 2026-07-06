@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 from typing import Any
 
 import httpx
@@ -129,11 +130,8 @@ async def _nlp_load(conversation_id: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=_NLP_TIMEOUT_SECONDS) as http:
             resp = await http.get(url)
-        if resp.status_code == 200:
-            entities = {
-                k: str(v)
-                for k, v in (resp.json().get("named_entities") or {}).items()
-            }
+        if resp.status_code == HTTPStatus.OK:
+            entities = {k: str(v) for k, v in (resp.json().get("named_entities") or {}).items()}
             if entities:
                 current = dict(_NLP_MIRROR_STATE.get(conversation_id) or {})
                 current.update(entities)
@@ -175,10 +173,14 @@ def _nlp_flush(conversation_id: str) -> None:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             req = urllib.request.Request(
-                url, data=body, method="PUT",
+                url,
+                data=body,
+                method="PUT",
                 headers={"Content-Type": "application/json"},
             )
-            _log.info("NLP state PUT %s named_entities=%s", url, json.dumps(payload, ensure_ascii=False))
+            _log.info(
+                "NLP state PUT %s named_entities=%s", url, json.dumps(payload, ensure_ascii=False)
+            )
             try:
                 with urllib.request.urlopen(req, timeout=_NLP_TIMEOUT_SECONDS) as resp:
                     _log.info("NLP state PUT %s -> HTTP %s", url, resp.status)
@@ -191,13 +193,16 @@ def _nlp_flush(conversation_id: str) -> None:
                     _NLP_PENDING_STATE.set(conversation_id, remaining)
                     return
             except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < max_retries:
+                if exc.code == HTTPStatus.TOO_MANY_REQUESTS and attempt < max_retries:
                     retry_after = float(
                         exc.headers.get("Retry-After") or exc.headers.get("retry-after") or "1"
                     )
                     _log.warning(
                         "NLP state PUT %s -> 429, retry in %.1fs (%d/%d)",
-                        url, retry_after, attempt, max_retries,
+                        url,
+                        retry_after,
+                        attempt,
+                        max_retries,
                     )
                     time.sleep(retry_after)
                 else:

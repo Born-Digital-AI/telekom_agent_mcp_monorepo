@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
 
-def _json(obj: Any) -> str:
+def _json(obj: Any) -> str:  # noqa: ANN401 — generic JSON serialiser
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
@@ -119,7 +119,8 @@ def register_knowledge_base_tools(
             int, pydantic.Field(ge=1, le=100, description="Počet položiek na stranu (max 100).")
         ] = 20,
         search: Annotated[
-            str | None, pydantic.Field(description="Voliteľný filter na podreťazec v názve dokumentu.")
+            str | None,
+            pydantic.Field(description="Voliteľný filter na podreťazec v názve dokumentu."),
         ] = None,
         labels: Annotated[
             list[str] | None,
@@ -174,8 +175,8 @@ def register_knowledge_base_tools(
         total = 0
         has_next = False
         errors: list[dict[str, Any]] = []
-        for iid, result in zip(target_ids, raw_results):
-            if isinstance(result, Exception):
+        for iid, result in zip(target_ids, raw_results, strict=True):
+            if isinstance(result, BaseException):
                 logger.warning(
                     "znalostna_baza_zoznam_dokumentov error (index_id=%s): %s", iid, result
                 )
@@ -200,7 +201,10 @@ def register_knowledge_base_tools(
     @mcp.tool(name="znalostna_baza_vyhladaj", annotations=read_only)
     async def search(
         query: Annotated[
-            str, pydantic.Field(min_length=1, description="Otázka v prirodzenom jazyku alebo kľúčové slová.")
+            str,
+            pydantic.Field(
+                min_length=1, description="Otázka v prirodzenom jazyku alebo kľúčové slová."
+            ),
         ],
         top_k: Annotated[
             int,
@@ -287,8 +291,8 @@ def register_knowledge_base_tools(
         seen_doc_ids: set[int] = set()
         all_docs: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        for iid, result in zip(target_ids, raw_results):
-            if isinstance(result, Exception):
+        for iid, result in zip(target_ids, raw_results, strict=True):
+            if isinstance(result, BaseException):
                 logger.warning("znalostna_baza_vyhladaj error (index_id=%s): %s", iid, result)
                 errors.append({"index_id": iid, "error": str(result)})
                 continue
@@ -385,9 +389,7 @@ def register_knowledge_base_tools(
             for iid in await _get_index_ids():
                 page = 1
                 while True:
-                    result = await client.list_documents(
-                        index_id=iid, page=page, limit=page_size
-                    )
+                    result = await client.list_documents(index_id=iid, page=page, limit=page_size)
                     docs = result.get("data", [])
                     document_count += len(docs)
                     for d in docs:

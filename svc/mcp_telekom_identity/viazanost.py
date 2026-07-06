@@ -12,17 +12,19 @@ from typing import Any
 # Agreement statuses considered "active" — mirrors NLP extractor get_agreements.py.
 # terminated/cancelled/expired are intentionally excluded: a contract may still have
 # an agreementPeriod.endDateTime in the future even after early termination.
-_ACTIVE_AGREEMENT_STATUSES = frozenset({
-    "active",
-    "inProtectionPeriod",
-    "validated",
-    "signed",
-    "approved",
-    "inProcess",
-    "inCorrection",
-    "initialized",
-    "approvalPending",
-})
+_ACTIVE_AGREEMENT_STATUSES = frozenset(
+    {
+        "active",
+        "inProtectionPeriod",
+        "validated",
+        "signed",
+        "approved",
+        "inProcess",
+        "inCorrection",
+        "initialized",
+        "approvalPending",
+    }
+)
 
 _VIAZANOST_TYP_ORDER = (
     "Prolongacne_okno",
@@ -31,19 +33,21 @@ _VIAZANOST_TYP_ORDER = (
     "Chyba",
 )
 
+# Classification thresholds from MSG_LAC_SC_VIAZANOST (LAC Selfcare.yaml)
+_PROLONGATION_WINDOW_DAYS = 90
+_DAYS_PER_YEAR = 365
+
 
 def _parse_agreement_date(value: str) -> date | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).date()
+        return datetime.fromisoformat(value.strip()).date()
     except (ValueError, AttributeError):
         return None
 
 
-def _filter_active_agreements(
-    agreements: list[Any], today: date
-) -> list[dict[str, str]]:
+def _filter_active_agreements(agreements: list[Any], today: date) -> list[dict[str, str]]:
     active: list[dict[str, str]] = []
     for agr in agreements:
         status = (agr.get("status") or "").lower()
@@ -77,11 +81,7 @@ def _product_display_name(product: dict[str, Any]) -> tuple[str, str]:
     else:
         service_name = product_name
 
-    identifier = (
-        product.get("publicIdentifier")
-        or product.get("productSerialNumber")
-        or ""
-    )
+    identifier = product.get("publicIdentifier") or product.get("productSerialNumber") or ""
 
     if identifier and identifier != service_name:
         display_name = f"{service_name} ({identifier})"
@@ -91,9 +91,7 @@ def _product_display_name(product: dict[str, Any]) -> tuple[str, str]:
     return display_name, identifier
 
 
-def _parse_products_with_active_agreements(
-    data: list[Any], today: date
-) -> list[dict[str, Any]]:
+def _parse_products_with_active_agreements(data: list[Any], today: date) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for product in data:
         if not isinstance(product, dict):
@@ -113,12 +111,14 @@ def _parse_products_with_active_agreements(
             if agr_to is not None and (latest_to is None or agr_to > latest_to):
                 latest_to = agr_to
 
-        result.append({
-            "display_name": display_name,
-            "group": product.get("group") or "",
-            "identifier": identifier,
-            "viazanost_do": str(latest_to) if latest_to else None,
-        })
+        result.append(
+            {
+                "display_name": display_name,
+                "group": product.get("group") or "",
+                "identifier": identifier,
+                "viazanost_do": str(latest_to) if latest_to else None,
+            }
+        )
     return result
 
 
@@ -130,8 +130,8 @@ def _classify_viazanost(
     Classification mirrors MSG_LAC_SC_VIAZANOST in LAC Selfcare.yaml:
       Nema_viazanost         — no active agreements
       Prolongacne_okno       — latest end < 90 days away
-      Viazanost_do_roka      — latest end 90–365 days away
-      Viazanost_viac_ako_rok — latest end ≥ 365 days away
+      Viazanost_do_roka      — latest end 90-365 days away
+      Viazanost_viac_ako_rok — latest end >= 365 days away
     Uses the LATEST end date across all products for the most conservative estimate.
     Builds a per-service breakdown in suggested_response when multiple services exist.
     """
@@ -166,8 +166,8 @@ def _classify_viazanost(
     else:
         suggested = "Vaše aktívne viazanosti:\n" + "\n".join(f"• {ln}" for ln in service_lines)
 
-    if days_left < 90:
+    if days_left < _PROLONGATION_WINDOW_DAYS:
         return "Prolongacne_okno", suggested, latest_to
-    if days_left < 365:
+    if days_left < _DAYS_PER_YEAR:
         return "Viazanost_do_roka", suggested, latest_to
     return "Viazanost_viac_ako_rok", suggested, latest_to

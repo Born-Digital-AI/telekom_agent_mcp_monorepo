@@ -84,7 +84,9 @@ def test_classifier_known_kod_rc_collision_is_documented() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(("ico", "ok"), [("86316923", True), ("12345678", False), ("00000000", False)])
+@pytest.mark.parametrize(
+    ("ico", "ok"), [("86316923", True), ("12345678", False), ("00000000", False)]
+)
 def test_is_valid_ico(ico: str, ok: bool) -> None:
     assert identity_tools._is_valid_ico(ico) is ok
 
@@ -93,12 +95,12 @@ def test_is_valid_ico(ico: str, ok: bool) -> None:
 @pytest.mark.parametrize(
     ("rc", "ok"),
     [
-        ("7304292105", True),   # mod-11 + valid date
+        ("7304292105", True),  # mod-11 + valid date
         ("8753189467", True),
-        ("6862147292", True),   # woman (month +50)
+        ("6862147292", True),  # woman (month +50)
         ("1002203200", False),  # mod-11 fails
         ("7300002105", False),  # month 00
-        ("12345", False),       # wrong length
+        ("12345", False),  # wrong length
     ],
 )
 def test_is_valid_rodne_cislo(rc: str, ok: bool) -> None:
@@ -162,9 +164,7 @@ def test_auth_factor_widget_shape(factor: str) -> None:
     w = widgets.auth_factor_widget(factor)
     inputs = _find(w, "Input")
     assert inputs[0]["name"] == widgets.AUTH_FIELD_KEYS[factor]
-    utterances = {
-        b["onClickAction"]["payload"]["utterance"] for b in _find(w, "Button")
-    }
+    utterances = {b["onClickAction"]["payload"]["utterance"] for b in _find(w, "Button")}
     assert widgets.AUTH_SUBMIT_UTTERANCE in utterances
     assert widgets.AUTH_SKIP_UTTERANCE in utterances
 
@@ -210,10 +210,11 @@ def _reset_state(monkeypatch):
     # Clear every per-conversation store in place between tests (see test_tools.py).
     identity_state.reset_all()
     # Make _nlp_flush a no-op by default (avoid background HTTP threads in tests).
-    monkeypatch.setattr(identity_tools, "_nlp_flush", lambda conv: None)
+    monkeypatch.setattr(identity_tools, "_nlp_flush", lambda _conv: None)
+
     # Tests seed _NLP_MIRROR_STATE directly; _nlp_load now always GETs the NLP
     # engine, so stub it out to keep tests offline and fast.
-    async def _no_nlp_load(conv):  # noqa: ANN001, ANN202
+    async def _no_nlp_load(_conv):
         return None
 
     monkeypatch.setattr(identity_tools, "_nlp_load", _no_nlp_load)
@@ -465,9 +466,9 @@ def test_flush_filters_sensitive_widget_keys(monkeypatch) -> None:
     identity_tools._NLP_PENDING_STATE.set(
         _CONV,
         {
-            "identification": "1002203200",        # normal → pushed
-            "identifikacia_vstup": "7304292105",   # sensitive → must NOT be pushed
-            "autentifikacia_rc_last4": "2105",      # sensitive → must NOT be pushed
+            "identification": "1002203200",  # normal → pushed
+            "identifikacia_vstup": "7304292105",  # sensitive → must NOT be pushed
+            "autentifikacia_rc_last4": "2105",  # sensitive → must NOT be pushed
         },
     )
 

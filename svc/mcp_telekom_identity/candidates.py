@@ -20,8 +20,11 @@ from svc.mcp_telekom_identity.dps_get_client import (
 
 _UPSTREAM_ERROR_MESSAGE = "Vyskytol sa technický problém. Prepojím vás na operátora."
 
+# Auth factor "rc_last4" compares the last 4 digits of the rodné číslo.
+_RC_LAST4_LEN = 4
 
-def _json(obj: Any) -> str:
+
+def _json(obj: Any) -> str:  # noqa: ANN401 — generic JSON serialiser
     return json.dumps(obj, ensure_ascii=False)
 
 
@@ -102,8 +105,8 @@ def _extract_rc_last4_from_party(party: dict[str, Any]) -> str | None:
     for ident in ind.get("individualIdentifications") or []:
         if ident.get("type") == "socialSecurityNumber":
             value = ident.get("identificationId")
-            if isinstance(value, str) and len(value) >= 4:
-                return value[-4:]
+            if isinstance(value, str) and len(value) >= _RC_LAST4_LEN:
+                return value[-_RC_LAST4_LEN:]
     return None
 
 
