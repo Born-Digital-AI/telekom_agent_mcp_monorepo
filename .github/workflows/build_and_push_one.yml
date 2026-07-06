@@ -4,13 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       service_name:
-        description: Service to build (folder name in svc/, e.g. mcp_telekom_cc_selfcare)
+        description: Service to build (folder name in svc/, e.g. mcp_telekom_identity)
         type: choice
         required: true
         options:
           - mcp_template
-          - mcp_telekom_cc_selfcare
-          - mcp_telekom_thd_selfcare
           - mcp_telekom_identity
       docker_tag:
         description: Docker tag (e.g. v0.1.0 or latest)

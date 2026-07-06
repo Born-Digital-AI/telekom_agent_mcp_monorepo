@@ -12,8 +12,8 @@ Tools (registered under ``znalostna_baza_*`` to sit cleanly next to the
   - znalostna_baza_detail_dokumentu  → full document metadata + chunks
   - znalostna_baza_stitky          → distinct labels (cached) for filter discovery
 
-Mirrors ``svc/mcp_telekom_thd_selfcare/tools.py`` (RAG facade) so both services
-behave identically against the indexer.
+Originally mirrored ``svc/mcp_telekom_thd_selfcare/tools.py`` (RAG facade; now
+archived on the ``archive/selfcare-services`` branch).
 """
 
 from __future__ import annotations

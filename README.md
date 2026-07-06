@@ -22,8 +22,7 @@ The repo follows the conventions of the production `python-monorepo`:
 │   └── monorepo/        Filesystem helpers used by bin/ scripts and CI
 ├── svc/
 │   ├── mcp_template/                  Reference example
-│   ├── mcp_telekom_cc_selfcare/       Authentication + invoice resend
-│   └── mcp_telekom_thd_selfcare/      Fixed internet troubleshooting
+│   └── mcp_telekom_identity/          Customer identification, authentication & lookup
 ├── tests/
 ├── requirements/        Generated pinned requirements (committed)
 ├── pyproject.toml       Ruff / basedpyright / pytest config
@@ -53,7 +52,7 @@ SERVICE_CLASS = MyService
 ```
 
 For tools migrated from the legacy `my-mcp-server` repo, use the compatibility shim
-(see [svc/mcp_telekom_cc_selfcare/](svc/mcp_telekom_cc_selfcare/)):
+(see [svc/mcp_telekom_identity/](svc/mcp_telekom_identity/)):
 
 ```python
 from lib.mcp_service.legacy_compat import ToolRegistry, mcp_tool
@@ -97,7 +96,7 @@ The log line for the call carries `application=mcp-template`, `conversation_id=d
 | Field | Source |
 |---|---|
 | `trace.id` / `trace_id` | `X-Trace-Id` request header (or generated). 8-char random fallback. |
-| `service.name` / `application` | `Service.NAME` class attribute (e.g. `mcp-telekom-cc-selfcare`). |
+| `service.name` / `application` | `Service.NAME` class attribute (e.g. `mcp-telekom-identity`). |
 | `service.version` / `app_version` | `APP_GIT_COMMIT` env var (set in Dockerfile from `git_commit` build-arg). |
 | `conversation_id` / `ConversationId` | `X-Conversation-Id` request header. |
 | `interaction_id` / `InteractionId` | `X-Interaction-Id` request header. |

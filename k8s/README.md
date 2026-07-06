@@ -9,15 +9,9 @@ repos (e.g. `non-prod-kubernetes/{development,internal-test,customer-test}/apps/
 
 ```
 k8s/
-├── mcp-template/
-│   ├── mcp-template-depl.yaml
-│   └── mcp-template-serv.yaml
-├── mcp-telekom-cc-selfcare/
-│   ├── mcp-telekom-cc-selfcare-depl.yaml
-│   └── mcp-telekom-cc-selfcare-serv.yaml
-└── mcp-telekom-thd-selfcare/
-    ├── mcp-telekom-thd-selfcare-depl.yaml
-    └── mcp-telekom-thd-selfcare-serv.yaml
+└── mcp-template/
+    ├── mcp-template-depl.yaml
+    └── mcp-template-serv.yaml
 ```
 
 Directories use **dashes** (matching the K8s `metadata.name`), unlike `svc/`
@@ -40,10 +34,10 @@ which uses underscores (Python module convention).
 
 ```bash
 # Apply directly (one-off, dev cluster)
-kubectl apply -f k8s/mcp-telekom-cc-selfcare/
+kubectl apply -f k8s/mcp-template/
 
 # Or copy into the environment repo and let the GitOps pipeline pick them up
-cp -r k8s/mcp-telekom-cc-selfcare ../non-prod-kubernetes/development/apps/
+cp -r k8s/mcp-template ../non-prod-kubernetes/development/apps/
 ```
 
 ## Editing checklist before applying

@@ -39,7 +39,8 @@ tests/lib|svc/        Mirrors the source tree
 ```
 
 Reference example: [`svc/mcp_template/`](svc/mcp_template/) — the canonical minimal service.
-Pattern for migrated legacy code: [`svc/mcp_telekom_cc_selfcare/`](svc/mcp_telekom_cc_selfcare/).
+Pattern for migrated legacy code: [`svc/mcp_telekom_identity/`](svc/mcp_telekom_identity/)
+(uses the `lib.mcp_service.legacy_compat` shim).
 
 ## Adding a new MCP server
 
@@ -187,7 +188,8 @@ records are shipped to Logstash → Kibana via `python-logstash-async`.
 - **Don't log secrets.** API keys belong in `pydantic.Field(default=..., exclude=True)`
   config fields and never appear in `repr(config)`.
 - **Don't log full PII.** For Telekom servers, names/birth-numbers/full phone numbers
-  must be masked (see `_mask_email` in [`mcp_telekom_cc_selfcare/tools.py`](svc/mcp_telekom_cc_selfcare/tools.py)).
+  must be masked — log only a suffix (e.g. `customer_id_last4` in
+  [`mcp_telekom_identity/tools.py`](svc/mcp_telekom_identity/tools.py)).
 
 ## Tool authoring rules
 

@@ -183,7 +183,7 @@ class Service[ConcreteConfig: ServiceConfig]:
         self.logger.info(f"Metrics: {self.metrics!r}")
 
         set_trace_id(random_trace_id())
-        # Use the K8s/deployment-friendly NAME (e.g. "mcp-telekom-cc-selfcare") for the
+        # Use the K8s/deployment-friendly NAME (e.g. "mcp-telekom-identity") for the
         # `application` field in log records — that's what operators query in Kibana.
         set_service_details(self.NAME, self.config.git_commit)
         self.logger.info(

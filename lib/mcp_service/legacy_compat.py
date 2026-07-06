@@ -65,7 +65,7 @@ Migration workflow (legacy ``my-mcp-server/projects/<name>/``)
    HTTP routes — re-implement via ``MCPService.register_http_endpoints`` if
    actually needed).
 
-Worked example: :mod:`svc.mcp_telekom_cc_selfcare`.
+Worked example: :mod:`svc.mcp_telekom_identity`.
 """
 
 from __future__ import annotations

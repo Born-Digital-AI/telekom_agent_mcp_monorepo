@@ -5,8 +5,8 @@ wrapped: list documents, search, get document, list chunks. Returns parsed
 JSON dicts verbatim — no Pydantic models, the indexer schema is stable enough
 and the tools serialize back to JSON anyway.
 
-Mirrors ``svc/mcp_telekom_thd_selfcare/indexer_client.py`` (RAG facade) so both
-services share the same indexer contract.
+Originally mirrored ``svc/mcp_telekom_thd_selfcare/indexer_client.py`` (RAG
+facade; now archived on the ``archive/selfcare-services`` branch).
 """
 
 from __future__ import annotations

@@ -7,9 +7,10 @@ Project memory for Claude Code sessions in this repo. Loaded automatically.
 Monorepo of FastMCP services exposing Slovak Telekom backends as MCP tools:
 
 - `svc/mcp_telekom_identity/` — identification & customer lookup (the most active service)
-- `svc/mcp_telekom_cc_selfcare/` — customer-care self-care flows
-- `svc/mcp_telekom_thd_selfcare/` — T-Home/Telekom self-care flows
 - `svc/mcp_template/` — scaffold for new services
+
+Former services `mcp_telekom_cc_selfcare` and `mcp_telekom_thd_selfcare` were
+removed from `main` and live on the `archive/selfcare-services` branch.
 
 The identity service talks to **3 DPS HAL APIs**:
 
