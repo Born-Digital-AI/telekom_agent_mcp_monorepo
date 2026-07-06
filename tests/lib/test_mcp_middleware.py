@@ -9,11 +9,56 @@ from lib.boilerplate.logging import (
     current_interaction_id,
     current_trace_id,
 )
-from lib.mcp_service.middleware import TracingMiddleware
+from lib.mcp_service.middleware import TracingMiddleware, _ensure_utf8_charset
 
 
 def _scope(headers: list[tuple[bytes, bytes]]) -> dict:
     return {"type": "http", "headers": headers, "method": "POST", "path": "/mcp"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        (b"text/event-stream", b"text/event-stream; charset=utf-8"),
+        (b"application/json", b"application/json; charset=utf-8"),
+        (b"text/plain", b"text/plain; charset=utf-8"),
+        # already has a charset -> untouched
+        (b"text/event-stream; charset=utf-8", b"text/event-stream; charset=utf-8"),
+        (b"application/json; charset=iso-8859-1", b"application/json; charset=iso-8859-1"),
+        # non-text/json -> untouched
+        (b"image/png", b"image/png"),
+    ],
+)
+def test_ensure_utf8_charset(content_type: bytes, expected: bytes) -> None:
+    assert _ensure_utf8_charset(content_type) == expected
+
+
+@pytest.mark.unit
+async def test_middleware_adds_utf8_charset_to_content_type() -> None:
+    async def inner_app(scope, receive, send) -> None:  # noqa: ARG001
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b""})
+
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b""}
+
+    await TracingMiddleware(inner_app)(_scope([]), receive, send)
+
+    start_frame = next(m for m in sent if m["type"] == "http.response.start")
+    response_headers = dict(start_frame["headers"])
+    assert response_headers[b"content-type"] == b"text/event-stream; charset=utf-8"
 
 
 @pytest.mark.unit

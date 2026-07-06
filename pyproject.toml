@@ -83,9 +83,14 @@ ignore = [
 "scripts/**" = ["T201", "D", "ANN", "S101", "S105", "INP001", "BLE001", "TRY300", "PLC0415", "PERF", "I001", "F401"]  # One-time validation scripts - relaxed rules
 ".github/scripts/**" = ["T201", "D", "ANN", "PLR0913", "PLR0912", "PLR0915", "C901", "S701", "INP001"]  # Print, docstrings, annotations, complexity rules, jinja2 autoescape, namespace packages (CI scripts)
 "__init__.py" = ["D104"]  # Docstrings in packages
-"tests/**" = ["D", "ANN", "S101", "INP001", "PLR2004", "SLF001", "FBT", "PTH", "BLE001", "PLC0415", "C901", "PERF", "PLR0911", "PLR0912", "PLR0915", "S110", "PT011", "DTZ005", "RUF001"]  # Relaxed rules for tests
+"tests/**" = ["D", "ANN", "S101", "INP001", "PLR2004", "SLF001", "FBT", "PTH", "BLE001", "PLC0415", "C901", "PERF", "PLR0911", "PLR0912", "PLR0915", "S110", "PT011", "DTZ005", "RUF001", "PT019"]  # Relaxed rules for tests
 "svc/**/tests/**" = ["D", "ANN", "S101", "INP001", "PLR2004", "SLF001", "FBT", "PTH", "BLE001", "PLC0415", "C901", "PERF", "PLR0911", "PLR0912", "PLR0915", "S110", "PT011", "DTZ005", "RUF001"]  # Same ignores for tests inside service directories
 "svc/**/tools.py" = ["D102", "D103", "D205", "D400", "D415", "D417", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", "ARG001", "ANN401", "C901", "S310", "BLE001", "N806", "TRY300", "RUF001"]  # MCP tool wrappers — legacy domain logic, relaxed rules
+# Domain modules split out of mcp_telekom_identity/tools.py — keep the relaxed rules their code carried there
+"svc/mcp_telekom_identity/__init__.py" = ["ANN401"]  # pydantic mode="before" validators take/return Any
+"svc/mcp_telekom_identity/classify.py" = ["PLR2004", "C901", "PLR0911"]  # identifier heuristics — digit-length/format checks
+"svc/mcp_telekom_identity/knowledge_base_tools.py" = ["C901", "PLR0913", "PLR0915"]  # MCP tool registration, same shape as tools.py
+"svc/mcp_telekom_identity/nlp_state.py" = ["BLE001", "S310"]  # fire-and-forget sync must never raise; internal NLP-engine URL
 "svc/**/customer_db.py" = ["D100", "D103", "D205", "ERA001", "FBT001", "FBT002", "PLR2004"]  # Mock data fixture modules — relaxed rules
 "svc/**/troubleshooting_data.py" = ["D100", "D103", "D205", "D400", "D415", "ERA001", "RUF001"]  # Static data with multi-line module docstring
 "svc/**/intent_catalog.py" = ["RUF001", "ERA001"]  # Slovak unicode literals

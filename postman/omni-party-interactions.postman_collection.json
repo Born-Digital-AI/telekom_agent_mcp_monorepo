@@ -1,0 +1,254 @@
+{
+  "info": {
+    "_postman_id": "c3d4e5f6-a7b8-4901-cdef-012345678902",
+    "name": "OMNI Party Interactions API 1.3.0",
+    "description": "OMNI-PartyInteractionsAPI v1.3.0 — záznamy o interakciách so zákazníkom (hovor, chat, e-mail…).\n\n**Setup:**\n1. Import prostredia `omni-party-interactions-test.postman_environment.json` a vyber ho v dropdown-e.\n2. Vyplň `bearer_token`.\n3. **VPN required** — `tapigw.sk.tmo` je dostupný iba cez VPN.\n\n**Auto-headers:** collection-level pre-request script automaticky generuje UUID pre `X-Request-Id`, `X-Request-Tracking-Id`, `X-Request-Session-Id`.\n\n## Kľúčové pravidlá POST\n- `direction` sa **neposiela** — odvodzuje sa automaticky zo suffixu `natcoChannel` (` - Inbound` / ` - Outbound`)\n- `natcoChannel` — kanál + smer (napr. `Call - Inbound`, `Email - Inbound`, `Chat`)\n- `natcoOwnerLogin` — Siebel login agenta (default: `EXTERNAL_SERVICE`)\n- `natcoOtherPartyContact` — číslo call-centra / agenta (iba pri hovoroch s `natcoChannel`)\n- `interactionMedium.mediumValue` — kontakt zákazníka (telefón, email)\n- `audit.sourceSystem` — systém, ktorý interakciu vytvoril\n- Platné hodnoty `status`: `Done`, `Error`, `Queued`, `In Progress`, `Draft`, `Cancelled`, `Not Started`",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{bearer_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.request.headers.upsert({ key: 'X-Request-Id',          value: pm.variables.replaceIn('{{$guid}}') });",
+          "pm.request.headers.upsert({ key: 'X-Request-Tracking-Id', value: pm.variables.replaceIn('{{$guid}}') });",
+          "pm.request.headers.upsert({ key: 'X-Request-Session-Id',  value: pm.variables.replaceIn('{{$guid}}') });"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('content-type is JSON when body present', function () {",
+          "    if (pm.response.code === 204 || pm.response.code === 404) return;",
+          "    pm.expect(pm.response.headers.get('Content-Type') || '').to.match(/application\\/json/i);",
+          "});",
+          "pm.test('not 401/403 (token still valid)', function () {",
+          "    pm.expect([401, 403]).to.not.include(pm.response.code);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://tapigw.sk.tmo/omni/test1/party-interactions/1.3.0",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "GET — Vyhľadanie interakcií",
+      "description": "GET requesty na čítanie interakcií.",
+      "item": [
+        {
+          "name": "GET /partyInteractions — vyhľadanie podľa party.id",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions?party.id={{party_id}}&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions"],
+              "query": [
+                {
+                  "key": "party.id",
+                  "value": "{{party_id}}",
+                  "description": "REQUIRED — Party ID zákazníka (napr. PARTY_1002203200)"
+                },
+                {
+                  "key": "fields",
+                  "value": "*",
+                  "description": "Zoznam polí v odpovedi, * = všetky"
+                },
+                {
+                  "key": "createdAfterDate",
+                  "value": "2026-05-01T00:00:00",
+                  "description": "Filter: interakcie vytvorené po tomto dátume (ISO 8601, bez timezone)",
+                  "disabled": true
+                },
+                {
+                  "key": "entityType",
+                  "value": "inboundCall",
+                  "description": "Filter: typ interakcie",
+                  "disabled": true
+                },
+                {
+                  "key": "page",
+                  "value": "0",
+                  "description": "Stránkovanie — kladné celé číslo, začína od 0",
+                  "disabled": true
+                },
+                {
+                  "key": "size",
+                  "value": "20",
+                  "description": "Veľkosť stránky",
+                  "disabled": true
+                },
+                {
+                  "key": "sort",
+                  "value": "-interactionDate.startDateTime",
+                  "description": "Zoradenie: prefix + vzostupne, - zostupne",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Vráti pole `PartyInteraction[]` pre daného zákazníka.\n\n**Povinný parameter:** `party.id` — ID Party (nie Customer ID!)\n\nHTTP 200 s prázdnym poľom `[]` = zákazník existuje, ale nemá žiadne interakcie."
+          }
+        },
+        {
+          "name": "GET /partyInteractions — filter celý máj 2026",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions?party.id={{party_id}}&createdAfterDate=2026-05-01T00:00:00&sort=-interactionDate.startDateTime&page=0&size=10&fields=*",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions"],
+              "query": [
+                { "key": "party.id",         "value": "{{party_id}}" },
+                { "key": "createdAfterDate",  "value": "2026-05-01T00:00:00" },
+                { "key": "sort",              "value": "-interactionDate.startDateTime" },
+                { "key": "page",              "value": "0" },
+                { "key": "size",              "value": "10" },
+                { "key": "fields",            "value": "*" }
+              ]
+            },
+            "description": "Interakcie zákazníka od 1.5.2026, zoradené zostupne (najnovšie prvé), prvá stránka 10 záznamov."
+          }
+        },
+        {
+          "name": "GET /partyInteractions/{id} — detail interakcie",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions/{{party_interaction_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions", "{{party_interaction_id}}"]
+            },
+            "description": "Načíta jednu konkrétnu interakciu podľa jej Siebel ID (napr. `1-AGPL74ZF`)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST — Vytvorenie interakcie",
+      "description": "POST requesty na vytvorenie novej interakcie.\n\nInterakcia sa uloží do Interaction DPS a odošle do Siebel CRM (master systém). Siebel vráti vygenerované `id` (napr. `1-AGPL74ZF`) v 201 odpovedi.",
+      "item": [
+        {
+          "name": "POST — Požiadavka cez Web Formulár (Email - Inbound) ★",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept",       "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Web Formulár - Napíšte nám - Požiadavka odoslaná z firemnej IP adresy\",\n  \"status\": \"Done\",\n  \"reason\": \"Single interaction\",\n  \"notes\": [\n    {\n      \"text\": \"TEXT TEXT TEXT\"\n    }\n  ],\n  \"interactionDate\": {\n    \"startDateTime\": \"2026-05-21T08:43:08+02:00\",\n    \"endDateTime\":   \"2026-05-21T08:43:10+02:00\"\n  },\n  \"characteristics\": [\n    { \"name\": \"natcoChannel\",    \"value\": \"Email - Inbound\", \"valueType\": \"string\" },\n    { \"name\": \"natcoOwnerLogin\", \"value\": \"SADMIN\",          \"valueType\": \"string\" }\n  ],\n  \"relatedParties\": [\n    { \"id\": \"{{customer_id}}\", \"entityReferredType\": \"Customer\" }\n  ],\n  \"audit\": {\n    \"sourceSystem\": \"EXTERNAL_SERVICE\"\n  }\n}",
+              "options": {
+                "raw": { "language": "json" }
+              }
+            },
+            "description": "Vytvorí interakciu zodpovedajúcu požiadavke z Web Formulára (\"Napíšte nám\").\n\n**Mapovanie polí zo Siebel UI:**\n| Siebel pole | API pole / hodnota |\n|---|---|\n| Typ interakcie: Požiadavka | `name` prefix (typ nie je samostatné pole) |\n| Spôsob komunikácie: Prichádzajúci email | `natcoChannel: \"Email - Inbound\"` |\n| Riešiteľ + Iniciátor: SADMIN | `natcoOwnerLogin: \"SADMIN\"` |\n| Status: Uzatvorená | `status: \"Done\"` |\n| Zákazník | `relatedParties[0].id` |\n| Začiatok / Koniec | `interactionDate.startDateTime/endDateTime` |\n| Obsah | `notes[0].text` |\n\n⚠️ Časy sú v CEST (`+02:00`). Ak API vyžaduje UTC, zmeň na `2026-05-21T06:43:08Z` / `2026-05-21T06:43:10Z`."
+          }
+        },
+        {
+          "name": "POST — Inbound hovor (s číslami zákazníka aj call-centra)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept",       "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Inbound call from customer\",\n  \"status\": \"Done\",\n  \"reason\": \"Single interaction\",\n  \"notes\": [\n    {\n      \"text\": \"Zákazník sa pýtal na zmenu tarifu. Informovaný o aktuálnej ponuke.\"\n    }\n  ],\n  \"interactionDate\": {\n    \"startDateTime\": \"2026-05-27T10:00:00+02:00\",\n    \"endDateTime\":   \"2026-05-27T10:15:00+02:00\"\n  },\n  \"characteristics\": [\n    { \"name\": \"natcoChannel\",          \"value\": \"Call - Inbound\", \"valueType\": \"string\" },\n    { \"name\": \"natcoOwnerLogin\",        \"value\": \"{{agent_login}}\",  \"valueType\": \"string\" },\n    { \"name\": \"natcoOtherPartyContact\", \"value\": \"1074\",            \"valueType\": \"string\" }\n  ],\n  \"relatedParties\": [\n    { \"id\": \"{{customer_id}}\", \"entityReferredType\": \"Customer\" }\n  ],\n  \"interactionMedium\": {\n    \"mediumValue\": \"{{msisdn}}\"\n  },\n  \"audit\": {\n    \"sourceSystem\": \"EXTERNAL_SERVICE\"\n  }\n}",
+              "options": {
+                "raw": { "language": "json" }
+              }
+            },
+            "description": "Prichádzajúci hovor — zákazník volal na call-centrum.\n\n`interactionMedium.mediumValue` = číslo zákazníka (volajúci)\n`natcoOtherPartyContact` = linka call-centra (volaný)\n\nSiebel mapovanie:\n- Called From Number = `mediumValue` (zákazník)\n- Called Number = `natcoOtherPartyContact` (call-centrum)\n\nSmer `inbounds` sa odvodí automaticky zo suffixu `Call - Inbound` — `direction` sa neposiela."
+          }
+        },
+        {
+          "name": "POST — Chat (directionless kanál)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept",       "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Customer support chat\",\n  \"status\": \"Done\",\n  \"reason\": \"Single interaction\",\n  \"notes\": [\n    {\n      \"text\": \"Zákazník sa pýtal na reklamáciu vyúčtovania.\"\n    }\n  ],\n  \"interactionDate\": {\n    \"startDateTime\": \"2026-05-27T14:30:00+02:00\",\n    \"endDateTime\":   \"2026-05-27T14:45:00+02:00\"\n  },\n  \"characteristics\": [\n    { \"name\": \"natcoChannel\",    \"value\": \"Chat\",           \"valueType\": \"string\" },\n    { \"name\": \"natcoOwnerLogin\", \"value\": \"{{agent_login}}\", \"valueType\": \"string\" }\n  ],\n  \"relatedParties\": [\n    { \"id\": \"{{customer_id}}\", \"entityReferredType\": \"Customer\" }\n  ],\n  \"audit\": {\n    \"sourceSystem\": \"EXTERNAL_SERVICE\"\n  }\n}",
+              "options": {
+                "raw": { "language": "json" }
+              }
+            },
+            "description": "Chat je \"directionless\" kanál — neobsahuje suffix ` - Inbound` / ` - Outbound`, takže Siebel neurčuje smer z kanála.\n\nPre chat nie je relevantný `interactionMedium` ani `natcoOtherPartyContact`."
+          }
+        },
+        {
+          "name": "POST — Outbound hovor (agent volá zákazníkovi)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept",       "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/partyInteractions",
+              "host": ["{{base_url}}"],
+              "path": ["partyInteractions"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Outbound call to customer\",\n  \"status\": \"Done\",\n  \"reason\": \"Single interaction\",\n  \"notes\": [\n    {\n      \"text\": \"Agent kontaktoval zákazníka ohľadom aktuálnej ponuky.\"\n    }\n  ],\n  \"interactionDate\": {\n    \"startDateTime\": \"2026-05-27T11:00:00+02:00\",\n    \"endDateTime\":   \"2026-05-27T11:10:00+02:00\"\n  },\n  \"characteristics\": [\n    { \"name\": \"natcoChannel\",          \"value\": \"Call - Outbound\", \"valueType\": \"string\" },\n    { \"name\": \"natcoOwnerLogin\",        \"value\": \"{{agent_login}}\",   \"valueType\": \"string\" },\n    { \"name\": \"natcoOtherPartyContact\", \"value\": \"1074\",             \"valueType\": \"string\" }\n  ],\n  \"relatedParties\": [\n    { \"id\": \"{{customer_id}}\", \"entityReferredType\": \"Customer\" }\n  ],\n  \"interactionMedium\": {\n    \"mediumValue\": \"{{msisdn}}\"\n  },\n  \"audit\": {\n    \"sourceSystem\": \"EXTERNAL_SERVICE\"\n  }\n}",
+              "options": {
+                "raw": { "language": "json" }
+              }
+            },
+            "description": "Odchádzajúci hovor — agent volá zákazníkovi.\n\n`natcoChannel: \"Call - Outbound\"` → Siebel nastaví smer `outbounds`.\n`mediumValue` = číslo zákazníka (volaný), `natcoOtherPartyContact` = linka call-centra (volajúci)."
+          }
+        }
+      ]
+    }
+  ]
+}

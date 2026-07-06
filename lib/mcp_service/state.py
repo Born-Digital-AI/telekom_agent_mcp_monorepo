@@ -63,6 +63,11 @@ class TTLStore[V]:
             if len(self._data) > self._sweep_threshold:
                 self._sweep_expired(now)
 
+    def clear(self) -> None:
+        """Drop all entries. Keeps the store object identity (useful for test resets)."""
+        with self._lock:
+            self._data.clear()
+
     def pop(self, key: str, default: V | None = None) -> V | None:
         """Remove ``key`` and return its value (or ``default`` if absent/expired)."""
         with self._lock:
