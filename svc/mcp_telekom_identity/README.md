@@ -3,6 +3,9 @@
 MCP server for identifying (and later authenticating) Slovak Telekom customers
 against the DPS API (party-management + customer-management).
 
+> Biznis dokumentácia toolov (pre nevývojárov, po slovensky):
+> [DOKUMENTACIA_BIZNIS.md](DOKUMENTACIA_BIZNIS.md)
+
 ## Cache & NLP state
 
 After every **successful** identification, the tool:
