@@ -165,24 +165,13 @@ def make_tool():
 
 @pytest.fixture(autouse=True)
 def _reset_identity_state_and_silence_nlp(monkeypatch):
+    from svc.mcp_telekom_identity import _state as identity_state
     from svc.mcp_telekom_identity import tools as identity_tools
 
-    # Reset cache between tests
-    identity_tools._IDENTITY_STATE = type(identity_tools._IDENTITY_STATE)(
-        ttl_seconds=identity_tools._IDENTITY_TTL_SECONDS,
-    )
-    identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
-        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
-    )
-    identity_tools._NLP_PENDING_STATE = type(identity_tools._NLP_PENDING_STATE)(
-        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
-    )
-    identity_tools._NLP_CONSUMED_STATE = type(identity_tools._NLP_CONSUMED_STATE)(
-        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
-    )
-    identity_tools._AUTH_STATE = type(identity_tools._AUTH_STATE)(
-        ttl_seconds=identity_tools._AUTH_TTL_SECONDS,
-    )
+    # Reset every per-conversation store between tests. reset_all() clears the
+    # stores in place (never rebinds), so the references re-exported via
+    # `identity_tools` and held by sibling modules stay valid.
+    identity_state.reset_all()
 
     # _nlp_load now always GETs the NLP engine; tests drive state via the mirror
     # and _nlp_set_state, so stub the load to keep tests offline and fast.
@@ -1371,6 +1360,7 @@ def test_nlp_get_named_entities_returns_empty_for_unknown_conv() -> None:
 @pytest.mark.unit
 def test_nlp_flush_pushes_pending_only(monkeypatch) -> None:
     """_nlp_flush pushes exactly the tool-written pending entities — no delta, not the mirror."""
+    from svc.mcp_telekom_identity import nlp_state
     from svc.mcp_telekom_identity import tools as identity_tools
 
     # Run the fire-and-forget PUT synchronously and capture request bodies.
@@ -1396,8 +1386,8 @@ def test_nlp_flush_pushes_pending_only(monkeypatch) -> None:
         def start(self):
             self._target()
 
-    monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(nlp_state.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(nlp_state.threading, "Thread", _SyncThread)
 
     conv = "conv-pending"
     # Only the pending buffer (entities our tools wrote) is pushed; the mirror —
@@ -1416,6 +1406,7 @@ def test_nlp_flush_pushes_pending_only(monkeypatch) -> None:
 @pytest.mark.unit
 def test_nlp_flush_failure_keeps_entities_pending(monkeypatch) -> None:
     """A failed PUT does not acknowledge, so the entities are retried on the next flush."""
+    from svc.mcp_telekom_identity import nlp_state
     from svc.mcp_telekom_identity import tools as identity_tools
 
     sent: list[dict] = []
@@ -1443,8 +1434,8 @@ def test_nlp_flush_failure_keeps_entities_pending(monkeypatch) -> None:
         def start(self):
             self._target()
 
-    monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(nlp_state.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(nlp_state.threading, "Thread", _SyncThread)
 
     conv = "conv-fail"
     identity_tools._NLP_PENDING_STATE.set(conv, {"a": "1"})
@@ -1492,13 +1483,15 @@ async def test_nlp_load_refetches_even_when_mirror_is_warm(monkeypatch) -> None:
     _nlp_load short-circuits on a warm mirror, that value stays invisible and the
     tool wrongly returns input_required.
     """
+    from svc.mcp_telekom_identity import nlp_state
+
     conv = "conv-refetch"
     # Mirror already warm from an earlier turn (Channel was set at conversation start).
     identity_tools._NLP_MIRROR_STATE.set(conv, {"Channel": "chat"})
 
     # NLP engine now also has the freshly-submitted widget value.
     monkeypatch.setattr(
-        identity_tools.httpx,
+        nlp_state.httpx,
         "AsyncClient",
         _fake_async_client({"Channel": "chat", "identifikacia_vstup": "2315055000"}),
     )

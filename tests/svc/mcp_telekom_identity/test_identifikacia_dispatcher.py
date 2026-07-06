@@ -205,18 +205,10 @@ class _CustomerStub:
 
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch):
-    identity_tools._IDENTITY_STATE = type(identity_tools._IDENTITY_STATE)(
-        ttl_seconds=identity_tools._IDENTITY_TTL_SECONDS,
-    )
-    identity_tools._NLP_MIRROR_STATE = type(identity_tools._NLP_MIRROR_STATE)(
-        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
-    )
-    identity_tools._NLP_PENDING_STATE = type(identity_tools._NLP_PENDING_STATE)(
-        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
-    )
-    identity_tools._NLP_CONSUMED_STATE = type(identity_tools._NLP_CONSUMED_STATE)(
-        ttl_seconds=identity_tools._NLP_MIRROR_TTL_SECONDS,
-    )
+    from svc.mcp_telekom_identity import _state as identity_state
+
+    # Clear every per-conversation store in place between tests (see test_tools.py).
+    identity_state.reset_all()
     # Make _nlp_flush a no-op by default (avoid background HTTP threads in tests).
     monkeypatch.setattr(identity_tools, "_nlp_flush", lambda conv: None)
     # Tests seed _NLP_MIRROR_STATE directly; _nlp_load now always GETs the NLP
@@ -406,6 +398,8 @@ async def test_explicit_type_overrides_autodetect(conv) -> None:  # noqa: ARG001
 
 def _capturing_flush_env(monkeypatch) -> list[dict]:
     """Wire the real _nlp_flush to run synchronously against a capturing urlopen."""
+    from svc.mcp_telekom_identity import nlp_state
+
     monkeypatch.setattr(identity_tools, "_nlp_flush", _REAL_NLP_FLUSH)
     captured: list[dict] = []
 
@@ -429,8 +423,8 @@ def _capturing_flush_env(monkeypatch) -> list[dict]:
         def start(self):
             self._target()
 
-    monkeypatch.setattr(identity_tools.urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setattr(identity_tools.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(nlp_state.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(nlp_state.threading, "Thread", _SyncThread)
     return captured
 
 
