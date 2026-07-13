@@ -14,6 +14,7 @@ from lib.mcp_service.legacy_compat import ToolRegistry
 from .dps_get_client import DPSGetClient
 from .indexer_client import IndexerClient, LabelsCache
 from .knowledge_base_tools import register_knowledge_base_tools
+from .roaming_tools import register_roaming_tools
 from .tools import register
 
 if TYPE_CHECKING:
@@ -125,13 +126,14 @@ class MCPTelekomIdentity(MCPService[MCPTelekomIdentityConfig]):
         )
 
     def setup_tools(self, mcp: FastMCP) -> None:
-        """Register identification tools (always) and knowledge-base tools (if configured)."""
+        """Register identification + roaming tools (always) and knowledge-base tools (if configured)."""
         registry = ToolRegistry(mcp)
         register(
             registry,
             client=self._dps_client,
             max_candidates=self._identity_config.dps_max_candidates,
         )
+        register_roaming_tools(mcp=mcp)
         self._setup_knowledge_base_tools(mcp)
 
     def _setup_knowledge_base_tools(self, mcp: FastMCP) -> None:
